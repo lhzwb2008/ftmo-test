@@ -1,7 +1,7 @@
 """
 简化版交易信号生成器
 只负责生成交易信号并写入SQLite数据库
-不包含任何长桥证券API调用
+使用长桥API获取股票数据
 """
 
 import pandas as pd
@@ -13,20 +13,34 @@ import pytz
 from math import floor
 import numpy as np
 import sqlite3
+from dotenv import load_dotenv
+
+from longport.openapi import Config, QuoteContext, Period, AdjustType
+
+load_dotenv(override=True)
 
 # SQLite数据库路径 - 使用MT5通用目录
 import platform
 if platform.system() == "Windows":
     # Windows系统：使用MT5通用目录
-    mt5_files_dir = os.path.expanduser("~/AppData/Roaming/MetaQuotes/Terminal/Common/Files")
+    # 获取AppData路径
+    appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
+    mt5_common_path = os.path.join(appdata_path, "MetaQuotes", "Terminal", "Common", "Files")
     
     # 确保目录存在
-    os.makedirs(mt5_files_dir, exist_ok=True)
-    DB_PATH = os.path.join(mt5_files_dir, "trading_signals.db")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 使用MT5通用目录: {mt5_files_dir}")
+    os.makedirs(mt5_common_path, exist_ok=True)
+    
+    # 数据库文件路径
+    DB_PATH = os.path.join(mt5_common_path, "trading_signals.db")
+    
+    # 打印路径信息
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Windows系统检测")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] MT5通用目录: {mt5_common_path}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 数据库路径: {DB_PATH}")
 else:
     # 非Windows系统：使用当前目录
     DB_PATH = "trading_signals.db"
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 非Windows系统，使用当前目录")
 
 # 固定配置参数
 CHECK_INTERVAL_MINUTES = 15
@@ -38,7 +52,7 @@ K1 = 1 # 上边界sigma乘数
 K2 = 1 # 下边界sigma乘数
 
 # 默认交易品种
-SYMBOL = 'QQQ'  # yfinance格式，不需要.US后缀
+SYMBOL = 'QQQ.US'  # 长桥格式，需要.US后缀
 
 # 调试模式配置
 DEBUG_MODE = False   # 设置为True开启调试模式
@@ -59,6 +73,29 @@ def get_us_eastern_time():
     # 正常模式或调试时间格式错误时返回当前时间
     eastern = pytz.timezone('US/Eastern')
     return datetime.now(eastern)
+
+def create_quote_context():
+    """创建长桥行情连接"""
+    max_retries = 5
+    retry_delay = 5  # 秒
+    
+    for attempt in range(max_retries):
+        try:
+            config = Config.from_env()
+            quote_ctx = QuoteContext(config)
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 长桥API连接成功")
+            return quote_ctx
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 长桥API连接失败 ({attempt + 1}/{max_retries}): {str(e)}")
+                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {retry_delay}秒后重试...")
+                time_module.sleep(retry_delay)
+            else:
+                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 长桥API连接失败，已达最大重试次数")
+                raise
+
+# 创建全局行情连接
+QUOTE_CTX = None  # 延迟初始化，在main中创建
 
 def init_sqlite_database():
     """初始化SQLite数据库"""
@@ -106,44 +143,138 @@ def write_signal_to_sqlite(action):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入信号失败: {str(e)}")
         return None
 
-def get_historical_data_yfinance(symbol, days_back=5):
-    """使用yfinance获取历史数据"""
+def get_historical_data(symbol, days_back=5):
+    """使用长桥API获取历史数据"""
     try:
-        # 计算开始和结束日期
-        end_date = get_us_eastern_time().date()
-        start_date = end_date - timedelta(days=days_back + 10)  # 多获取一些数据以确保有足够的交易日
+        # 使用1分钟K线
+        sdk_period = Period.Min_1
+        adjust_type = AdjustType.ForwardAdjust
+        eastern = pytz.timezone('US/Eastern')
+        now_et = get_us_eastern_time()
+        current_date = now_et.date()
         
-        # 下载数据
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(start=start_date, end=end_date, interval='1m')
+        if DEBUG_MODE:
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 开始获取历史数据: {symbol}")
         
+        # 计算起始日期
+        start_date = current_date - timedelta(days=days_back)
+        
+        # 对于1分钟数据使用按日获取的方式
+        all_candles = []
+        
+        # 尝试从今天开始向前获取足够的数据
+        date_to_check = current_date
+        api_call_count = 0
+        
+        while date_to_check >= start_date:
+            day_start_time = datetime.combine(date_to_check, time(9, 30))
+            day_start_time_et = eastern.localize(day_start_time)
+            
+            # 添加API调用间隔控制
+            if api_call_count > 0:
+                time_module.sleep(0.2)  # 200毫秒延迟，避免触发限流
+            
+            # 重试机制
+            max_retries = 3
+            retry_delay = 1
+            day_candles = None
+            
+            for attempt in range(max_retries):
+                try:
+                    # 每天最多获取390分钟数据（6.5小时交易时间）
+                    day_candles = QUOTE_CTX.history_candlesticks_by_offset(
+                        symbol, sdk_period, adjust_type, True, 390,
+                        day_start_time_et
+                    )
+                    api_call_count += 1
+                    break  # 成功则跳出重试循环
+                except Exception as e:
+                    if "rate limit" in str(e).lower():
+                        if attempt < max_retries - 1:
+                            if DEBUG_MODE:
+                                print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，等待 {retry_delay} 秒后重试 ({attempt + 1}/{max_retries})")
+                            time_module.sleep(retry_delay)
+                            retry_delay *= 2  # 指数退避
+                        else:
+                            if DEBUG_MODE:
+                                print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，已达最大重试次数")
+                            raise
+                    else:
+                        raise  # 其他错误直接抛出
+            
+            if day_candles:
+                all_candles.extend(day_candles)
+                if DEBUG_MODE:
+                    print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {date_to_check} 数据: {len(day_candles)} 条")
+                
+            date_to_check -= timedelta(days=1)
+        
+        # 处理数据并去重
+        data = []
+        processed_timestamps = set()
+        
+        for candle in all_candles:
+            timestamp = candle.timestamp
+            if isinstance(timestamp, datetime):
+                ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                ts_str = str(timestamp)
+                
+            # 去重处理
+            if ts_str in processed_timestamps:
+                continue
+            processed_timestamps.add(ts_str)
+            
+            # 标准化时区
+            if isinstance(timestamp, datetime):
+                if timestamp.tzinfo is None:
+                    hour = timestamp.hour
+                    if symbol.endswith(".US") and 9 <= hour < 17:
+                        dt = eastern.localize(timestamp)
+                    elif symbol.endswith(".US") and (hour >= 21 or hour < 5):
+                        beijing = pytz.timezone('Asia/Shanghai')
+                        dt = beijing.localize(timestamp).astimezone(eastern)
+                    else:
+                        utc = pytz.utc
+                        dt = utc.localize(timestamp).astimezone(eastern)
+                else:
+                    dt = timestamp.astimezone(eastern)
+            else:
+                dt = datetime.fromtimestamp(timestamp, eastern)
+            
+            # 过滤未来日期
+            if dt.date() > current_date:
+                continue
+                
+            # 添加到数据列表
+            data.append({
+                "Close": float(candle.close),
+                "Open": float(candle.open),
+                "High": float(candle.high),
+                "Low": float(candle.low),
+                "Volume": float(candle.volume),
+                "Turnover": float(candle.turnover),
+                "DateTime": dt
+            })
+        
+        # 转换为DataFrame并进行后处理
+        df = pd.DataFrame(data)
         if df.empty:
             print(f"警告: 无法获取{symbol}的历史数据")
             return pd.DataFrame()
-        
-        # 转换时区到美东时间
-        eastern = pytz.timezone('US/Eastern')
-        df.index = df.index.tz_convert(eastern)
-        
-        # 添加必要的列
-        df['DateTime'] = df.index
-        df['Date'] = df.index.date
-        df['Time'] = df.index.strftime('%H:%M')
+            
+        df["Date"] = df["DateTime"].dt.date
+        df["Time"] = df["DateTime"].dt.strftime('%H:%M')
         
         # 过滤交易时间
-        df = df[df['Time'].between('09:30', '16:00')]
+        if symbol.endswith(".US"):
+            df = df[df["Time"].between("09:30", "16:00")]
+            
+        # 去除重复数据
+        df = df.drop_duplicates(subset=['Date', 'Time'])
         
-        # 重命名列以匹配原始格式
-        df = df.rename(columns={
-            'Open': 'Open',
-            'High': 'High',
-            'Low': 'Low',
-            'Close': 'Close',
-            'Volume': 'Volume'
-        })
-        
-        # 添加Turnover列（成交额 = 价格 * 成交量）
-        df['Turnover'] = df['Close'] * df['Volume']
+        # 过滤掉未来日期的数据（双重保险）
+        df = df[df["Date"] <= current_date]
         
         return df
         
@@ -181,7 +312,7 @@ def calculate_vwap(df):
             # 直接在result_df中设置VWAP值
             result_df.loc[idx, 'VWAP'] = vwap
     
-    return result_df
+    return result_df['VWAP']  # 只返回VWAP列
 
 def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     """计算噪声区域"""
@@ -331,7 +462,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             continue
         
         # 获取历史数据
-        df = get_historical_data_yfinance(symbol, lookback_days + 5)
+        df = get_historical_data(symbol, lookback_days + 5)
         if df.empty:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 无法获取历史数据，等待下次重试")
             time_module.sleep(60)  # 等待1分钟后重试
@@ -405,6 +536,10 @@ if __name__ == "__main__":
     
     # 初始化SQLite数据库
     init_sqlite_database()
+    
+    # 初始化长桥API连接
+    print("\n初始化长桥API连接...")
+    QUOTE_CTX = create_quote_context()
     
     if DEBUG_MODE:
         print("调试模式已开启")
