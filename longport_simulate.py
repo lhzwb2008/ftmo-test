@@ -8,10 +8,22 @@ from math import floor
 from decimal import Decimal
 from dotenv import load_dotenv
 import numpy as np
+import pymysql
+from pymysql.cursors import DictCursor
 
 from longport.openapi import Config, TradeContext, QuoteContext, Period, OrderSide, OrderType, TimeInForceType, AdjustType, OutsideRTH
 
 load_dotenv(override=True)
+
+# 数据库配置
+DB_CONFIG = {
+    'host': 'sh-cdb-kgv8etuq.sql.tencentcdb.com',
+    'port': 23333,
+    'user': 'root',
+    'password': 'Hello2025',
+    'database': 'order',
+    'charset': 'utf8mb4'
+}
 
 # 固定配置参数
 CHECK_INTERVAL_MINUTES = 15
@@ -19,7 +31,7 @@ TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
 TRADING_END_TIME = (15, 45)   # 交易结束时间：15点40分
 MAX_POSITIONS_PER_DAY = 10
 LOOKBACK_DAYS = 1
-LEVERAGE = 1.8 # 杠杆倍数，默认为1倍
+LEVERAGE = 1 # 杠杆倍数，默认为1倍
 K1 = 1 # 上边界sigma乘数
 K2 = 1 # 下边界sigma乘数
 
@@ -74,6 +86,71 @@ def create_contexts():
                 raise
 
 QUOTE_CTX, TRADE_CTX = create_contexts()
+
+def init_database():
+    """初始化数据库，创建交易信号表"""
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        # 创建交易信号表
+        create_table_sql = """
+        CREATE TABLE IF NOT EXISTS trading_signals (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            symbol VARCHAR(20) NOT NULL,
+            signal_type VARCHAR(10) NOT NULL COMMENT 'BUY或SELL',
+            quantity INT NOT NULL,
+            price DECIMAL(10, 2) NOT NULL,
+            stop_price DECIMAL(10, 2),
+            leverage DECIMAL(5, 2) DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            consumed BOOLEAN DEFAULT FALSE,
+            consumed_at TIMESTAMP NULL,
+            status VARCHAR(20) DEFAULT 'PENDING' COMMENT 'PENDING/EXECUTED/CANCELLED',
+            INDEX idx_symbol_consumed (symbol, consumed),
+            INDEX idx_created_at (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+        cursor.execute(create_table_sql)
+        conn.commit()
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 数据库表初始化成功")
+        
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 数据库初始化失败: {str(e)}")
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
+
+def write_trading_signal(symbol, signal_type, quantity, price, stop_price=None):
+    """将交易信号写入数据库"""
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        insert_sql = """
+        INSERT INTO trading_signals (symbol, signal_type, quantity, price, stop_price, leverage)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_sql, (symbol, signal_type, quantity, price, stop_price, LEVERAGE))
+        conn.commit()
+        
+        signal_id = cursor.lastrowid
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 交易信号已写入数据库，ID: {signal_id}")
+        return signal_id
+        
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入交易信号失败: {str(e)}")
+        return None
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
+
+# 初始化数据库
+init_database()
 
 def get_account_balance():
     if DEBUG_MODE:
@@ -919,35 +996,40 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"错误: 尝试{max_retries}次后仍无法获取当前时间点 {current_time} 的数据")
                     continue  # 继续下一次循环，而不是退出
                 
-                # 执行平仓
+                # 写入平仓信号到数据库
                 side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
+                signal_id = write_trading_signal(symbol, side.upper(), abs(position_quantity), exit_price, None)
                 
-                # 计算盈亏
-                if entry_price:
-                    pnl = (exit_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                    pnl_pct = (exit_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {exit_price}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:.2f}%)")
-                    # 更新收益统计
-                    DAILY_PNL += pnl
-                    TOTAL_PNL += pnl
-                    # 记录平仓交易
-                    DAILY_TRADES.append({
-                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                        "action": "平仓",
-                        "side": side,
-                        "quantity": abs(position_quantity),
-                        "price": exit_price,
-                        "pnl": pnl
-                    })
-                
-                # 平仓后增加交易次数计数器
-                positions_opened_today += 1
-                
-                position_quantity = 0
-                entry_price = None
+                if signal_id:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库，ID: {signal_id}")
+                    
+                    # 计算盈亏
+                    if entry_price:
+                        pnl = (exit_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                        pnl_pct = (exit_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 模拟平仓: {side} {abs(position_quantity)} {symbol} 价格: {exit_price}")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:.2f}%)")
+                        # 更新收益统计
+                        DAILY_PNL += pnl
+                        TOTAL_PNL += pnl
+                        # 记录平仓交易
+                        DAILY_TRADES.append({
+                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                            "action": "平仓信号",
+                            "side": side,
+                            "quantity": abs(position_quantity),
+                            "price": exit_price,
+                            "pnl": pnl
+                        })
+                    
+                    # 平仓后增加交易次数计数器
+                    positions_opened_today += 1
+                    
+                    position_quantity = 0
+                    entry_price = None
+                    current_stop = None
+                else:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 警告: 平仓信号写入数据库失败")
         else:
             # 检查是否已有持仓，如果有则不再开仓
             if position_quantity != 0:
@@ -1017,23 +1099,32 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 调整后资金: ${adjusted_capital:.2f}")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股")
                     side = "Buy" if signal > 0 else "Sell"
-                    order_id = submit_order(symbol, side, position_size, outside_rth=outside_rth_setting)
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 订单已提交，ID: {order_id}")
                     
-                    # 删除订单状态检查代码，直接更新持仓状态
-                    position_quantity = position_size if signal > 0 else -position_size
-                    entry_price = latest_price
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {position_size} {symbol} 价格: {entry_price}")
+                    # 将交易信号写入数据库，而不是直接下单
+                    signal_id = write_trading_signal(symbol, side.upper(), position_size, latest_price, stop)
                     
-                    # 记录开仓交易
-                    DAILY_TRADES.append({
-                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                        "action": "开仓",
-                        "side": side,
-                        "quantity": position_size,
-                        "price": entry_price,
-                        "pnl": None  # 开仓时还没有盈亏
-                    })
+                    if signal_id:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易信号已写入数据库，ID: {signal_id}")
+                        
+                        # 更新持仓状态（用于模拟跟踪）
+                        position_quantity = position_size if signal > 0 else -position_size
+                        entry_price = latest_price
+                        current_stop = stop
+                        positions_opened_today += 1
+                        
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 模拟开仓: {side} {position_size} {symbol} 价格: {entry_price}")
+                        
+                        # 记录开仓交易
+                        DAILY_TRADES.append({
+                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                            "action": "开仓信号",
+                            "side": side,
+                            "quantity": position_size,
+                            "price": entry_price,
+                            "pnl": None  # 开仓时还没有盈亏
+                        })
+                    else:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 警告: 交易信号写入数据库失败")
         
         # 调试模式且单次运行模式，完成一次循环后退出
         if DEBUG_MODE and DEBUG_ONCE:
