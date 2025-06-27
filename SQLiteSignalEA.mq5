@@ -417,6 +417,11 @@ double CalculateLotSize()
     Print("📊 初始保证金: ", margin_initial);
     Print("📊 维持保证金: ", margin_maintenance);
     Print("📊 保证金计算模式: ", EnumToString(calc_mode));
+    Print("💰 账户余额: $", DoubleToString(balance, 2));
+    Print("💰 账户净值: $", DoubleToString(equity, 2));
+    Print("💰 可用保证金: $", DoubleToString(free_margin, 2));
+    Print("💰 使用资金比例: ", RiskPercent, "%");
+    Print("💰 计算使用资金: $", DoubleToString(risk_amount, 2));
     
     // 计算1手所需的保证金
     double margin_for_one_lot = 0;

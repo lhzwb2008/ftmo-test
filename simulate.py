@@ -143,6 +143,8 @@ def write_signal_to_sqlite(action):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入信号失败: {str(e)}")
         return None
 
+
+
 def get_historical_data(symbol, days_back=5):
     """使用长桥API获取历史数据"""
     try:
@@ -314,6 +316,36 @@ def calculate_vwap(df):
     
     return result_df['VWAP']  # 只返回VWAP列
 
+def check_exit_conditions(df, position_type, current_date, current_time_str):
+    """检查退出条件（参考simulate_old逻辑）"""
+    # 获取当前时间点数据
+    current_data = df[(df["Date"] == current_date) & (df["Time"] == current_time_str)]
+    
+    # 如果当前时间点没有数据，使用最新数据
+    if current_data.empty:
+        df_sorted = df.sort_values(by=["Date", "Time"], ascending=True)
+        latest = df_sorted.iloc[-1]
+    else:
+        latest = current_data.iloc[0]
+        
+    price = latest["Close"]
+    vwap = latest["VWAP"]
+    upper = latest["UpperBound"]
+    lower = latest["LowerBound"]
+    
+    if position_type == 'LONG':
+        # 多头持仓：价格跌破上轨和VWAP的较大值时退出
+        stop_level = max(upper, vwap)
+        exit_signal = price < stop_level
+        return exit_signal
+    elif position_type == 'SHORT':
+        # 空头持仓：价格突破下轨和VWAP的较小值时退出
+        stop_level = min(lower, vwap)
+        exit_signal = price > stop_level
+        return exit_signal
+    
+    return False
+
 def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     """计算噪声区域"""
     # 创建数据副本
@@ -399,6 +431,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     signals_sent_today = 0
     last_date = None
     last_signal_time = None  # 防止同一分钟内重复发送信号
+    current_position = None  # 跟踪当前持仓状态：None, 'LONG', 'SHORT'
     
     while True:
         now = get_us_eastern_time()
@@ -422,6 +455,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 检查是否是新交易日
         if last_date is not None and current_date != last_date:
             signals_sent_today = 0
+            current_position = None  # 新交易日重置持仓状态
         last_date = current_date
         
         # 检查是否在交易时间内
@@ -439,6 +473,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易时间结束，发送收盘信号")
                 write_signal_to_sqlite("CLOSE")
                 last_signal_time = current_time_str
+                current_position = None  # 收盘后重置持仓状态
             
             if DEBUG_MODE and DEBUG_ONCE:
                 print("\n调试模式单次运行完成，程序退出")
@@ -477,8 +512,20 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         df["VWAP"] = calculate_vwap(df)
         df = calculate_noise_area(df, lookback_days, K1, K2)
         
+        # 检查是否已有持仓，如果有则检查退出条件
+        if current_position is not None:
+            if DEBUG_MODE:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓状态: {current_position}，检查退出条件")
+            
+            # 检查退出条件
+            exit_signal = check_exit_conditions(df, current_position, current_date, current_time_str)
+            if exit_signal:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号，发送平仓信号")
+                write_signal_to_sqlite("CLOSE")
+                current_position = None  # 平仓后重置持仓状态
+                last_signal_time = current_time_str
         # 检查是否达到每日信号上限
-        if signals_sent_today >= max_positions_per_day:
+        elif signals_sent_today >= max_positions_per_day:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已发送 {signals_sent_today} 个信号，达到上限")
         else:
             # 避免同一分钟内重复发送信号
@@ -504,12 +551,14 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         write_signal_to_sqlite("BUY")
                         signals_sent_today += 1
                         last_signal_time = current_time_str
+                        current_position = 'LONG'
                     # 检查空头入场条件
                     elif price < lower and price < vwap:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足空头入场条件，发送卖出信号")
                         write_signal_to_sqlite("SELL")
                         signals_sent_today += 1
                         last_signal_time = current_time_str
+                        current_position = 'SHORT'
                     else:
                         if DEBUG_MODE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件")
