@@ -4,14 +4,18 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.00"
+#property version   "1.01"
 #property strict
+
+// 添加必要的权限声明
+#property script_show_inputs
 
 #include <Trade\Trade.mqh>
 #include <Trade\AccountInfo.mqh>
 
 //--- 输入参数
-input string   DBPath = "trading_signals.db";          // SQLite数据库文件
+input string   DBPath = "trading_signals.db";          // SQLite数据库文件名
+input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
 input int      MagicNumber = 20241228;                 // 魔术数字
 input double   Leverage = 5.0;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
@@ -76,16 +80,70 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool OpenDatabase()
 {
-    string full_path = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\" + DBPath;
-    db_handle = DatabaseOpen(full_path, DATABASE_OPEN_READWRITE | DATABASE_OPEN_COMMON);
+    string full_path;
+    
+    // 根据设置选择路径
+    if(UseCommonPath)
+    {
+        // 使用通用目录 - 所有MT5终端共享
+        full_path = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\" + DBPath;
+    }
+    else
+    {
+        // 使用当前终端的Files目录
+        full_path = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL5\\Files\\" + DBPath;
+    }
+    
+    // 打印调试信息
+    Print("🔍 尝试打开数据库: ", full_path);
+    Print("🔍 使用通用目录: ", UseCommonPath ? "是" : "否");
+    Print("🔍 当前终端目录: ", TerminalInfoString(TERMINAL_DATA_PATH));
+    Print("🔍 通用数据目录: ", TerminalInfoString(TERMINAL_COMMONDATA_PATH));
+    
+    // 方式1: 尝试读写模式
+    if(UseCommonPath)
+    {
+        db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READWRITE | DATABASE_OPEN_COMMON);
+    }
+    else
+    {
+        db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READWRITE);
+    }
     
     if(db_handle == INVALID_HANDLE)
     {
-        Print("❌ 无法打开数据库: ", full_path);
+        Print("❌ 读写模式失败，尝试只读模式...");
+        if(UseCommonPath)
+        {
+            db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READONLY | DATABASE_OPEN_COMMON);
+        }
+        else
+        {
+            db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READONLY);
+        }
+    }
+    
+    if(db_handle == INVALID_HANDLE)
+    {
+        Print("❌ 所有方式都失败了");
+        Print("❌ 最后错误代码: ", GetLastError());
+        Print("❌ 请检查以下事项:");
+        Print("   1. 数据库文件是否存在于正确目录");
+        Print("   2. 文件权限是否正确");
+        Print("   3. 数据库文件是否损坏");
+        Print("   4. 建议的解决方案:");
+        if(UseCommonPath)
+        {
+            Print("      - 将数据库文件复制到: ", TerminalInfoString(TERMINAL_COMMONDATA_PATH), "\\Files\\");
+        }
+        else
+        {
+            Print("      - 将数据库文件复制到: ", TerminalInfoString(TERMINAL_DATA_PATH), "\\MQL5\\Files\\");
+        }
         return false;
     }
     
-    Print("✅ 数据库已打开");
+    Print("✅ 数据库已成功打开: ", full_path);
     return true;
 }
 
@@ -97,8 +155,8 @@ void CheckDatabaseSignals()
     if(db_handle == INVALID_HANDLE)
         return;
     
-    // 查询未消费的信号
-    string query = "SELECT id, action, quantity FROM signals WHERE consumed = 0 ORDER BY created_at ASC LIMIT 1";
+    // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
+    string query = "SELECT id, action FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
     
     int request = DatabasePrepare(db_handle, query);
     if(request == INVALID_HANDLE)
@@ -110,18 +168,19 @@ void CheckDatabaseSignals()
     // 读取查询结果
     if(DatabaseRead(request))
     {
-        long signal_id;
-        string action;
-        long quantity;
+        long latest_signal_id;
+        string latest_action;
         
-        DatabaseColumnLong(request, 0, signal_id);
-        DatabaseColumnText(request, 1, action);
-        DatabaseColumnLong(request, 2, quantity);
+        DatabaseColumnLong(request, 0, latest_signal_id);
+        DatabaseColumnText(request, 1, latest_action);
         
-        Print("📊 新信号: ", action, " 数量: ", quantity);
+        Print("📊 检测到未消费信号，只执行最新的: ", latest_action, " (ID: ", latest_signal_id, ")");
         
-        // 处理信号
-        ProcessSignal(signal_id, action, quantity);
+        // 先标记所有未消费的信号为已消费（除了最新的这一条）
+        MarkOldSignalsConsumed(latest_signal_id);
+        
+        // 处理最新的信号
+        ProcessSignal(latest_signal_id, latest_action);
     }
     
     DatabaseFinalize(request);
@@ -130,7 +189,7 @@ void CheckDatabaseSignals()
 //+------------------------------------------------------------------+
 //| 处理交易信号                                                      |
 //+------------------------------------------------------------------+
-void ProcessSignal(long signal_id, string action, long quantity)
+void ProcessSignal(long signal_id, string action)
 {
     bool result = false;
     double lots = 0;
@@ -223,6 +282,19 @@ void CloseAllPositions()
                 trade.PositionClose(ticket);
             }
         }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 标记旧信号为已消费（除了指定的最新信号）                            |
+//+------------------------------------------------------------------+
+void MarkOldSignalsConsumed(long latest_signal_id)
+{
+    string update_query = StringFormat("UPDATE signals SET consumed = 1 WHERE consumed = 0 AND id != %d", latest_signal_id);
+    
+    if(DatabaseExecute(db_handle, update_query))
+    {
+        Print("✅ 旧信号已全部标记为已消费");
     }
 }
 

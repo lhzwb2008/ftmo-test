@@ -14,8 +14,19 @@ from longport.openapi import Config, TradeContext, QuoteContext, Period, OrderSi
 
 load_dotenv(override=True)
 
-# SQLite数据库路径
-DB_PATH = "trading_signals.db"
+# SQLite数据库路径 - 使用MT5通用目录
+import platform
+if platform.system() == "Windows":
+    # Windows系统：使用MT5通用目录
+    mt5_files_dir = os.path.expanduser("~/AppData/Roaming/MetaQuotes/Terminal/Common/Files")
+    
+    # 确保目录存在
+    os.makedirs(mt5_files_dir, exist_ok=True)
+    DB_PATH = os.path.join(mt5_files_dir, "trading_signals.db")
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S') if 'get_us_eastern_time' in globals() else datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 使用MT5通用目录: {mt5_files_dir}")
+else:
+    # 非Windows系统：使用当前目录
+    DB_PATH = "trading_signals.db"
 
 # 固定配置参数
 CHECK_INTERVAL_MINUTES = 15
@@ -90,7 +101,6 @@ def init_sqlite_database():
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT NOT NULL,  -- BUY, SELL, CLOSE
-            quantity INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             consumed INTEGER DEFAULT 0
         )
@@ -104,22 +114,22 @@ def init_sqlite_database():
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
 
-def write_signal_to_sqlite(action, quantity):
+def write_signal_to_sqlite(action):
     """将交易信号写入SQLite数据库"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute("""
-        INSERT INTO signals (action, quantity)
-        VALUES (?, ?)
-        """, (action.upper(), abs(quantity)))
+        INSERT INTO signals (action)
+        VALUES (?)
+        """, (action.upper(),))
         
         conn.commit()
         signal_id = cursor.lastrowid
         conn.close()
         
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 信号已写入: {action} {quantity} (ID: {signal_id})")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 信号已写入: {action} (ID: {signal_id})")
         return signal_id
         
     except Exception as e:
