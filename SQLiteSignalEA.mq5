@@ -194,49 +194,86 @@ void ProcessSignal(long signal_id, string action)
     bool result = false;
     double lots = 0;
     
-    // 根据账户余额计算手数
-    if(action == "BUY" || action == "SELL")
-    {
-        lots = CalculateLotSize();
-        if(lots <= 0)
-        {
-            Print("❌ 计算手数失败，余额不足");
-            MarkSignalConsumed(signal_id);
-            return;
-        }
-    }
+    // 检查当前持仓状态
+    int position_type = GetPositionType(); // 0=无持仓, 1=多仓, -1=空仓
     
     if(action == "BUY")
     {
-        // 检查是否已有持仓
-        if(HasPosition())
+        if(position_type == 1)
         {
-            Print("⚠️ 已有持仓，忽略买入信号");
+            // 已有多仓，忽略买入信号
+            Print("⚠️ 已有多仓，忽略买入信号");
             MarkSignalConsumed(signal_id);
             return;
         }
-        
-        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        result = trade.Buy(lots, _Symbol, ask, 0, 0, "QQQ Signal Buy");
+        else if(position_type == -1)
+        {
+            // 有空仓，先平仓
+            Print("🔄 检测到买入信号，先平掉现有空仓");
+            CloseAllPositions();
+            MarkSignalConsumed(signal_id);
+            return;
+        }
+        else
+        {
+            // 无持仓，开多仓
+            lots = CalculateLotSize();
+            if(lots <= 0)
+            {
+                Print("❌ 计算手数失败，余额不足");
+                MarkSignalConsumed(signal_id);
+                return;
+            }
+            
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            result = trade.Buy(lots, _Symbol, ask, 0, 0, "QQQ Signal Buy");
+        }
     }
     else if(action == "SELL")
     {
-        // 检查是否已有持仓
-        if(HasPosition())
+        if(position_type == -1)
         {
-            Print("⚠️ 已有持仓，忽略卖空信号");
+            // 已有空仓，忽略卖出信号
+            Print("⚠️ 已有空仓，忽略卖出信号");
             MarkSignalConsumed(signal_id);
             return;
         }
-        
-        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-        result = trade.Sell(lots, _Symbol, bid, 0, 0, "QQQ Signal Sell");
+        else if(position_type == 1)
+        {
+            // 有多仓，先平仓
+            Print("🔄 检测到卖出信号，先平掉现有多仓");
+            CloseAllPositions();
+            MarkSignalConsumed(signal_id);
+            return;
+        }
+        else
+        {
+            // 无持仓，开空仓
+            lots = CalculateLotSize();
+            if(lots <= 0)
+            {
+                Print("❌ 计算手数失败，余额不足");
+                MarkSignalConsumed(signal_id);
+                return;
+            }
+            
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            result = trade.Sell(lots, _Symbol, bid, 0, 0, "QQQ Signal Sell");
+        }
     }
     else if(action == "CLOSE")
     {
         // 平仓所有持仓
-        CloseAllPositions();
-        result = true;
+        if(position_type != 0)
+        {
+            CloseAllPositions();
+            result = true;
+        }
+        else
+        {
+            Print("⚠️ 无持仓，忽略平仓信号");
+            result = true; // 标记为成功，避免重复处理
+        }
     }
     
     if(result)
@@ -265,6 +302,30 @@ bool HasPosition()
         }
     }
     return false;
+}
+
+//+------------------------------------------------------------------+
+//| 获取当前持仓类型                                                  |
+//| 返回: 0=无持仓, 1=多仓, -1=空仓                                  |
+//+------------------------------------------------------------------+
+int GetPositionType()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(PositionSelectByTicket(ticket))
+        {
+            if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            {
+                ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+                if(type == POSITION_TYPE_BUY)
+                    return 1;  // 多仓
+                else if(type == POSITION_TYPE_SELL)
+                    return -1; // 空仓
+            }
+        }
+    }
+    return 0; // 无持仓
 }
 
 //+------------------------------------------------------------------+
@@ -320,15 +381,13 @@ double CalculateLotSize()
     double balance = AccountInfoDouble(ACCOUNT_BALANCE);
     double equity = AccountInfoDouble(ACCOUNT_EQUITY);
     double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+    double account_leverage = (double)AccountInfoInteger(ACCOUNT_LEVERAGE);
     
-    // 使用可用保证金和余额中的较小值
-    double available_funds = MathMin(free_margin, equity);
+    // 使用余额作为基础
+    double base_amount = balance;
     
     // 应用风险百分比
-    double risk_amount = available_funds * (RiskPercent / 100.0);
-    
-    // 应用杠杆
-    double leveraged_amount = risk_amount * Leverage;
+    double risk_amount = base_amount * (RiskPercent / 100.0);
     
     // 获取当前价格
     double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -338,13 +397,72 @@ double CalculateLotSize()
     double contract_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
     if(contract_size <= 0) contract_size = 1;
     
-    // 计算手数
-    double lots = leveraged_amount / (price * contract_size);
+    // 获取点值
+    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    
+    // 获取保证金计算相关信息
+    double margin_initial = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
+    double margin_maintenance = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_MAINTENANCE);
+    ENUM_SYMBOL_CALC_MODE calc_mode = (ENUM_SYMBOL_CALC_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_CALC_MODE);
+    
+    // 打印合约规格信息（用于调试）
+    Print("=== 合约规格信息 ===");
+    Print("📊 交易品种: ", _Symbol);
+    Print("📊 合约大小: ", contract_size);
+    Print("📊 最小变动价位: ", tick_size);
+    Print("📊 最小变动价值: ", tick_value);
+    Print("📊 当前价格: ", price);
+    Print("📊 账户杠杆: ", account_leverage);
+    Print("📊 初始保证金: ", margin_initial);
+    Print("📊 维持保证金: ", margin_maintenance);
+    Print("📊 保证金计算模式: ", EnumToString(calc_mode));
+    
+    // 计算1手所需的保证金
+    double margin_for_one_lot = 0;
+    bool margin_calc_result = OrderCalcMargin(
+        ORDER_TYPE_BUY,
+        _Symbol,
+        1.0,  // 1手
+        price,
+        margin_for_one_lot
+    );
+    
+    if(margin_calc_result)
+    {
+        Print("📊 1手所需保证金: $", DoubleToString(margin_for_one_lot, 2));
+    }
+    else
+    {
+        Print("❌ 无法计算1手保证金");
+    }
+    
+    // 方法1：根据可用保证金和杠杆计算最大可能手数
+    double max_lots_by_margin = 0;
+    if(margin_for_one_lot > 0)
+    {
+        max_lots_by_margin = (free_margin * 0.95) / margin_for_one_lot;  // 使用95%的可用保证金
+        Print("📊 基于可用保证金的最大手数: ", DoubleToString(max_lots_by_margin, 2));
+    }
+    
+    // 方法2：使用设定的杠杆倍数计算
+    double total_trading_value = risk_amount * Leverage;
+    double lots_by_leverage = total_trading_value / (price * contract_size);
+    
+    // 选择两种方法中较小的值（更保守）
+    double lots = MathMin(lots_by_leverage, max_lots_by_margin);
+    
+    Print("📊 基于杠杆的手数: ", DoubleToString(lots_by_leverage, 2));
+    Print("📊 选择手数（取较小值）: ", DoubleToString(lots, 2));
     
     // 调整到合法范围
     double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
     double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    Print("📊 最小手数: ", min_lot);
+    Print("📊 最大手数: ", max_lot);
+    Print("📊 手数步长: ", lot_step);
     
     // 向下取整到步长
     lots = MathFloor(lots / lot_step) * lot_step;
@@ -353,11 +471,41 @@ double CalculateLotSize()
     lots = MathMax(lots, min_lot);
     lots = MathMin(lots, max_lot);
     
+    // 计算实际的保证金需求
+    double actual_margin_required = 0;
+    OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, price, actual_margin_required);
+    
+    // 计算实际持仓价值
+    double position_value = lots * price * contract_size;
+    
+    // 计算实际杠杆
+    double actual_leverage = position_value / actual_margin_required;
+    
     Print("💰 账户余额: $", DoubleToString(balance, 2));
     Print("💰 可用保证金: $", DoubleToString(free_margin, 2));
     Print("💰 使用资金: $", DoubleToString(risk_amount, 2), " (", RiskPercent, "%)");
-    Print("💰 杠杆后资金: $", DoubleToString(leveraged_amount, 2), " (", Leverage, "倍)");
-    Print("📊 计算手数: ", DoubleToString(lots, 2));
+    Print("📊 1手价值: $", DoubleToString(price * contract_size, 2));
+    Print("📊 设定杠杆倍数: ", Leverage, "倍");
+    Print("💰 可交易总价值: $", DoubleToString(total_trading_value, 2));
+    Print("📊 最终手数: ", DoubleToString(lots, 2));
+    Print("💰 实际持仓价值: $", DoubleToString(position_value, 2));
+    Print("💰 实际所需保证金: $", DoubleToString(actual_margin_required, 2));
+    Print("📊 实际杠杆: ", DoubleToString(actual_leverage, 2), "倍");
+    
+    // 再次检查保证金是否充足
+    if(actual_margin_required > free_margin)
+    {
+        Print("⚠️ 警告：所需保证金超过可用保证金！");
+        Print("⚠️ 所需保证金: $", DoubleToString(actual_margin_required, 2));
+        Print("⚠️ 可用保证金: $", DoubleToString(free_margin, 2));
+        
+        // 调整手数以适应可用保证金
+        lots = (free_margin * 0.95) / margin_for_one_lot;
+        lots = MathFloor(lots / lot_step) * lot_step;
+        lots = MathMax(lots, min_lot);
+        
+        Print("📊 调整后手数: ", DoubleToString(lots, 2));
+    }
     
     return lots;
 } 
