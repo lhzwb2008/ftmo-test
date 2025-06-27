@@ -696,7 +696,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             # 写入平仓信号到数据库
             side = "Sell" if position_quantity > 0 else "Buy"
-            signal_id = write_signal_to_sqlite("CLOSE", abs(position_quantity))
+            signal_id = write_signal_to_sqlite("CLOSE")
             
             if signal_id:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库，ID: {signal_id}")
@@ -806,7 +806,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                signal_id = write_signal_to_sqlite("CLOSE", abs(position_quantity))
+                signal_id = write_signal_to_sqlite("CLOSE")
                 
                 if signal_id:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库，ID: {signal_id}")
@@ -907,7 +907,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                signal_id = write_signal_to_sqlite("CLOSE", abs(position_quantity))
+                signal_id = write_signal_to_sqlite("CLOSE")
                 
                 if signal_id:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库，ID: {signal_id}")
@@ -1096,7 +1096,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     side = "Buy" if signal > 0 else "Sell"
                     
                     # 写入交易信号到数据库，而不是直接下单
-                    signal_id = write_signal_to_sqlite(side, position_size)
+                    signal_id = write_signal_to_sqlite(side)
                     
                     if signal_id:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易信号已写入数据库，ID: {signal_id}")
