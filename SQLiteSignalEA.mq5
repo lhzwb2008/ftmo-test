@@ -8,13 +8,14 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include <Trade\AccountInfo.mqh>
 
 //--- 输入参数
 input string   DBPath = "trading_signals.db";          // SQLite数据库文件
 input int      MagicNumber = 20241228;                 // 魔术数字
-input double   Leverage = 20.0;                        // 杠杆倍数
-input double   BaseLotSize = 0.1;                      // 基础手数
-input int      CheckIntervalSeconds = 5;               // 检查间隔（秒）
+input double   Leverage = 5.0;                        // 杠杆倍数
+input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
+input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 
 //--- 全局变量
 CTrade trade;
@@ -38,7 +39,7 @@ int OnInit()
     
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
-    Print("📊 基础手数: ", BaseLotSize);
+    Print("📊 使用余额: ", RiskPercent, "%");
     
     return(INIT_SUCCEEDED);
 }
@@ -132,18 +133,19 @@ void CheckDatabaseSignals()
 void ProcessSignal(long signal_id, string action, long quantity)
 {
     bool result = false;
+    double lots = 0;
     
-    // 计算手数（考虑杠杆）
-    double lots = BaseLotSize * Leverage;
-    
-    // 调整到合法范围
-    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-    
-    lots = MathMax(lots, min_lot);
-    lots = MathMin(lots, max_lot);
-    lots = MathRound(lots / lot_step) * lot_step;
+    // 根据账户余额计算手数
+    if(action == "BUY" || action == "SELL")
+    {
+        lots = CalculateLotSize();
+        if(lots <= 0)
+        {
+            Print("❌ 计算手数失败，余额不足");
+            MarkSignalConsumed(signal_id);
+            return;
+        }
+    }
     
     if(action == "BUY")
     {
@@ -235,4 +237,55 @@ void MarkSignalConsumed(long signal_id)
     {
         Print("✅ 信号已标记为已消费");
     }
+}
+
+//+------------------------------------------------------------------+
+//| 根据账户余额和杠杆计算手数                                         |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+    // 获取账户信息
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+    
+    // 使用可用保证金和余额中的较小值
+    double available_funds = MathMin(free_margin, equity);
+    
+    // 应用风险百分比
+    double risk_amount = available_funds * (RiskPercent / 100.0);
+    
+    // 应用杠杆
+    double leveraged_amount = risk_amount * Leverage;
+    
+    // 获取当前价格
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    if(price <= 0) return 0;
+    
+    // 获取合约规格
+    double contract_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+    if(contract_size <= 0) contract_size = 1;
+    
+    // 计算手数
+    double lots = leveraged_amount / (price * contract_size);
+    
+    // 调整到合法范围
+    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    // 向下取整到步长
+    lots = MathFloor(lots / lot_step) * lot_step;
+    
+    // 确保在允许范围内
+    lots = MathMax(lots, min_lot);
+    lots = MathMin(lots, max_lot);
+    
+    Print("💰 账户余额: $", DoubleToString(balance, 2));
+    Print("💰 可用保证金: $", DoubleToString(free_margin, 2));
+    Print("💰 使用资金: $", DoubleToString(risk_amount, 2), " (", RiskPercent, "%)");
+    Print("💰 杠杆后资金: $", DoubleToString(leveraged_amount, 2), " (", Leverage, "倍)");
+    Print("📊 计算手数: ", DoubleToString(lots, 2));
+    
+    return lots;
 } 
