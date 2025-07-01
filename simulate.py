@@ -9,9 +9,8 @@ from decimal import Decimal
 from dotenv import load_dotenv
 import numpy as np
 import sqlite3
-import signal
 
-from longport.openapi import Config, QuoteContext, TradeContext, Period, AdjustType, Market
+from longport.openapi import Config, TradeContext, QuoteContext, Period, OrderSide, OrderType, TimeInForceType, AdjustType, OutsideRTH
 
 load_dotenv(override=True)
 
@@ -33,9 +32,9 @@ DEBUG_MODE = False   # 设置为True开启调试模式
 DEBUG_TIME = "2025-05-15 12:36:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
 DEBUG_ONCE = True  # 是否只运行一次就退出
 
-# 全局变量用于跟踪收益
-TOTAL_PNL = 0.0  # 累计盈亏
-DAILY_PNL = 0.0  # 当日盈亏
+# 收益统计全局变量
+TOTAL_PNL = 0.0  # 总收益
+DAILY_PNL = 0.0  # 当日收益
 LAST_STATS_DATE = None  # 上次统计日期
 DAILY_TRADES = []  # 当日交易记录
 
@@ -43,85 +42,13 @@ DAILY_TRADES = []  # 当日交易记录
 import platform
 if platform.system() == "Windows":
     # Windows系统：使用MT5通用目录
-    # 获取AppData路径
     appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
     mt5_common_path = os.path.join(appdata_path, "MetaQuotes", "Terminal", "Common", "Files")
-    
-    # 确保目录存在
     os.makedirs(mt5_common_path, exist_ok=True)
-    
-    # 数据库文件路径
     DB_PATH = os.path.join(mt5_common_path, "trading_signals.db")
-    
-    # 打印路径信息
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Windows系统检测")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] MT5通用目录: {mt5_common_path}")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 数据库路径: {DB_PATH}")
 else:
     # 非Windows系统：使用当前目录
     DB_PATH = "trading_signals.db"
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 非Windows系统，使用当前目录")
-
-def get_us_eastern_time():
-    if DEBUG_MODE and DEBUG_TIME:
-        # 如果处于调试模式且指定了时间，返回指定的时间
-        try:
-            dt = datetime.strptime(DEBUG_TIME, "%Y-%m-%d %H:%M:%S")
-            eastern = pytz.timezone('US/Eastern')
-            return eastern.localize(dt)
-        except ValueError:
-            print(f"错误的调试时间格式: {DEBUG_TIME}，应为 'YYYY-MM-DD HH:MM:SS'")
-    
-    # 正常模式或调试时间格式错误时返回当前时间
-    eastern = pytz.timezone('US/Eastern')
-    return datetime.now(eastern)
-
-def create_contexts():
-    max_retries = 5
-    retry_delay = 5  # 秒
-    
-    for attempt in range(max_retries):
-        try:
-            config = Config.from_env()
-            quote_ctx = QuoteContext(config)
-            trade_ctx = TradeContext(config)
-            if DEBUG_MODE:
-                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接成功")
-            return quote_ctx, trade_ctx
-        except Exception as e:
-            if attempt < max_retries - 1:
-                if DEBUG_MODE:
-                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败 ({attempt + 1}/{max_retries}): {str(e)}")
-                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {retry_delay}秒后重试...")
-                time_module.sleep(retry_delay)
-            else:
-                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败，已达最大重试次数")
-                raise
-
-QUOTE_CTX, TRADE_CTX = create_contexts()
-
-def signal_handler(signum, frame):
-    """处理退出信号"""
-    print("\n接收到退出信号，正在关闭...")
-    # 长桥API的Context对象可能没有close方法，直接退出
-    sys.exit(0)
-
-def get_quote(symbol):
-    """获取实时行情"""
-    try:
-        resp = QUOTE_CTX.quote([symbol])
-        if resp and len(resp) > 0:
-            quote = resp[0]
-            return {
-                "last_done": quote.last_done,
-                "volume": quote.volume,
-                "turnover": quote.turnover,
-                "bid_price": quote.bid_price,
-                "ask_price": quote.ask_price
-            }
-    except Exception as e:
-        print(f"获取行情失败: {e}")
-    return {}
 
 def init_sqlite_database():
     """初始化SQLite数据库"""
@@ -169,7 +96,79 @@ def write_signal_to_sqlite(action):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入信号失败: {str(e)}")
         return None
 
+def get_us_eastern_time():
+    if DEBUG_MODE and DEBUG_TIME:
+        # 如果处于调试模式且指定了时间，返回指定的时间
+        try:
+            dt = datetime.strptime(DEBUG_TIME, "%Y-%m-%d %H:%M:%S")
+            eastern = pytz.timezone('US/Eastern')
+            return eastern.localize(dt)
+        except ValueError:
+            print(f"错误的调试时间格式: {DEBUG_TIME}，应为 'YYYY-MM-DD HH:MM:SS'")
+    
+    # 正常模式或调试时间格式错误时返回当前时间
+    eastern = pytz.timezone('US/Eastern')
+    return datetime.now(eastern)
 
+def create_contexts():
+    max_retries = 5
+    retry_delay = 5  # 秒
+    
+    for attempt in range(max_retries):
+        try:
+            config = Config.from_env()
+            quote_ctx = QuoteContext(config)
+            trade_ctx = TradeContext(config)
+            if DEBUG_MODE:
+                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接成功")
+            return quote_ctx, trade_ctx
+        except Exception as e:
+            if attempt < max_retries - 1:
+                if DEBUG_MODE:
+                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败 ({attempt + 1}/{max_retries}): {str(e)}")
+                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {retry_delay}秒后重试...")
+                time_module.sleep(retry_delay)
+            else:
+                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败，已达最大重试次数")
+                raise
+
+QUOTE_CTX, TRADE_CTX = create_contexts()
+
+def get_account_balance():
+    if DEBUG_MODE:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 获取美元账户余额")
+    balance_list = TRADE_CTX.account_balance()  # 不需要指定currency参数
+    
+    # 从cash_infos中找到USD的可用现金
+    usd_available_cash = 0.0
+    for balance_info in balance_list:
+        for cash_info in balance_info.cash_infos:
+            if cash_info.currency == "USD":
+                usd_available_cash = float(cash_info.available_cash)
+                if DEBUG_MODE:
+                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 美元可用现金: ${usd_available_cash:.2f}")
+                return usd_available_cash
+    
+    # 如果没有找到USD账户，返回0
+    if DEBUG_MODE:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 警告: 未找到美元账户，返回余额为0")
+    return 0.0
+
+def get_current_positions():
+    if DEBUG_MODE:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 获取当前持仓")
+    stock_positions_response = TRADE_CTX.stock_positions()
+    positions = {}
+    for channel in stock_positions_response.channels:
+        for position in channel.positions:
+            symbol = position.symbol
+            quantity = int(position.quantity)
+            cost_price = float(position.cost_price)
+            positions[symbol] = {
+                "quantity": quantity,
+                "cost_price": cost_price
+            }
+    return positions
 
 def get_historical_data(symbol, days_back=None):
     # 简化天数计算逻辑
@@ -306,7 +305,19 @@ def get_historical_data(symbol, days_back=None):
     
     return df
 
-
+def get_quote(symbol):
+    quotes = QUOTE_CTX.quote([symbol])
+    quote_data = {
+        "symbol": quotes[0].symbol,
+        "last_done": str(quotes[0].last_done),
+        "open": str(quotes[0].open),
+        "high": str(quotes[0].high),
+        "low": str(quotes[0].low),
+        "volume": str(quotes[0].volume),
+        "turnover": str(quotes[0].turnover),
+        "timestamp": quotes[0].timestamp.isoformat()
+    }
+    return quote_data
 
 def calculate_vwap(df):
     # 创建一个结果DataFrame的副本
@@ -450,7 +461,13 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     
     return df
 
-
+def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None):
+    # 将下单改为写入数据库
+    action = "BUY" if side == "Buy" else "SELL"
+    signal_id = write_signal_to_sqlite(action)
+    
+    # 返回一个模拟的订单ID
+    return f"SIM_{signal_id}" if signal_id else "SIM_ERROR"
 
 def check_exit_conditions(df, position_quantity, current_stop):
     # 获取当前时间点
@@ -512,35 +529,34 @@ def check_exit_conditions(df, position_quantity, current_stop):
         return exit_signal, new_stop
     return False, None
 
-def is_trading_day(symbol):
-    """检查今天是否是交易日"""
-    try:
-        today = get_us_eastern_time()
-        
-        # 周末不交易
-        if today.weekday() >= 5:  # 5是周六，6是周日
-            return False
-            
-        # 美国主要节假日（简化版）
-        month, day = today.month, today.day
-        
-        # 新年
-        if month == 1 and day == 1:
-            return False
-        # 独立日
-        if month == 7 and day == 4:
-            return False
-        # 圣诞节
-        if month == 12 and day == 25:
-            return False
-            
-        # 其他情况默认为交易日
-        return True
-        
-    except Exception as e:
-        print(f"检查交易日失败: {e}")
-        # 默认返回True，避免因为API问题导致策略停止
-        return True
+def is_trading_day(symbol=None):
+    market = None
+    if symbol:
+        if symbol.endswith(".US"):
+            market = "US"
+        elif symbol.endswith(".HK"):
+            market = "HK"
+        elif symbol.endswith(".SH") or symbol.endswith(".SZ"):
+            market = "CN"
+        elif symbol.endswith(".SG"):
+            market = "SG"
+    if not market:
+        market = "US"
+    now_et = get_us_eastern_time()
+    current_date = now_et.date()
+    from longport.openapi import Market
+    market_mapping = {
+        "US": Market.US, "HK": Market.HK, "CN": Market.CN, "SG": Market.SG
+    }
+    sdk_market = market_mapping.get(market, Market.US)
+    calendar_resp = QUOTE_CTX.trading_days(
+        sdk_market, current_date, current_date
+    )
+    trading_dates = calendar_resp.trading_days
+    half_trading_dates = calendar_resp.half_trading_days
+    is_trade_day = current_date in trading_dates
+    is_half_trade_day = current_date in half_trading_dates
+    return is_trade_day or is_half_trade_day
 
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
@@ -557,12 +573,15 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if DEBUG_ONCE:
             print("单次运行模式已开启，策略将只运行一次")
     
-    # 使用固定初始资金进行模拟
-    initial_capital = 100000  # 假设10万美元资金
-    print(f"初始资金: ${initial_capital:.2f}")
+    initial_capital = get_account_balance()
+    if initial_capital <= 0:
+        print("Error: Could not get account balance or balance is zero")
+        sys.exit(1)
     
-    # 初始化持仓为0（不再从实际账户获取）
-    position_quantity = 0
+    # 获取当前实际持仓
+    current_positions = get_current_positions()
+    symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
+    position_quantity = symbol_position["quantity"]
     
     # 初始化入场价格为None，后续由交易操作更新
     entry_price = None
@@ -570,7 +589,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     current_stop = None
     positions_opened_today = 0
     last_date = None
-    outside_rth_setting = "ANY_TIME"
+    outside_rth_setting = OutsideRTH.AnyTime
     
     while True:
         now = get_us_eastern_time()
@@ -578,11 +597,13 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if DEBUG_MODE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 主循环开始")
         
-        # 模拟模式下，持仓状态由程序内部维护，不再从实际账户获取
-        # position_quantity 已经在程序中维护
+        # 每次循环都更新当前持仓状态和账户余额
+        current_positions = get_current_positions()
+        symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
+        position_quantity = symbol_position["quantity"]
         
-        # 模拟模式下使用固定资金
-        current_balance = initial_capital
+        # 获取当前美元账户余额
+        current_balance = get_account_balance()
         
         # 如果持仓量变为0，重置入场价格
         if position_quantity == 0:
@@ -636,11 +657,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"错误: 尝试{max_retries}次后仍无法获取当前时间点 {current_time} 的数据")
                 sys.exit(1)
             
-            # 执行平仓 - 写入数据库
+            # 执行平仓
             side = "Sell" if position_quantity > 0 else "Buy"
-            action = "SELL" if side == "Sell" else "BUY"
-            write_signal_to_sqlite(action)
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库: {action}")
+            close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
             
             # 计算盈亏
             if entry_price:
@@ -745,9 +765,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                action = "SELL" if side == "Sell" else "BUY"
-                write_signal_to_sqlite(action)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库: {action}")
+                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
                 
                 # 计算盈亏
                 if entry_price and current_price > 0:
@@ -843,9 +862,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                action = "SELL" if side == "Sell" else "BUY"
-                write_signal_to_sqlite(action)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库: {action}")
+                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
                 
                 # 计算盈亏
                 if entry_price and current_price > 0:
@@ -927,9 +945,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 
                 # 执行平仓
                 side = "Sell" if position_quantity > 0 else "Buy"
-                action = "SELL" if side == "Sell" else "BUY"
-                write_signal_to_sqlite(action)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已写入数据库: {action}")
+                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
                 
                 # 计算盈亏
                 if entry_price:
@@ -1014,8 +1031,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 if signal != 0:
                     # 保留交易信号日志
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号! 价格: {price}, 止损: {stop}")
-                    # 使用固定资金进行模拟
-                    available_capital = 100000  # 假设10万美元资金
+                    available_capital = get_account_balance()
                     # 应用杠杆比例
                     adjusted_capital = available_capital * LEVERAGE
                     position_size = floor(adjusted_capital / latest_price)
@@ -1025,9 +1041,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 调整后资金: ${adjusted_capital:.2f}")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股")
                     side = "Buy" if signal > 0 else "Sell"
-                    action = "BUY" if side == "Buy" else "SELL"
-                    write_signal_to_sqlite(action)
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓信号已写入数据库: {action}")
+                    order_id = submit_order(symbol, side, position_size, outside_rth=outside_rth_setting)
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 订单已提交，ID: {order_id}")
                     
                     # 删除订单状态检查代码，直接更新持仓状态
                     position_quantity = position_size if signal > 0 else -position_size
@@ -1098,12 +1113,8 @@ if __name__ == "__main__":
             print("单次运行模式已开启")
     print(f"杠杆倍数: {LEVERAGE}倍")
     
-    # 初始化数据库
+    # 初始化SQLite数据库
     init_sqlite_database()
-    
-    # 添加信号处理
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
     
     if QUOTE_CTX is None or TRADE_CTX is None:
         print("错误: 无法创建API上下文")
