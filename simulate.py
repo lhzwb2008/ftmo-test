@@ -16,7 +16,7 @@ load_dotenv(override=True)
 
 # 固定配置参数
 CHECK_INTERVAL_MINUTES = 15
-TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
+TRADING_START_TIME = (9, 41)  # 交易开始时间：9点40分
 TRADING_END_TIME = (15, 45)   # 交易结束时间：15点40分
 MAX_POSITIONS_PER_DAY = 10
 LOOKBACK_DAYS = 1
