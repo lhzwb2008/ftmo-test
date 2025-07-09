@@ -28,7 +28,7 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
 # 调试模式配置
 DEBUG_MODE = False   # 设置为True开启调试模式
-DEBUG_TIME = "2025-05-15 12:36:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
+DEBUG_TIME = "2025-07-07 09:40:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
 DEBUG_ONCE = True  # 是否只运行一次就退出
 
 # 收益统计全局变量

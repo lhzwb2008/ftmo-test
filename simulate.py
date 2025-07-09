@@ -16,7 +16,7 @@ load_dotenv(override=True)
 
 # 固定配置参数
 CHECK_INTERVAL_MINUTES = 15
-TRADING_START_TIME = (9, 41)  # 交易开始时间：9点41分
+TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
 TRADING_END_TIME = (15, 45)   # 交易结束时间：15点40分
 MAX_POSITIONS_PER_DAY = 10
 LOOKBACK_DAYS = 1
@@ -29,8 +29,8 @@ FIXED_POSITION_SIZE = 100  # 模拟模式固定下单量
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
 # 调试模式配置
-DEBUG_MODE = False   # 设置为True开启调试模式
-DEBUG_TIME = "2025-05-15 12:36:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
+DEBUG_MODE = True   # 设置为True开启调试模式
+# DEBUG_TIME = "2025-05-15 12:36:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
 DEBUG_ONCE = True  # 是否只运行一次就退出
 
 # 收益统计全局变量
@@ -98,7 +98,7 @@ def write_signal_to_sqlite(action):
         return None
 
 def get_us_eastern_time():
-    if DEBUG_MODE and DEBUG_TIME:
+    if DEBUG_MODE and 'DEBUG_TIME' in globals() and DEBUG_TIME:
         # 如果处于调试模式且指定了时间，返回指定的时间
         try:
             dt = datetime.strptime(DEBUG_TIME, "%Y-%m-%d %H:%M:%S")
@@ -554,12 +554,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     #     print("Error: Could not get account balance or balance is zero")
     #     sys.exit(1)
     
-    # 获取当前实际持仓
-    current_positions = get_current_positions()
-    symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
-    position_quantity = symbol_position["quantity"]
-    
-    # 初始化入场价格为None，后续由交易操作更新
+    # 初始化持仓状态
+    position_quantity = 0
     entry_price = None
     
     current_stop = None
@@ -573,10 +569,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if DEBUG_MODE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 主循环开始")
         
-        # 每次循环都更新当前持仓状态和账户余额
-        current_positions = get_current_positions()
-        symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
-        position_quantity = symbol_position["quantity"]
+        # 模拟模式下不再重新获取持仓状态，保持本地状态
+        # current_positions = get_current_positions()
+        # symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
+        # position_quantity = symbol_position["quantity"]
         
         # 模拟模式：不需要获取账户余额
         # current_balance = get_account_balance()
@@ -1077,7 +1073,7 @@ if __name__ == "__main__":
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     if DEBUG_MODE:
         print("调试模式已开启")
-        if DEBUG_TIME:
+        if 'DEBUG_TIME' in globals() and DEBUG_TIME:
             print(f"调试时间: {DEBUG_TIME}")
         if DEBUG_ONCE:
             print("单次运行模式已开启")
