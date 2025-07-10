@@ -25,6 +25,12 @@ K1 = 1 # 上边界sigma乘数
 K2 = 1 # 下边界sigma乘数
 FIXED_POSITION_SIZE = 100  # 模拟模式固定下单量
 
+# 成交量确认参数
+USE_VOLUME_CONFIRMATION = True  # 成交量确认开关
+VOLUME_LOOKBACK = 8  # 历史成交量回看期，默认20分钟
+VOLUME_RECENT = 1  # 近期成交量回看期，默认5分钟
+VOLUME_THRESHOLD = 1.2  # 成交量阈值，默认1.2倍
+
 # 默认交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
@@ -977,6 +983,29 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if not latest_data.empty:
                 latest_row = latest_data.iloc[-1].copy()
                 latest_row["Close"] = latest_price
+                
+                # 计算成交量条件
+                volume_condition = True  # 默认为True，如果关闭成交量确认则始终满足
+                if USE_VOLUME_CONFIRMATION:
+                    # 获取成交量数据
+                    volume_data = latest_data["Volume"].values
+                    if len(volume_data) >= VOLUME_LOOKBACK:
+                        # 计算历史平均成交量（前n分钟）
+                        avg_volume_history = np.mean(volume_data[-VOLUME_LOOKBACK:])
+                        # 计算近期平均成交量（近m分钟）
+                        if len(volume_data) >= VOLUME_RECENT:
+                            avg_volume_recent = np.mean(volume_data[-VOLUME_RECENT:])
+                        else:
+                            avg_volume_recent = np.mean(volume_data)
+                        # 检查成交量条件
+                        volume_condition = avg_volume_recent > avg_volume_history * VOLUME_THRESHOLD
+                        if DEBUG_MODE:
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量确认: 近期平均={avg_volume_recent:.0f}, 历史平均={avg_volume_history:.0f}, 阈值={VOLUME_THRESHOLD}, 满足条件={volume_condition}")
+                    else:
+                        # 数据不足，暂时不使用成交量确认
+                        if DEBUG_MODE:
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量数据不足，跳过成交量确认")
+                
                 long_price_above_upper = latest_price > latest_row["UpperBound"]
                 long_price_above_vwap = latest_price > latest_row["VWAP"]
                 if DEBUG_MODE:
@@ -984,7 +1013,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 signal = 0
                 price = latest_price
                 stop = None
-                if long_price_above_upper and long_price_above_vwap:
+                if long_price_above_upper and long_price_above_vwap and volume_condition:
                     if DEBUG_MODE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足多头入场条件!")
                     signal = 1
@@ -992,14 +1021,14 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     short_price_below_lower = latest_price < latest_row["LowerBound"]
                     short_price_below_vwap = latest_price < latest_row["VWAP"]
-                    if short_price_below_lower and short_price_below_vwap:
+                    if short_price_below_lower and short_price_below_vwap and volume_condition:
                         if DEBUG_MODE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足空头入场条件!")
                         signal = -1
                         stop = min(latest_row["LowerBound"], latest_row["VWAP"])
                     else:
                         if DEBUG_MODE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap} & {volume_condition}), 空头({short_price_below_lower} & {short_price_below_vwap} & {volume_condition})")
                 if signal != 0:
                     # 保留交易信号日志
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号! 价格: {price}, 止损: {stop}")
@@ -1078,6 +1107,12 @@ if __name__ == "__main__":
         if DEBUG_ONCE:
             print("单次运行模式已开启")
     print(f"固定下单量: {FIXED_POSITION_SIZE} 股")
+    
+    # 显示成交量确认设置
+    if USE_VOLUME_CONFIRMATION:
+        print(f"成交量确认: 已开启 (历史回看={VOLUME_LOOKBACK}分钟, 近期回看={VOLUME_RECENT}分钟, 阈值={VOLUME_THRESHOLD}x)")
+    else:
+        print("成交量确认: 已关闭")
     
     # 初始化SQLite数据库
     init_sqlite_database()
