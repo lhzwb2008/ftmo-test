@@ -34,10 +34,11 @@ VOLUME_THRESHOLD = 1.2  # 成交量阈值，默认1.2倍
 # 默认交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
-# 调试模式配置
-DEBUG_MODE = True   # 设置为True开启调试模式
-# DEBUG_TIME = "2025-05-15 12:36:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
-DEBUG_ONCE = False  # 是否只运行一次就退出
+# 日志和调试模式配置（分离两个功能）
+LOG_VERBOSE = True   # 设置为True开启详细日志打印
+DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
+DEBUG_TIME = "2025-07-10 10:25:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
+DEBUG_ONCE = True  # 是否只运行一次就退出（仅在DEBUG_MODE=True时有效）
 
 # 收益统计全局变量
 TOTAL_PNL = 0.0  # 总收益
@@ -126,12 +127,12 @@ def create_contexts():
             config = Config.from_env()
             quote_ctx = QuoteContext(config)
             trade_ctx = TradeContext(config)
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接成功")
             return quote_ctx, trade_ctx
         except Exception as e:
             if attempt < max_retries - 1:
-                if DEBUG_MODE:
+                if LOG_VERBOSE:
                     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败 ({attempt + 1}/{max_retries}): {str(e)}")
                     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {retry_delay}秒后重试...")
                 time_module.sleep(retry_delay)
@@ -163,7 +164,7 @@ def get_historical_data(symbol, days_back=None):
     now_et = get_us_eastern_time()
     current_date = now_et.date()
     
-    if DEBUG_MODE:
+    if LOG_VERBOSE:
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 开始获取历史数据: {symbol}")
     
     # 计算起始日期
@@ -200,12 +201,12 @@ def get_historical_data(symbol, days_back=None):
             except Exception as e:
                 if "rate limit" in str(e).lower():
                     if attempt < max_retries - 1:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，等待 {retry_delay} 秒后重试 ({attempt + 1}/{max_retries})")
                         time_module.sleep(retry_delay)
                         retry_delay *= 2  # 指数退避
                     else:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，已达最大重试次数")
                         raise
                 else:
@@ -213,7 +214,7 @@ def get_historical_data(symbol, days_back=None):
         
         if day_candles:
             all_candles.extend(day_candles)
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {date_to_check} 数据: {len(day_candles)} 条")
             
         date_to_check -= timedelta(days=1)
@@ -572,7 +573,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     while True:
         now = get_us_eastern_time()
         current_date = now.date()
-        if DEBUG_MODE:
+        if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 主循环开始")
         
         # 模拟模式下不再重新获取持仓状态，保持本地状态
@@ -594,7 +595,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间为交易结束时间 {trading_end_time[0]}:{trading_end_time[1]}，执行平仓")
             
             # 获取历史数据
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print("获取历史数据")
             df = get_historical_data(symbol)
             if df.empty:
@@ -623,7 +624,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     retry_count += 1
                     if retry_count < max_retries:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
                         time_module.sleep(retry_interval)
                         # 重新获取数据
@@ -730,7 +731,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         
         # 检查是否是交易日（调试模式下保持原有逻辑）
         is_today_trading_day = is_trading_day(symbol)
-        if DEBUG_MODE:
+        if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 是否交易日: {is_today_trading_day}")
             
         if not is_today_trading_day:
@@ -821,7 +822,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if df.empty:
             print("Error: Could not get historical data")
             sys.exit(1)
-        if DEBUG_MODE:
+        if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 历史数据获取完成: {len(df)} 条")
             
         # 调试模式下，根据指定时间截断数据
@@ -830,7 +831,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             df = df[df["DateTime"] <= now]
             
         if not is_trading_hours:
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前不在交易时间内 ({trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d})")
             if position_quantity != 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易日结束，执行平仓")
@@ -882,7 +883,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if position_quantity != 0:
             exit_signal, new_stop = check_exit_conditions(df, position_quantity, current_stop)
             current_stop = new_stop
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓检查: 数量={position_quantity}, 退出信号={exit_signal}, 当前止损={current_stop}")
             if exit_signal:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号!")
@@ -906,7 +907,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     else:
                         retry_count += 1
                         if retry_count < max_retries:
-                            if DEBUG_MODE:
+                            if LOG_VERBOSE:
                                 print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
                             time_module.sleep(retry_interval)
                             # 重新获取数据
@@ -953,7 +954,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         else:
             # 检查是否已有持仓，如果有则不再开仓
             if position_quantity != 0:
-                if DEBUG_MODE:
+                if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
                 continue
                 
@@ -999,22 +1000,22 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                             avg_volume_recent = np.mean(volume_data)
                         # 检查成交量条件
                         volume_condition = avg_volume_recent > avg_volume_history * VOLUME_THRESHOLD
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量确认: 近期平均={avg_volume_recent:.0f}, 历史平均={avg_volume_history:.0f}, 阈值={VOLUME_THRESHOLD}, 满足条件={volume_condition}")
                     else:
                         # 数据不足，暂时不使用成交量确认
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量数据不足，跳过成交量确认")
                 
                 long_price_above_upper = latest_price > latest_row["UpperBound"]
                 long_price_above_vwap = latest_price > latest_row["VWAP"]
-                if DEBUG_MODE:
+                if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 价格={latest_price:.2f}, 上界={latest_row['UpperBound']:.2f}, VWAP={latest_row['VWAP']:.2f}, 下界={latest_row['LowerBound']:.2f}")
                 signal = 0
                 price = latest_price
                 stop = None
                 if long_price_above_upper and long_price_above_vwap and volume_condition:
-                    if DEBUG_MODE:
+                    if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足多头入场条件!")
                     signal = 1
                     stop = max(latest_row["UpperBound"], latest_row["VWAP"])
@@ -1022,12 +1023,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     short_price_below_lower = latest_price < latest_row["LowerBound"]
                     short_price_below_vwap = latest_price < latest_row["VWAP"]
                     if short_price_below_lower and short_price_below_vwap and volume_condition:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足空头入场条件!")
                         signal = -1
                         stop = min(latest_row["LowerBound"], latest_row["VWAP"])
                     else:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap} & {volume_condition}), 空头({short_price_below_lower} & {short_price_below_vwap} & {volume_condition})")
                 if signal != 0:
                     # 保留交易信号日志
@@ -1092,7 +1093,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         next_check_time = now + timedelta(minutes=check_interval_minutes)
         sleep_seconds = (next_check_time - now).total_seconds()
         if sleep_seconds > 0:
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {sleep_seconds:.0f} 秒")
             time_module.sleep(sleep_seconds)
 
@@ -1100,12 +1101,22 @@ if __name__ == "__main__":
     print("\n长桥API交易策略启动 - 模拟模式")
     print("版本: 1.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
+    
+    # 显示配置状态
     if DEBUG_MODE:
-        print("调试模式已开启")
+        print("调试模式: 已开启（使用固定时间）")
         if 'DEBUG_TIME' in globals() and DEBUG_TIME:
-            print(f"调试时间: {DEBUG_TIME}")
+            print(f"  固定时间: {DEBUG_TIME}")
         if DEBUG_ONCE:
-            print("单次运行模式已开启")
+            print("  单次运行: 是")
+    else:
+        print("调试模式: 已关闭（使用当前时间）")
+    
+    if LOG_VERBOSE:
+        print("详细日志: 已开启")
+    else:
+        print("详细日志: 已关闭")
+    
     print(f"固定下单量: {FIXED_POSITION_SIZE} 股")
     
     # 显示成交量确认设置
