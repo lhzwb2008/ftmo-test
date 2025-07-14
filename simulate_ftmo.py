@@ -988,12 +988,17 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 计算成交量条件
                 volume_condition = True  # 默认为True，如果关闭成交量确认则始终满足
                 if USE_VOLUME_CONFIRMATION:
-                    # 获取成交量数据
+                    # 获取成交量数据 - 排除当前分钟的未完整K线，使用上一分钟及之前的数据
                     volume_data = latest_data["Volume"].values
+                    
+                    # 排除最后一个数据点（当前分钟的未完整K线）
+                    if len(volume_data) > 1:
+                        volume_data = volume_data[:-1]  # 使用除最后一个点外的所有数据
+                    
                     if len(volume_data) >= VOLUME_LOOKBACK:
-                        # 计算历史平均成交量（前n分钟）
+                        # 计算历史平均成交量（前n分钟，排除当前分钟）
                         avg_volume_history = np.mean(volume_data[-VOLUME_LOOKBACK:])
-                        # 计算近期平均成交量（近m分钟）
+                        # 计算近期平均成交量（近m分钟，排除当前分钟）
                         if len(volume_data) >= VOLUME_RECENT:
                             avg_volume_recent = np.mean(volume_data[-VOLUME_RECENT:])
                         else:
@@ -1001,11 +1006,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         # 检查成交量条件
                         volume_condition = avg_volume_recent > avg_volume_history * VOLUME_THRESHOLD
                         if LOG_VERBOSE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量确认: 近期平均={avg_volume_recent:.0f}, 历史平均={avg_volume_history:.0f}, 阈值={VOLUME_THRESHOLD}, 满足条件={volume_condition}")
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量确认 (排除当前分钟): 近期平均={avg_volume_recent:.0f}, 历史平均={avg_volume_history:.0f}, 阈值={VOLUME_THRESHOLD}, 满足条件={volume_condition}")
                     else:
                         # 数据不足，暂时不使用成交量确认
                         if LOG_VERBOSE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量数据不足，跳过成交量确认")
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量数据不足（排除当前分钟后），跳过成交量确认")
                 
                 long_price_above_upper = latest_price > latest_row["UpperBound"]
                 long_price_above_vwap = latest_price > latest_row["VWAP"]
