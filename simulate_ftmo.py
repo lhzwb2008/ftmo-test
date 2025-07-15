@@ -27,8 +27,8 @@ FIXED_POSITION_SIZE = 100  # 模拟模式固定下单量
 
 # 成交量确认参数
 USE_VOLUME_CONFIRMATION = True  # 成交量确认开关
-VOLUME_LOOKBACK = 8  # 历史成交量回看期，默认20分钟
-VOLUME_RECENT = 1  # 近期成交量回看期，默认5分钟
+VOLUME_LOOKBACK = 5  # 历史成交量回看期，默认5分钟
+VOLUME_RECENT = 1  # 近期成交量回看期，默认1分钟
 VOLUME_THRESHOLD = 1.2  # 成交量阈值，默认1.2倍
 
 # 默认交易品种
@@ -995,22 +995,20 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     if len(volume_data) > 1:
                         volume_data = volume_data[:-1]  # 使用除最后一个点外的所有数据
                     
-                    if len(volume_data) >= VOLUME_LOOKBACK:
-                        # 计算历史平均成交量（前n分钟，排除当前分钟）
-                        avg_volume_history = np.mean(volume_data[-VOLUME_LOOKBACK:])
-                        # 计算近期平均成交量（近m分钟，排除当前分钟）
-                        if len(volume_data) >= VOLUME_RECENT:
-                            avg_volume_recent = np.mean(volume_data[-VOLUME_RECENT:])
-                        else:
-                            avg_volume_recent = np.mean(volume_data)
+                    # 确保有足够的数据进行比较
+                    if len(volume_data) >= VOLUME_LOOKBACK + VOLUME_RECENT:
+                        # 计算近期平均成交量（最近的VOLUME_RECENT根K线）
+                        avg_volume_recent = np.mean(volume_data[-VOLUME_RECENT:])
+                        # 计算历史平均成交量（近期之前的VOLUME_LOOKBACK根K线）
+                        avg_volume_history = np.mean(volume_data[-(VOLUME_LOOKBACK + VOLUME_RECENT):-VOLUME_RECENT])
                         # 检查成交量条件
                         volume_condition = avg_volume_recent > avg_volume_history * VOLUME_THRESHOLD
                         if LOG_VERBOSE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量确认 (排除当前分钟): 近期平均={avg_volume_recent:.0f}, 历史平均={avg_volume_history:.0f}, 阈值={VOLUME_THRESHOLD}, 满足条件={volume_condition}")
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量确认 (互不重叠): 近期平均={avg_volume_recent:.0f}, 历史平均={avg_volume_history:.0f}, 阈值={VOLUME_THRESHOLD}, 满足条件={volume_condition}")
                     else:
                         # 数据不足，暂时不使用成交量确认
                         if LOG_VERBOSE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量数据不足（排除当前分钟后），跳过成交量确认")
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 成交量数据不足（需要至少{VOLUME_LOOKBACK + VOLUME_RECENT}根完整K线），跳过成交量确认")
                 
                 long_price_above_upper = latest_price > latest_row["UpperBound"]
                 long_price_above_vwap = latest_price > latest_row["VWAP"]
