@@ -8,6 +8,7 @@ from math import floor
 from decimal import Decimal
 from dotenv import load_dotenv
 import numpy as np
+import sqlite3
 
 from longport.openapi import Config, TradeContext, QuoteContext, Period, OrderSide, OrderType, TimeInForceType, AdjustType, OutsideRTH
 
@@ -16,20 +17,22 @@ load_dotenv(override=True)
 # 固定配置参数
 CHECK_INTERVAL_MINUTES = 15
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
-TRADING_END_TIME = (15, 45)   # 交易结束时间：15点40分
+TRADING_END_TIME = (15, 40)   # 交易结束时间：15点40分
 MAX_POSITIONS_PER_DAY = 10
 LOOKBACK_DAYS = 1
-LEVERAGE = 1.8 # 杠杆倍数，默认为1倍
+LEVERAGE = 2 # 杠杆倍数，默认为1倍
 K1 = 1 # 上边界sigma乘数
 K2 = 1 # 下边界sigma乘数
+FIXED_POSITION_SIZE = 100  # 模拟模式固定下单量
 
 # 默认交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
-# 调试模式配置
-DEBUG_MODE = False   # 设置为True开启调试模式
-DEBUG_TIME = "2025-07-07 09:40:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
-DEBUG_ONCE = True  # 是否只运行一次就退出
+# 日志和调试模式配置（分离两个功能）
+LOG_VERBOSE = True   # 设置为True开启详细日志打印
+DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
+DEBUG_TIME = "2025-07-10 10:25:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
+DEBUG_ONCE = True  # 是否只运行一次就退出（仅在DEBUG_MODE=True时有效）
 
 # 收益统计全局变量
 TOTAL_PNL = 0.0  # 总收益
@@ -37,8 +40,66 @@ DAILY_PNL = 0.0  # 当日收益
 LAST_STATS_DATE = None  # 上次统计日期
 DAILY_TRADES = []  # 当日交易记录
 
+# SQLite数据库路径 - 使用MT5通用目录
+import platform
+if platform.system() == "Windows":
+    # Windows系统：使用MT5通用目录
+    appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
+    mt5_common_path = os.path.join(appdata_path, "MetaQuotes", "Terminal", "Common", "Files")
+    os.makedirs(mt5_common_path, exist_ok=True)
+    DB_PATH = os.path.join(mt5_common_path, "trading_signals.db")
+else:
+    # 非Windows系统：使用当前目录
+    DB_PATH = "trading_signals.db"
+
+def init_sqlite_database():
+    """初始化SQLite数据库"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # 创建简化的交易信号表
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,  -- BUY, SELL, CLOSE
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            consumed INTEGER DEFAULT 0
+        )
+        """)
+        
+        conn.commit()
+        conn.close()
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化成功")
+        print(f"数据库路径: {os.path.abspath(DB_PATH)}")
+        
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
+
+def write_signal_to_sqlite(action):
+    """将交易信号写入SQLite数据库"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+        INSERT INTO signals (action)
+        VALUES (?)
+        """, (action.upper(),))
+        
+        conn.commit()
+        signal_id = cursor.lastrowid
+        conn.close()
+        
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 信号已写入: {action} (ID: {signal_id})")
+        return signal_id
+        
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入信号失败: {str(e)}")
+        return None
+
 def get_us_eastern_time():
-    if DEBUG_MODE and DEBUG_TIME:
+    if DEBUG_MODE and 'DEBUG_TIME' in globals() and DEBUG_TIME:
         # 如果处于调试模式且指定了时间，返回指定的时间
         try:
             dt = datetime.strptime(DEBUG_TIME, "%Y-%m-%d %H:%M:%S")
@@ -60,12 +121,12 @@ def create_contexts():
             config = Config.from_env()
             quote_ctx = QuoteContext(config)
             trade_ctx = TradeContext(config)
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接成功")
             return quote_ctx, trade_ctx
         except Exception as e:
             if attempt < max_retries - 1:
-                if DEBUG_MODE:
+                if LOG_VERBOSE:
                     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败 ({attempt + 1}/{max_retries}): {str(e)}")
                     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {retry_delay}秒后重试...")
                 time_module.sleep(retry_delay)
@@ -75,41 +136,31 @@ def create_contexts():
 
 QUOTE_CTX, TRADE_CTX = create_contexts()
 
+def generate_check_times(start_time, end_time, interval_minutes):
+    """生成所有的检查时间点"""
+    check_times = []
+    start_hour, start_minute = start_time
+    end_hour, end_minute = end_time
+    
+    # 从开始时间开始，每隔interval_minutes生成一个检查点
+    current = datetime.now().replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = datetime.now().replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    
+    while current <= end:
+        check_times.append((current.hour, current.minute))
+        current += timedelta(minutes=interval_minutes)
+    
+    return check_times
+
 def get_account_balance():
-    if DEBUG_MODE:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 获取美元账户余额")
-    balance_list = TRADE_CTX.account_balance()  # 不需要指定currency参数
-    
-    # 从cash_infos中找到USD的可用现金
-    usd_available_cash = 0.0
-    for balance_info in balance_list:
-        for cash_info in balance_info.cash_infos:
-            if cash_info.currency == "USD":
-                usd_available_cash = float(cash_info.available_cash)
-                if DEBUG_MODE:
-                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 美元可用现金: ${usd_available_cash:.2f}")
-                return usd_available_cash
-    
-    # 如果没有找到USD账户，返回0
-    if DEBUG_MODE:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 警告: 未找到美元账户，返回余额为0")
-    return 0.0
+    """模拟模式：不需要获取实际账户余额"""
+    # 返回一个模拟的余额值
+    return 10000.0
 
 def get_current_positions():
-    if DEBUG_MODE:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 获取当前持仓")
-    stock_positions_response = TRADE_CTX.stock_positions()
-    positions = {}
-    for channel in stock_positions_response.channels:
-        for position in channel.positions:
-            symbol = position.symbol
-            quantity = int(position.quantity)
-            cost_price = float(position.cost_price)
-            positions[symbol] = {
-                "quantity": quantity,
-                "cost_price": cost_price
-            }
-    return positions
+    """模拟模式：返回空持仓"""
+    # 模拟模式总是返回空持仓，让策略可以正常运行
+    return {}
 
 def get_historical_data(symbol, days_back=None):
     # 简化天数计算逻辑
@@ -123,7 +174,7 @@ def get_historical_data(symbol, days_back=None):
     now_et = get_us_eastern_time()
     current_date = now_et.date()
     
-    if DEBUG_MODE:
+    if LOG_VERBOSE:
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 开始获取历史数据: {symbol}")
     
     # 计算起始日期
@@ -160,12 +211,12 @@ def get_historical_data(symbol, days_back=None):
             except Exception as e:
                 if "rate limit" in str(e).lower():
                     if attempt < max_retries - 1:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，等待 {retry_delay} 秒后重试 ({attempt + 1}/{max_retries})")
                         time_module.sleep(retry_delay)
                         retry_delay *= 2  # 指数退避
                     else:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，已达最大重试次数")
                         raise
                 else:
@@ -173,7 +224,7 @@ def get_historical_data(symbol, days_back=None):
         
         if day_candles:
             all_candles.extend(day_candles)
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {date_to_check} 数据: {len(day_candles)} 条")
             
         date_to_check -= timedelta(days=1)
@@ -403,47 +454,12 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     return df
 
 def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None):
-    sdk_side = OrderSide.Buy if side == "Buy" else OrderSide.Sell
-    if isinstance(order_type, str):
-        order_type_map = {
-            "MO": OrderType.MO, "LO": OrderType.LO, "ELO": OrderType.ELO,
-            "AO": OrderType.AO, "ALO": OrderType.ALO
-        }
-        sdk_order_type = order_type_map.get(order_type, OrderType.MO)
-    else:
-        sdk_order_type = order_type
-    time_in_force = TimeInForceType.Day
-    if outside_rth is None:
-        outside_rth = OutsideRTH.AnyTime
-    elif isinstance(outside_rth, str):
-        outside_rth_map = {
-            "RTH_ONLY": OutsideRTH.RTHOnly,
-            "ANY_TIME": OutsideRTH.AnyTime,
-            "OVERNIGHT": OutsideRTH.Overnight
-        }
-        outside_rth = outside_rth_map.get(outside_rth, OutsideRTH.AnyTime)
-    dec_quantity = Decimal(str(quantity)) if not isinstance(quantity, Decimal) else quantity
-    if sdk_order_type == OrderType.LO and price is not None:
-        dec_price = Decimal(str(price)) if not isinstance(price, Decimal) else price
-        response = TRADE_CTX.submit_order(
-            symbol=symbol,
-            order_type=sdk_order_type,
-            side=sdk_side,
-            submitted_price=dec_price,
-            submitted_quantity=dec_quantity,
-            time_in_force=time_in_force,
-            outside_rth=outside_rth
-        )
-    else:
-        response = TRADE_CTX.submit_order(
-            symbol=symbol,
-            order_type=OrderType.MO,
-            side=sdk_side,
-            submitted_quantity=dec_quantity,
-            time_in_force=time_in_force,
-            outside_rth=outside_rth
-        )
-    return response.order_id
+    # 将下单改为写入数据库
+    action = "BUY" if side == "Buy" else "SELL"
+    signal_id = write_signal_to_sqlite(action)
+    
+    # 返回一个模拟的订单ID
+    return f"SIM_{signal_id}" if signal_id else "SIM_ERROR"
 
 def check_exit_conditions(df, position_quantity, current_stop):
     # 获取当前时间点
@@ -451,16 +467,17 @@ def check_exit_conditions(df, position_quantity, current_stop):
     current_time = now.strftime('%H:%M')
     current_date = now.date()
     
-    # 精简日志，直接获取当前时间点数据
-    current_data = df[(df["Date"] == current_date) & (df["Time"] == current_time)]
+    # 使用前一分钟的完整K线数据
+    prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
+    prev_data = df[(df["Date"] == current_date) & (df["Time"] == prev_minute_time)]
     
-    # 如果当前时间点没有数据，使用最新数据
-    if current_data.empty:
+    # 如果前一分钟没有数据，使用最新数据
+    if prev_data.empty:
         # 按日期和时间排序，获取最新的数据
         df_sorted = df.sort_values(by=["Date", "Time"], ascending=True)
         latest = df_sorted.iloc[-1]
     else:
-        latest = current_data.iloc[0]
+        latest = prev_data.iloc[0]
         
     price = latest["Close"]
     vwap = latest["VWAP"]
@@ -539,27 +556,28 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
     global TOTAL_PNL, DAILY_PNL, LAST_STATS_DATE, DAILY_TRADES
     
+    # 生成所有的检查时间点
+    check_times = generate_check_times(trading_start_time, trading_end_time, check_interval_minutes)
+    
     now_et = get_us_eastern_time()
     print(f"启动交易策略 - 交易品种: {symbol}")
     print(f"当前美东时间: {now_et.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"交易时间: {trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d}")
     print(f"每日最大开仓次数: {max_positions_per_day}")
+    print(f"检查时间点: {', '.join([f'{h:02d}:{m:02d}' for h, m in check_times])}")
     if DEBUG_MODE:
         print(f"调试模式已开启! 使用时间: {now_et.strftime('%Y-%m-%d %H:%M:%S')}")
         if DEBUG_ONCE:
             print("单次运行模式已开启，策略将只运行一次")
     
-    initial_capital = get_account_balance()
-    if initial_capital <= 0:
-        print("Error: Could not get account balance or balance is zero")
-        sys.exit(1)
+    # 模拟模式：不需要获取实际账户余额
+    # initial_capital = get_account_balance()
+    # if initial_capital <= 0:
+    #     print("Error: Could not get account balance or balance is zero")
+    #     sys.exit(1)
     
-    # 获取当前实际持仓
-    current_positions = get_current_positions()
-    symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
-    position_quantity = symbol_position["quantity"]
-    
-    # 初始化入场价格为None，后续由交易操作更新
+    # 初始化持仓状态
+    position_quantity = 0
     entry_price = None
     
     current_stop = None
@@ -570,16 +588,16 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     while True:
         now = get_us_eastern_time()
         current_date = now.date()
-        if DEBUG_MODE:
+        if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 主循环开始")
         
-        # 每次循环都更新当前持仓状态和账户余额
-        current_positions = get_current_positions()
-        symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
-        position_quantity = symbol_position["quantity"]
+        # 模拟模式下不再重新获取持仓状态，保持本地状态
+        # current_positions = get_current_positions()
+        # symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
+        # position_quantity = symbol_position["quantity"]
         
-        # 获取当前美元账户余额
-        current_balance = get_account_balance()
+        # 模拟模式：不需要获取账户余额
+        # current_balance = get_account_balance()
         
         # 如果持仓量变为0，重置入场价格
         if position_quantity == 0:
@@ -592,7 +610,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间为交易结束时间 {trading_end_time[0]}:{trading_end_time[1]}，执行平仓")
             
             # 获取历史数据
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print("获取历史数据")
             df = get_historical_data(symbol)
             if df.empty:
@@ -621,7 +639,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     retry_count += 1
                     if retry_count < max_retries:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
                         time_module.sleep(retry_interval)
                         # 重新获取数据
@@ -728,7 +746,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         
         # 检查是否是交易日（调试模式下保持原有逻辑）
         is_today_trading_day = is_trading_day(symbol)
-        if DEBUG_MODE:
+        if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 是否交易日: {is_today_trading_day}")
             
         if not is_today_trading_day:
@@ -814,12 +832,27 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             (current_hour > start_hour or (current_hour == start_hour and current_minute >= start_minute)) and
             (current_hour < end_hour or (current_hour == end_hour and current_minute <= end_minute))
         )
+        
+        # 检查是否是策略检查时间点
+        # 使用预定义的检查时间点列表
+        is_check_time = (current_hour, current_minute) in check_times
+        
+        # 如果是交易时间内的检查时间点，且当前秒数小于59，等待K线完成
+        if is_trading_hours and is_check_time and now.second < 59:
+            # 计算需要等待的秒数，等到下一分钟的第1秒
+            wait_to_next_minute = 60 - now.second + 1
+            if LOG_VERBOSE:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 检测到策略检查时间点({current_hour:02d}:{current_minute:02d})，等待{wait_to_next_minute}秒让K线完成...")
+            time_module.sleep(wait_to_next_minute)
+            # 更新时间
+            now = get_us_eastern_time()
+            current_hour, current_minute = now.hour, now.minute
             
         df = get_historical_data(symbol)
         if df.empty:
             print("Error: Could not get historical data")
             sys.exit(1)
-        if DEBUG_MODE:
+        if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 历史数据获取完成: {len(df)} 条")
             
         # 调试模式下，根据指定时间截断数据
@@ -828,7 +861,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             df = df[df["DateTime"] <= now]
             
         if not is_trading_hours:
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前不在交易时间内 ({trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d})")
             if position_quantity != 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易日结束，执行平仓")
@@ -880,7 +913,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if position_quantity != 0:
             exit_signal, new_stop = check_exit_conditions(df, position_quantity, current_stop)
             current_stop = new_stop
-            if DEBUG_MODE:
+            if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓检查: 数量={position_quantity}, 退出信号={exit_signal}, 当前止损={current_stop}")
             if exit_signal:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号!")
@@ -904,7 +937,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     else:
                         retry_count += 1
                         if retry_count < max_retries:
-                            if DEBUG_MODE:
+                            if LOG_VERBOSE:
                                 print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
                             time_module.sleep(retry_interval)
                             # 重新获取数据
@@ -951,7 +984,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         else:
             # 检查是否已有持仓，如果有则不再开仓
             if position_quantity != 0:
-                if DEBUG_MODE:
+                if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
                 continue
                 
@@ -962,14 +995,17 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             # 获取价格
             if DEBUG_MODE:
-                # 调试模式：直接使用当前时间点的历史价格
+                # 调试模式：使用前一分钟的历史价格
                 current_time = now.strftime('%H:%M')
+                # 计算前一分钟的时间
+                prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
                 latest_date = df["Date"].max()
-                debug_data = df[(df["Date"] == latest_date) & (df["Time"] == current_time)]
+                debug_data = df[(df["Date"] == latest_date) & (df["Time"] == prev_minute_time)]
                 
                 if not debug_data.empty:
                     latest_price = float(debug_data["Close"].iloc[0])
                 else:
+                    # 如果找不到前一分钟的数据，使用最新的可用数据
                     latest_price = float(df.iloc[-1]["Close"])
             else:
                 # 正常模式: 使用API获取实时价格
@@ -979,17 +1015,29 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             latest_date = df["Date"].max()
             latest_data = df[df["Date"] == latest_date].copy()
             if not latest_data.empty:
-                latest_row = latest_data.iloc[-1].copy()
+                # 使用前一分钟的数据进行判断
+                prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
+                prev_minute_data = latest_data[latest_data["Time"] == prev_minute_time]
+                
+                if not prev_minute_data.empty:
+                    latest_row = prev_minute_data.iloc[0].copy()
+                else:
+                    # 如果找不到前一分钟的数据，使用最新的可用数据
+                    latest_row = latest_data.iloc[-1].copy()
+                
+                # 更新价格为实时价格
                 latest_row["Close"] = latest_price
+                
                 long_price_above_upper = latest_price > latest_row["UpperBound"]
                 long_price_above_vwap = latest_price > latest_row["VWAP"]
-                if DEBUG_MODE:
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 使用K线时间: {latest_row.get('Time', prev_minute_time)}")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 价格={latest_price:.2f}, 上界={latest_row['UpperBound']:.2f}, VWAP={latest_row['VWAP']:.2f}, 下界={latest_row['LowerBound']:.2f}")
                 signal = 0
                 price = latest_price
                 stop = None
                 if long_price_above_upper and long_price_above_vwap:
-                    if DEBUG_MODE:
+                    if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足多头入场条件!")
                     signal = 1
                     stop = max(latest_row["UpperBound"], latest_row["VWAP"])
@@ -997,25 +1045,19 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     short_price_below_lower = latest_price < latest_row["LowerBound"]
                     short_price_below_vwap = latest_price < latest_row["VWAP"]
                     if short_price_below_lower and short_price_below_vwap:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足空头入场条件!")
                         signal = -1
                         stop = min(latest_row["LowerBound"], latest_row["VWAP"])
                     else:
-                        if DEBUG_MODE:
+                        if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
                 if signal != 0:
                     # 保留交易信号日志
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号! 价格: {price}, 止损: {stop}")
-                    available_capital = get_account_balance()
-                    # 应用杠杆比例
-                    adjusted_capital = available_capital * LEVERAGE
-                    position_size = floor(adjusted_capital / latest_price)
-                    if position_size <= 0:
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: Insufficient capital for position")
-                        sys.exit(1)
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 调整后资金: ${adjusted_capital:.2f}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股")
+                    # 模拟模式：使用固定下单量
+                    position_size = FIXED_POSITION_SIZE
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股 (模拟固定量)")
                     side = "Buy" if signal > 0 else "Sell"
                     order_id = submit_order(symbol, side, position_size, outside_rth=outside_rth_setting)
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 订单已提交，ID: {order_id}")
@@ -1073,21 +1115,63 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         next_check_time = now + timedelta(minutes=check_interval_minutes)
         sleep_seconds = (next_check_time - now).total_seconds()
         if sleep_seconds > 0:
-            if DEBUG_MODE:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {sleep_seconds:.0f} 秒")
-            time_module.sleep(sleep_seconds)
+            # 找到下一个检查时间点
+            next_check = None
+            current_minutes = current_hour * 60 + current_minute
+            
+            for h, m in check_times:
+                check_minutes = h * 60 + m
+                if check_minutes > current_minutes:
+                    next_check = (h, m)
+                    break
+            
+            # 如果今天没有更多检查点，使用明天的第一个
+            if next_check is None and check_times:
+                next_check = check_times[0]
+                # 计算到明天这个时间点的等待时间
+                tomorrow = now.date() + timedelta(days=1)
+                next_check_datetime = datetime.combine(tomorrow, time(next_check[0], next_check[1], 0), tzinfo=now.tzinfo)
+            elif next_check is not None:
+                # 计算到下一个检查点的等待时间
+                next_check_datetime = now.replace(hour=next_check[0], minute=next_check[1], second=0, microsecond=0)
+            else:
+                # 如果没有检查点，等待默认时间
+                next_check_datetime = now + timedelta(minutes=check_interval_minutes)
+                
+            wait_seconds = (next_check_datetime - now).total_seconds()
+            
+            if LOG_VERBOSE and wait_seconds > 0 and next_check is not None:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待到下一个检查时间点 {next_check[0]:02d}:{next_check[1]:02d} ({wait_seconds:.0f} 秒)")
+            elif LOG_VERBOSE and wait_seconds > 0:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {wait_seconds:.0f} 秒")
+            
+            if wait_seconds > 0:
+                time_module.sleep(wait_seconds)
 
 if __name__ == "__main__":
-    print("\n长桥API交易策略启动")
+    print("\n长桥API交易策略启动 - 模拟模式")
     print("版本: 1.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
+    
+    # 显示配置状态
     if DEBUG_MODE:
-        print("调试模式已开启")
-        if DEBUG_TIME:
-            print(f"调试时间: {DEBUG_TIME}")
+        print("调试模式: 已开启（使用固定时间）")
+        if 'DEBUG_TIME' in globals() and DEBUG_TIME:
+            print(f"  固定时间: {DEBUG_TIME}")
         if DEBUG_ONCE:
-            print("单次运行模式已开启")
-    print(f"杠杆倍数: {LEVERAGE}倍")
+            print("  单次运行: 是")
+    else:
+        print("调试模式: 已关闭（使用当前时间）")
+    
+    if LOG_VERBOSE:
+        print("详细日志: 已开启")
+    else:
+        print("详细日志: 已关闭")
+    
+    print(f"固定下单量: {FIXED_POSITION_SIZE} 股")
+    
+    # 初始化SQLite数据库
+    init_sqlite_database()
     
     if QUOTE_CTX is None or TRADE_CTX is None:
         print("错误: 无法创建API上下文")
