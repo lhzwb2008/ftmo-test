@@ -710,6 +710,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         last_date = current_date
         LAST_STATS_DATE = current_date
         
+        # 获取当前时间信息
+        current_hour, current_minute = now.hour, now.minute
+        
         # 保持原有交易时间检查逻辑
         start_hour, start_minute = trading_start_time
         end_hour, end_minute = trading_end_time
