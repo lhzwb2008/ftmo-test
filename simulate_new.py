@@ -603,147 +603,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if position_quantity == 0:
             entry_price = None
         
-        # 检查是否是交易时间结束点，如果是且有持仓，则强制平仓
-        current_hour, current_minute = now.hour, now.minute
-        is_trading_end = current_hour == trading_end_time[0] and current_minute == trading_end_time[1]
-        if is_trading_end and position_quantity != 0:
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间为交易结束时间 {trading_end_time[0]}:{trading_end_time[1]}，执行平仓")
-            
-            # 获取历史数据
-            if LOG_VERBOSE:
-                print("获取历史数据")
-            df = get_historical_data(symbol)
-            if df.empty:
-                print("错误: 获取历史数据为空")
-                sys.exit(1)
-                
-            if DEBUG_MODE:
-                df = df[df["DateTime"] <= now]
-            
-            # 获取当前时间点的价格数据
-            current_time = now.strftime('%H:%M')
-            
-            # 尝试获取当前时间点数据，如果没有则等待重试
-            retry_count = 0
-            max_retries = 10
-            retry_interval = 5
-            current_price = None
-            
-            while retry_count < max_retries:
-                current_data = df[(df["Date"] == current_date) & (df["Time"] == current_time)]
-                
-                if not current_data.empty:
-                    # 使用当前时间点的价格
-                    current_price = float(current_data["Close"].iloc[0])
-                    break
-                else:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        if LOG_VERBOSE:
-                            print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
-                        time_module.sleep(retry_interval)
-                        # 重新获取数据
-                        df = get_historical_data(symbol)
-                        if DEBUG_MODE:
-                            df = df[df["DateTime"] <= now]
-            
-            if current_price is None:
-                print(f"错误: 尝试{max_retries}次后仍无法获取当前时间点 {current_time} 的数据")
-                sys.exit(1)
-            
-            # 执行平仓
-            side = "Sell" if position_quantity > 0 else "Buy"
-            close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
-            
-            # 计算盈亏
-            if entry_price:
-                pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                pnl_pct = (current_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {current_price}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:.2f}%)")
-                # 更新收益统计
-                DAILY_PNL += pnl
-                TOTAL_PNL += pnl
-                # 记录平仓交易
-                DAILY_TRADES.append({
-                    "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                    "action": "平仓",
-                    "side": side,
-                    "quantity": abs(position_quantity),
-                    "price": current_price,
-                    "pnl": pnl
-                })
-            else:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {current_price}")
-                
-            position_quantity = 0
-            entry_price = None
-            
-            # 在交易日结束时打印当日所有交易记录
-            if DAILY_TRADES:
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] ===== 当日交易记录 =====")
-                for i, trade in enumerate(DAILY_TRADES, 1):
-                    print(f"交易 #{i}:")
-                    print(f"  时间: {trade['time']}")
-                    print(f"  操作: {trade['action']} {trade['side']} {trade['quantity']} 股")
-                    print(f"  价格: ${trade['price']:.2f}")
-                    if trade['pnl'] is not None:
-                        print(f"  盈亏: ${trade['pnl']:+.2f}")
-                
-                # 计算当日统计
-                total_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓'])
-                winning_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓' and t['pnl'] > 0])
-                losing_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓' and t['pnl'] < 0])
-                
-                print(f"\n当日交易统计:")
-                print(f"  总交易次数: {total_trades}")
-                print(f"  盈利次数: {winning_trades}")
-                print(f"  亏损次数: {losing_trades}")
-                if total_trades > 0:
-                    print(f"  胜率: {winning_trades/total_trades*100:.1f}%")
-                print(f"  当日盈亏: ${DAILY_PNL:+.2f}")
-                print(f"  累计盈亏: ${TOTAL_PNL:+.2f}")
-                print("=" * 50)
-                
-                # 清空当日交易记录，为下一个交易日准备
-                DAILY_TRADES.clear()
-            
-            if DEBUG_MODE and DEBUG_ONCE:
-                print("\n调试模式单次运行完成，程序退出")
-                
-                # 打印当日交易记录（如果有）
-                if DAILY_TRADES:
-                    print(f"\n===== 当日交易记录 =====")
-                    for i, trade in enumerate(DAILY_TRADES, 1):
-                        print(f"交易 #{i}:")
-                        print(f"  时间: {trade['time']}")
-                        print(f"  操作: {trade['action']} {trade['side']} {trade['quantity']} 股")
-                        print(f"  价格: ${trade['price']:.2f}")
-                        if trade['pnl'] is not None:
-                            print(f"  盈亏: ${trade['pnl']:+.2f}")
-                    
-                    # 计算当日统计
-                    total_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓'])
-                    winning_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓' and t['pnl'] > 0])
-                    losing_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓' and t['pnl'] < 0])
-                    
-                    print(f"\n当日交易统计:")
-                    print(f"  总交易次数: {total_trades}")
-                    print(f"  盈利次数: {winning_trades}")
-                    print(f"  亏损次数: {losing_trades}")
-                    if total_trades > 0:
-                        print(f"  胜率: {winning_trades/total_trades*100:.1f}%")
-                    print("=" * 50)
-                
-                # 输出最终收益统计
-                if DAILY_PNL != 0 or TOTAL_PNL != 0:
-                    print(f"\n=== 最终收益统计 ===")
-                    print(f"当日盈亏: ${DAILY_PNL:+.2f}")
-                    print(f"累计盈亏: ${TOTAL_PNL:+.2f}")
-                break
-            continue
-        
         # 检查是否是交易日（调试模式下保持原有逻辑）
         is_today_trading_day = is_trading_day(symbol)
         if LOG_VERBOSE:
@@ -779,6 +638,32 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     
                 position_quantity = 0
                 entry_price = None
+                
+                # 在交易日结束时打印当日所有交易记录
+                if DAILY_TRADES:
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] ===== 当日交易记录 =====")
+                    for i, trade in enumerate(DAILY_TRADES, 1):
+                        print(f"交易 #{i}:")
+                        print(f"  时间: {trade['time']}")
+                        print(f"  操作: {trade['action']} {trade['side']} {trade['quantity']} 股")
+                        print(f"  价格: ${trade['price']:.2f}")
+                        if trade['pnl'] is not None:
+                            print(f"  盈亏: ${trade['pnl']:+.2f}")
+                    
+                    # 计算当日统计
+                    total_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓'])
+                    winning_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓' and t['pnl'] > 0])
+                    losing_trades = len([t for t in DAILY_TRADES if t['action'] == '平仓' and t['pnl'] < 0])
+                    
+                    print(f"\n当日交易统计:")
+                    print(f"  总交易次数: {total_trades}")
+                    print(f"  盈利次数: {winning_trades}")
+                    print(f"  亏损次数: {losing_trades}")
+                    if total_trades > 0:
+                        print(f"  胜率: {winning_trades/total_trades*100:.1f}%")
+                    print(f"  当日盈亏: ${DAILY_PNL:+.2f}")
+                    print(f"  累计盈亏: ${TOTAL_PNL:+.2f}")
+                    print("=" * 50)
             next_check_time = now + timedelta(hours=12)
             wait_seconds = (next_check_time - now).total_seconds()
             time_module.sleep(wait_seconds)
@@ -910,47 +795,23 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 直接计算噪声区域，不需要中间复制
         df = calculate_noise_area(df, lookback_days, K1, K2)
         
+        # 检查是否是最后一个检查时间点（收盘时间）
+        is_last_check_time = (current_hour, current_minute) == trading_end_time
+        
         if position_quantity != 0:
-            exit_signal, new_stop = check_exit_conditions(df, position_quantity, current_stop)
-            current_stop = new_stop
-            if LOG_VERBOSE:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓检查: 数量={position_quantity}, 退出信号={exit_signal}, 当前止损={current_stop}")
-            if exit_signal:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号!")
+            # 如果是收盘时间，强制平仓
+            if is_last_check_time:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 到达交易结束时间 {trading_end_time[0]:02d}:{trading_end_time[1]:02d}，执行收盘平仓")
                 
-                # 确保使用当前时间点的价格数据
-                current_time = now.strftime('%H:%M')
+                # 使用前一分钟的数据（15:40的完整K线）
+                prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
+                close_data = df[(df["Date"] == current_date) & (df["Time"] == prev_minute_time)]
                 
-                # 尝试获取当前时间点数据，如果没有则等待重试
-                retry_count = 0
-                max_retries = 10
-                retry_interval = 5
-                exit_price = None
-                
-                while retry_count < max_retries:
-                    current_data = df[(df["Date"] == current_date) & (df["Time"] == current_time)]
-                    
-                    if not current_data.empty:
-                        # 使用当前时间点的价格
-                        exit_price = float(current_data["Close"].iloc[0])
-                        break
-                    else:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            if LOG_VERBOSE:
-                                print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
-                            time_module.sleep(retry_interval)
-                            # 重新获取数据
-                            df = get_historical_data(symbol)
-                            if DEBUG_MODE:
-                                df = df[df["DateTime"] <= now]
-                            # 重新计算VWAP和噪声区域
-                            df["VWAP"] = calculate_vwap(df)
-                            df = calculate_noise_area(df, lookback_days, K1, K2)
-                
-                if exit_price is None:
-                    print(f"错误: 尝试{max_retries}次后仍无法获取当前时间点 {current_time} 的数据")
-                    continue  # 继续下一次循环，而不是退出
+                if not close_data.empty:
+                    exit_price = float(close_data["Close"].iloc[0])
+                else:
+                    # 如果找不到，使用最新可用数据
+                    exit_price = float(df.iloc[-1]["Close"])
                 
                 # 执行平仓
                 side = "Sell" if position_quantity > 0 else "Buy"
@@ -976,11 +837,80 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         "pnl": pnl
                     })
                 
-                # 平仓后增加交易次数计数器
-                positions_opened_today += 1
-                
                 position_quantity = 0
                 entry_price = None
+            else:
+                # 正常的止损检查
+                exit_signal, new_stop = check_exit_conditions(df, position_quantity, current_stop)
+                current_stop = new_stop
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓检查: 数量={position_quantity}, 退出信号={exit_signal}, 当前止损={current_stop}")
+                if exit_signal:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号!")
+                    
+                    # 确保使用当前时间点的价格数据
+                    current_time = now.strftime('%H:%M')
+                    
+                    # 尝试获取当前时间点数据，如果没有则等待重试
+                    retry_count = 0
+                    max_retries = 10
+                    retry_interval = 5
+                    exit_price = None
+                    
+                    while retry_count < max_retries:
+                        current_data = df[(df["Date"] == current_date) & (df["Time"] == current_time)]
+                        
+                        if not current_data.empty:
+                            # 使用当前时间点的价格
+                            exit_price = float(current_data["Close"].iloc[0])
+                            break
+                        else:
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                if LOG_VERBOSE:
+                                    print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
+                                time_module.sleep(retry_interval)
+                                # 重新获取数据
+                                df = get_historical_data(symbol)
+                                if DEBUG_MODE:
+                                    df = df[df["DateTime"] <= now]
+                                # 重新计算VWAP和噪声区域
+                                df["VWAP"] = calculate_vwap(df)
+                                df = calculate_noise_area(df, lookback_days, K1, K2)
+                    
+                    if exit_price is None:
+                        print(f"错误: 尝试{max_retries}次后仍无法获取当前时间点 {current_time} 的数据")
+                        continue  # 继续下一次循环，而不是退出
+                    
+                    # 执行平仓
+                    side = "Sell" if position_quantity > 0 else "Buy"
+                    close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
+                    
+                    # 计算盈亏
+                    if entry_price:
+                        pnl = (exit_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                        pnl_pct = (exit_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {exit_price}")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:.2f}%)")
+                        # 更新收益统计
+                        DAILY_PNL += pnl
+                        TOTAL_PNL += pnl
+                        # 记录平仓交易
+                        DAILY_TRADES.append({
+                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                            "action": "平仓",
+                            "side": side,
+                            "quantity": abs(position_quantity),
+                            "price": exit_price,
+                            "pnl": pnl
+                        })
+                    
+                    # 平仓后增加交易次数计数器
+                    positions_opened_today += 1
+                    
+                    position_quantity = 0
+                    entry_price = None
         else:
             # 检查是否已有持仓，如果有则不再开仓
             if position_quantity != 0:
