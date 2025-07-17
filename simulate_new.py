@@ -53,14 +53,17 @@ else:
     DB_PATH = "trading_signals.db"
 
 def init_sqlite_database():
-    """初始化SQLite数据库"""
+    """初始化SQLite数据库，每次启动时清空所有数据"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
+        # 先删除现有表（如果存在）
+        cursor.execute("DROP TABLE IF EXISTS signals")
+        
         # 创建简化的交易信号表
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
+        CREATE TABLE signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT NOT NULL,  -- BUY, SELL, CLOSE
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -70,7 +73,7 @@ def init_sqlite_database():
         
         conn.commit()
         conn.close()
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化成功")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化成功（已清空历史数据）")
         print(f"数据库路径: {os.path.abspath(DB_PATH)}")
         
     except Exception as e:
