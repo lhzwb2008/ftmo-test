@@ -719,14 +719,25 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 保持原有交易时间检查逻辑
         start_hour, start_minute = trading_start_time
         end_hour, end_minute = trading_end_time
-        is_trading_hours = (
-            (current_hour > start_hour or (current_hour == start_hour and current_minute >= start_minute)) and
-            (current_hour < end_hour or (current_hour == end_hour and current_minute <= end_minute))
-        )
         
         # 检查是否是策略检查时间点
         # 使用预定义的检查时间点列表
         is_check_time = (current_hour, current_minute) in check_times
+        
+        # 检查是否是最后一个检查时间点（收盘时间）
+        is_last_check_time = (current_hour, current_minute) == trading_end_time
+        
+        # 使用原始的检查时间来判断是否在交易时间内
+        # 如果是最后一个检查时间点，即使等待后超过了交易时间，也应该视为在交易时间内
+        if is_last_check_time:
+            # 如果是收盘时间点，强制认为在交易时间内，以便执行收盘平仓
+            is_trading_hours = True
+        else:
+            # 使用当前实际时间判断
+            is_trading_hours = (
+                (current_hour > start_hour or (current_hour == start_hour and current_minute >= start_minute)) and
+                (current_hour < end_hour or (current_hour == end_hour and current_minute <= end_minute))
+            )
         
         # 如果是交易时间内的检查时间点，且当前秒数小于59，等待K线完成
         if is_trading_hours and is_check_time and now.second < 59:
@@ -737,7 +748,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             time_module.sleep(wait_to_next_minute)
             # 更新时间
             now = get_us_eastern_time()
-            current_hour, current_minute = now.hour, now.minute
+            # 注意：不要更新 current_hour 和 current_minute，保持原始的检查时间点
+            # 这样可以确保 is_last_check_time 的判断不会因为等待而失效
             
         df = get_historical_data(symbol)
         if df.empty:
@@ -800,9 +812,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         
         # 直接计算噪声区域，不需要中间复制
         df = calculate_noise_area(df, lookback_days, K1, K2)
-        
-        # 检查是否是最后一个检查时间点（收盘时间）
-        is_last_check_time = (current_hour, current_minute) == trading_end_time
         
         if position_quantity != 0:
             # 如果是收盘时间，强制平仓
