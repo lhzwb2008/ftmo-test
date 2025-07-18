@@ -927,100 +927,104 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     position_quantity = 0
                     entry_price = None
         else:
-            # 检查是否已有持仓，如果有则不再开仓
-            if position_quantity != 0:
-                if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
-                continue
-                
-            # 检查今日是否达到最大持仓数
-            if positions_opened_today >= max_positions_per_day:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已开仓 {positions_opened_today} 次，达到上限")
-                continue
-            
-            # 获取价格
-            if DEBUG_MODE:
-                # 调试模式：使用前一分钟的历史价格
-                current_time = now.strftime('%H:%M')
-                # 计算前一分钟的时间
-                prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
-                latest_date = df["Date"].max()
-                debug_data = df[(df["Date"] == latest_date) & (df["Time"] == prev_minute_time)]
-                
-                if not debug_data.empty:
-                    latest_price = float(debug_data["Close"].iloc[0])
-                else:
-                    # 如果找不到前一分钟的数据，使用最新的可用数据
-                    latest_price = float(df.iloc[-1]["Close"])
+            # 如果是收盘时间，不允许开仓
+            if is_last_check_time:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 到达交易结束时间 {trading_end_time[0]:02d}:{trading_end_time[1]:02d}，不允许开仓")
             else:
-                # 正常模式: 使用API获取实时价格
-                quote = get_quote(symbol)
-                latest_price = float(quote.get("last_done", df.iloc[-1]["Close"]))
-            
-            latest_date = df["Date"].max()
-            latest_data = df[df["Date"] == latest_date].copy()
-            if not latest_data.empty:
-                # 使用前一分钟的数据进行判断
-                prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
-                prev_minute_data = latest_data[latest_data["Time"] == prev_minute_time]
-                
-                if not prev_minute_data.empty:
-                    latest_row = prev_minute_data.iloc[0].copy()
-                else:
-                    # 如果找不到前一分钟的数据，使用最新的可用数据
-                    latest_row = latest_data.iloc[-1].copy()
-                
-                # 更新价格为实时价格
-                latest_row["Close"] = latest_price
-                
-                long_price_above_upper = latest_price > latest_row["UpperBound"]
-                long_price_above_vwap = latest_price > latest_row["VWAP"]
-                if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 使用K线时间: {latest_row.get('Time', prev_minute_time)}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 价格={latest_price:.2f}, 上界={latest_row['UpperBound']:.2f}, VWAP={latest_row['VWAP']:.2f}, 下界={latest_row['LowerBound']:.2f}")
-                signal = 0
-                price = latest_price
-                stop = None
-                if long_price_above_upper and long_price_above_vwap:
+                # 检查是否已有持仓，如果有则不再开仓
+                if position_quantity != 0:
                     if LOG_VERBOSE:
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足多头入场条件!")
-                    signal = 1
-                    stop = max(latest_row["UpperBound"], latest_row["VWAP"])
-                else:
-                    short_price_below_lower = latest_price < latest_row["LowerBound"]
-                    short_price_below_vwap = latest_price < latest_row["VWAP"]
-                    if short_price_below_lower and short_price_below_vwap:
-                        if LOG_VERBOSE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足空头入场条件!")
-                        signal = -1
-                        stop = min(latest_row["LowerBound"], latest_row["VWAP"])
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
+                    continue
+                
+                # 检查今日是否达到最大持仓数
+                if positions_opened_today >= max_positions_per_day:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已开仓 {positions_opened_today} 次，达到上限")
+                    continue
+                
+                # 获取价格
+                if DEBUG_MODE:
+                    # 调试模式：使用前一分钟的历史价格
+                    current_time = now.strftime('%H:%M')
+                    # 计算前一分钟的时间
+                    prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
+                    latest_date = df["Date"].max()
+                    debug_data = df[(df["Date"] == latest_date) & (df["Time"] == prev_minute_time)]
+                    
+                    if not debug_data.empty:
+                        latest_price = float(debug_data["Close"].iloc[0])
                     else:
+                        # 如果找不到前一分钟的数据，使用最新的可用数据
+                        latest_price = float(df.iloc[-1]["Close"])
+                else:
+                    # 正常模式: 使用API获取实时价格
+                    quote = get_quote(symbol)
+                    latest_price = float(quote.get("last_done", df.iloc[-1]["Close"]))
+                
+                latest_date = df["Date"].max()
+                latest_data = df[df["Date"] == latest_date].copy()
+                if not latest_data.empty:
+                    # 使用前一分钟的数据进行判断
+                    prev_minute_time = (now - timedelta(minutes=1)).strftime('%H:%M')
+                    prev_minute_data = latest_data[latest_data["Time"] == prev_minute_time]
+                    
+                    if not prev_minute_data.empty:
+                        latest_row = prev_minute_data.iloc[0].copy()
+                    else:
+                        # 如果找不到前一分钟的数据，使用最新的可用数据
+                        latest_row = latest_data.iloc[-1].copy()
+                    
+                    # 更新价格为实时价格
+                    latest_row["Close"] = latest_price
+                    
+                    long_price_above_upper = latest_price > latest_row["UpperBound"]
+                    long_price_above_vwap = latest_price > latest_row["VWAP"]
+                    if LOG_VERBOSE:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 使用K线时间: {latest_row.get('Time', prev_minute_time)}")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 价格={latest_price:.2f}, 上界={latest_row['UpperBound']:.2f}, VWAP={latest_row['VWAP']:.2f}, 下界={latest_row['LowerBound']:.2f}")
+                    signal = 0
+                    price = latest_price
+                    stop = None
+                    if long_price_above_upper and long_price_above_vwap:
                         if LOG_VERBOSE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
-                if signal != 0:
-                    # 保留交易信号日志
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号! 价格: {price}, 止损: {stop}")
-                    # 模拟模式：使用固定下单量
-                    position_size = FIXED_POSITION_SIZE
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股 (模拟固定量)")
-                    side = "Buy" if signal > 0 else "Sell"
-                    order_id = submit_order(symbol, side, position_size, outside_rth=outside_rth_setting)
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 订单已提交，ID: {order_id}")
-                    
-                    # 删除订单状态检查代码，直接更新持仓状态
-                    position_quantity = position_size if signal > 0 else -position_size
-                    entry_price = latest_price
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {position_size} {symbol} 价格: {entry_price}")
-                    
-                    # 记录开仓交易
-                    DAILY_TRADES.append({
-                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                        "action": "开仓",
-                        "side": side,
-                        "quantity": position_size,
-                        "price": entry_price,
-                        "pnl": None  # 开仓时还没有盈亏
-                    })
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足多头入场条件!")
+                        signal = 1
+                        stop = max(latest_row["UpperBound"], latest_row["VWAP"])
+                    else:
+                        short_price_below_lower = latest_price < latest_row["LowerBound"]
+                        short_price_below_vwap = latest_price < latest_row["VWAP"]
+                        if short_price_below_lower and short_price_below_vwap:
+                            if LOG_VERBOSE:
+                                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足空头入场条件!")
+                            signal = -1
+                            stop = min(latest_row["LowerBound"], latest_row["VWAP"])
+                        else:
+                            if LOG_VERBOSE:
+                                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
+                    if signal != 0:
+                        # 保留交易信号日志
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号! 价格: {price}, 止损: {stop}")
+                        # 模拟模式：使用固定下单量
+                        position_size = FIXED_POSITION_SIZE
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股 (模拟固定量)")
+                        side = "Buy" if signal > 0 else "Sell"
+                        order_id = submit_order(symbol, side, position_size, outside_rth=outside_rth_setting)
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 订单已提交，ID: {order_id}")
+                        
+                        # 删除订单状态检查代码，直接更新持仓状态
+                        position_quantity = position_size if signal > 0 else -position_size
+                        entry_price = latest_price
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {position_size} {symbol} 价格: {entry_price}")
+                        
+                        # 记录开仓交易
+                        DAILY_TRADES.append({
+                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                            "action": "开仓",
+                            "side": side,
+                            "quantity": position_size,
+                            "price": entry_price,
+                            "pnl": None  # 开仓时还没有盈亏
+                        })
         
         # 调试模式且单次运行模式，完成一次循环后退出
         if DEBUG_MODE and DEBUG_ONCE:
