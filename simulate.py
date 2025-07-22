@@ -29,7 +29,7 @@ FIXED_POSITION_SIZE = 100  # 模拟模式固定下单量
 SYMBOL = 'QQQ.US'
 
 # 日志和调试模式配置（分离两个功能）
-LOG_VERBOSE = False   # 设置为True开启详细日志打印
+LOG_VERBOSE = True   # 设置为True开启详细日志打印
 DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
 DEBUG_TIME = "2025-07-10 10:25:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
 DEBUG_ONCE = True  # 是否只运行一次就退出（仅在DEBUG_MODE=True时有效）
@@ -768,46 +768,43 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 截断到调试时间之前的数据
             df = df[df["DateTime"] <= now]
             
-        # 首先检查日内止损（无论是否有持仓）
-        if not DAILY_STOP_TRIGGERED:
-            # 计算当日总亏损百分比
+        # 如果有持仓且未触发日内止损，只做日内止损检查（不做技术分析）
+        if position_quantity != 0 and not DAILY_STOP_TRIGGERED:
+            # 只检查日内止损，不获取历史数据和技术分析
             current_loss_pct = abs(DAILY_PNL / INITIAL_CAPITAL) if DAILY_PNL < 0 else 0
             
-            # 如果当日已实现亏损超过4%，触发日内止损
             if current_loss_pct >= MAX_DAILY_LOSS_PCT:
                 print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发日内止损 !!!!!")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已实现亏损: ${DAILY_PNL:.2f} ({current_loss_pct*100:.2f}%)")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 超过最大日内亏损限制 {MAX_DAILY_LOSS_PCT*100:.0f}%")
                 
-                # 如果有持仓，先平仓
-                if position_quantity != 0:
-                    # 获取当前价格用于计算盈亏
-                    quote = get_quote(symbol)
-                    current_price = float(quote.get("last_done", 0))
-                    
-                    side = "Sell" if position_quantity > 0 else "Buy"
-                    close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损平仓订单已提交，ID: {close_order_id}")
-                    
-                    # 计算盈亏
-                    if entry_price and current_price > 0:
-                        unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                        DAILY_PNL += unrealized_pnl
-                        TOTAL_PNL += unrealized_pnl
-                        # 记录平仓交易
-                        DAILY_TRADES.append({
-                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                            "action": "平仓(日内止损)",
-                            "side": side,
-                            "quantity": abs(position_quantity),
-                            "price": current_price,
-                            "pnl": unrealized_pnl
-                        })
-                    
-                    # 重置持仓状态
-                    position_quantity = 0
-                    entry_price = None
-                    current_stop = None
+                # 获取当前价格用于计算盈亏
+                quote = get_quote(symbol)
+                current_price = float(quote.get("last_done", 0))
+                
+                side = "Sell" if position_quantity > 0 else "Buy"
+                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损平仓订单已提交，ID: {close_order_id}")
+                
+                # 计算盈亏
+                if entry_price and current_price > 0:
+                    unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                    DAILY_PNL += unrealized_pnl
+                    TOTAL_PNL += unrealized_pnl
+                    # 记录平仓交易
+                    DAILY_TRADES.append({
+                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                        "action": "平仓(日内止损)",
+                        "side": side,
+                        "quantity": abs(position_quantity),
+                        "price": current_price,
+                        "pnl": unrealized_pnl
+                    })
+                
+                # 重置持仓状态
+                position_quantity = 0
+                entry_price = None
+                current_stop = None
                 
                 # 设置止损标志，今日不再交易
                 DAILY_STOP_TRIGGERED = True
@@ -816,6 +813,15 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 
                 # 继续下一次循环
                 continue
+            
+            # 如果未触发止损，等待1分钟后再检查
+            next_check_time = now + timedelta(minutes=1)
+            sleep_seconds = (next_check_time - now).total_seconds()
+            if sleep_seconds > 0:
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 有持仓，1分钟后检查日内止损")
+                time_module.sleep(sleep_seconds)
+            continue  # 跳过后续的技术分析逻辑
             
         if not is_trading_hours:
             if LOG_VERBOSE:
@@ -1122,49 +1128,39 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"累计盈亏: ${TOTAL_PNL:+.2f}")
             break
             
-        # 如果有持仓且未触发日内止损，设置更短的检查间隔（1分钟）以便及时检查止损
-        if position_quantity != 0 and not DAILY_STOP_TRIGGERED:
-            # 有持仓时每分钟检查一次
-            next_check_time = now + timedelta(minutes=1)
-            sleep_seconds = (next_check_time - now).total_seconds()
-            if sleep_seconds > 0:
-                if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 有持仓，1分钟后检查日内止损")
-                time_module.sleep(sleep_seconds)
+        # 无持仓或已触发止损，使用正常的检查间隔
+        # 找到下一个检查时间点
+        next_check = None
+        current_minutes = current_hour * 60 + current_minute
+        
+        for h, m in check_times:
+            check_minutes = h * 60 + m
+            if check_minutes > current_minutes:
+                next_check = (h, m)
+                break
+        
+        # 如果今天没有更多检查点，使用明天的第一个
+        if next_check is None and check_times:
+            next_check = check_times[0]
+            # 计算到明天这个时间点的等待时间
+            tomorrow = now.date() + timedelta(days=1)
+            next_check_datetime = datetime.combine(tomorrow, time(next_check[0], next_check[1], 0), tzinfo=now.tzinfo)
+        elif next_check is not None:
+            # 计算到下一个检查点的等待时间
+            next_check_datetime = now.replace(hour=next_check[0], minute=next_check[1], second=0, microsecond=0)
         else:
-            # 无持仓或已触发止损，使用正常的检查间隔
-            # 找到下一个检查时间点
-            next_check = None
-            current_minutes = current_hour * 60 + current_minute
+            # 如果没有检查点，等待默认时间
+            next_check_datetime = now + timedelta(minutes=check_interval_minutes)
             
-            for h, m in check_times:
-                check_minutes = h * 60 + m
-                if check_minutes > current_minutes:
-                    next_check = (h, m)
-                    break
-            
-            # 如果今天没有更多检查点，使用明天的第一个
-            if next_check is None and check_times:
-                next_check = check_times[0]
-                # 计算到明天这个时间点的等待时间
-                tomorrow = now.date() + timedelta(days=1)
-                next_check_datetime = datetime.combine(tomorrow, time(next_check[0], next_check[1], 0), tzinfo=now.tzinfo)
-            elif next_check is not None:
-                # 计算到下一个检查点的等待时间
-                next_check_datetime = now.replace(hour=next_check[0], minute=next_check[1], second=0, microsecond=0)
-            else:
-                # 如果没有检查点，等待默认时间
-                next_check_datetime = now + timedelta(minutes=check_interval_minutes)
-                
-            wait_seconds = (next_check_datetime - now).total_seconds()
-            
-            if LOG_VERBOSE and wait_seconds > 0 and next_check is not None:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待到下一个检查时间点 {next_check[0]:02d}:{next_check[1]:02d} ({wait_seconds:.0f} 秒)")
-            elif LOG_VERBOSE and wait_seconds > 0:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {wait_seconds:.0f} 秒")
-            
-            if wait_seconds > 0:
-                time_module.sleep(wait_seconds)
+        wait_seconds = (next_check_datetime - now).total_seconds()
+        
+        if LOG_VERBOSE and wait_seconds > 0 and next_check is not None:
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待到下一个检查时间点 {next_check[0]:02d}:{next_check[1]:02d} ({wait_seconds:.0f} 秒)")
+        elif LOG_VERBOSE and wait_seconds > 0:
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {wait_seconds:.0f} 秒")
+        
+        if wait_seconds > 0:
+            time_module.sleep(wait_seconds)
 
 if __name__ == "__main__":
     print("\n长桥API交易策略启动 - 模拟模式")
