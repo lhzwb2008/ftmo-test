@@ -768,6 +768,55 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 截断到调试时间之前的数据
             df = df[df["DateTime"] <= now]
             
+        # 首先检查日内止损（无论是否有持仓）
+        if not DAILY_STOP_TRIGGERED:
+            # 计算当日总亏损百分比
+            current_loss_pct = abs(DAILY_PNL / INITIAL_CAPITAL) if DAILY_PNL < 0 else 0
+            
+            # 如果当日已实现亏损超过4%，触发日内止损
+            if current_loss_pct >= MAX_DAILY_LOSS_PCT:
+                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发日内止损 !!!!!")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已实现亏损: ${DAILY_PNL:.2f} ({current_loss_pct*100:.2f}%)")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 超过最大日内亏损限制 {MAX_DAILY_LOSS_PCT*100:.0f}%")
+                
+                # 如果有持仓，先平仓
+                if position_quantity != 0:
+                    # 获取当前价格用于计算盈亏
+                    quote = get_quote(symbol)
+                    current_price = float(quote.get("last_done", 0))
+                    
+                    side = "Sell" if position_quantity > 0 else "Buy"
+                    close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损平仓订单已提交，ID: {close_order_id}")
+                    
+                    # 计算盈亏
+                    if entry_price and current_price > 0:
+                        unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                        DAILY_PNL += unrealized_pnl
+                        TOTAL_PNL += unrealized_pnl
+                        # 记录平仓交易
+                        DAILY_TRADES.append({
+                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                            "action": "平仓(日内止损)",
+                            "side": side,
+                            "quantity": abs(position_quantity),
+                            "price": current_price,
+                            "pnl": unrealized_pnl
+                        })
+                    
+                    # 重置持仓状态
+                    position_quantity = 0
+                    entry_price = None
+                    current_stop = None
+                
+                # 设置止损标志，今日不再交易
+                DAILY_STOP_TRIGGERED = True
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日不再进行新的交易")
+                print("=" * 60)
+                
+                # 继续下一次循环
+                continue
+            
         if not is_trading_hours:
             if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前不在交易时间内 ({trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d})")
@@ -819,60 +868,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         df = calculate_noise_area(df, lookback_days, K1, K2)
         
         if position_quantity != 0:
-            # 首先检查日内止损（每分钟检查）
-            # 计算当前持仓的浮动盈亏
-            if entry_price:
-                quote = get_quote(symbol)
-                current_price = float(quote.get("last_done", 0))
-                if current_price > 0:
-                    # 计算当前持仓的浮动盈亏
-                    unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                    # 计算当日总亏损（已实现亏损 + 未实现亏损）
-                    total_daily_loss = DAILY_PNL + unrealized_pnl
-                    # 计算亏损百分比
-                    loss_pct = abs(total_daily_loss / INITIAL_CAPITAL) if total_daily_loss < 0 else 0
-                    
-                    # 如果亏损超过4%，触发日内止损
-                    if loss_pct >= MAX_DAILY_LOSS_PCT and not DAILY_STOP_TRIGGERED:
-                        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发日内止损 !!!!!")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: ${current_price:.2f}")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 入场价格: ${entry_price:.2f}")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前持仓浮动盈亏: ${unrealized_pnl:.2f}")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已实现盈亏: ${DAILY_PNL:.2f}")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日总亏损: ${total_daily_loss:.2f} ({loss_pct*100:.2f}%)")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 超过最大日内亏损限制 {MAX_DAILY_LOSS_PCT*100:.0f}%，执行强制平仓")
-                        
-                        # 执行平仓
-                        side = "Sell" if position_quantity > 0 else "Buy"
-                        close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损平仓订单已提交，ID: {close_order_id}")
-                        
-                        # 更新收益统计
-                        DAILY_PNL += unrealized_pnl
-                        TOTAL_PNL += unrealized_pnl
-                        
-                        # 记录平仓交易
-                        DAILY_TRADES.append({
-                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                            "action": "平仓(日内止损)",
-                            "side": side,
-                            "quantity": abs(position_quantity),
-                            "price": current_price,
-                            "pnl": unrealized_pnl
-                        })
-                        
-                        # 设置止损标志，今日不再交易
-                        DAILY_STOP_TRIGGERED = True
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日不再进行新的交易")
-                        print("=" * 60)
-                        
-                        # 重置持仓状态
-                        position_quantity = 0
-                        entry_price = None
-                        current_stop = None
-                        
-                        # 继续下一次循环
-                        continue
             
             # 如果是收盘时间，强制平仓
             if is_last_check_time:
