@@ -26,10 +26,10 @@ K2 = 1 # 下边界sigma乘数
 FIXED_POSITION_SIZE = 100  # 模拟模式固定下单量
 
 # 默认交易品种
-SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
+SYMBOL = 'QQQ.US'
 
 # 日志和调试模式配置（分离两个功能）
-LOG_VERBOSE = True   # 设置为True开启详细日志打印
+LOG_VERBOSE = False   # 设置为True开启详细日志打印
 DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
 DEBUG_TIME = "2025-07-10 10:25:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
 DEBUG_ONCE = True  # 是否只运行一次就退出（仅在DEBUG_MODE=True时有效）
