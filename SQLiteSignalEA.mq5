@@ -17,7 +17,7 @@
 input string   DBPath = "trading_signals.db";          // SQLite数据库文件名
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
 input int      MagicNumber = 20241228;                 // 魔术数字
-input double   Leverage = 2.0;                        // 杠杆倍数
+input double   Leverage = 4.0;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 
