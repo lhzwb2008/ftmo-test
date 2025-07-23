@@ -26,7 +26,7 @@ K2 = 1 # 下边界sigma乘数
 FIXED_POSITION_SIZE = 100  # 模拟模式固定下单量
 
 # 默认交易品种
-SYMBOL = 'QQQ.US'
+SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
 # 日志和调试模式配置（分离两个功能）
 LOG_VERBOSE = True   # 设置为True开启详细日志打印
@@ -594,85 +594,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     while True:
         now = get_us_eastern_time()
         current_date = now.date()
-        
-        # 如果有持仓且未触发日内止损，只做日内止损检查（不做技术分析）
-        if position_quantity != 0 and not DAILY_STOP_TRIGGERED:
-            # 只检查日内止损，不获取历史数据和技术分析
-            current_loss_pct = abs(DAILY_PNL / INITIAL_CAPITAL) if DAILY_PNL < 0 else 0
-            
-            # 获取当前价格用于显示详细信息
-            quote = get_quote(symbol)
-            current_price = float(quote.get("last_done", 0))
-            
-            # 计算当前未实现盈亏
-            if entry_price and current_price > 0:
-                unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                total_current_pnl = DAILY_PNL + unrealized_pnl
-                total_loss_pct = abs(total_current_pnl / INITIAL_CAPITAL) if total_current_pnl < 0 else 0
-            else:
-                unrealized_pnl = 0
-                total_current_pnl = DAILY_PNL
-                total_loss_pct = current_loss_pct
-            
-            # 打印详细的检查信息
-            if LOG_VERBOSE:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] === 分钟级止损检查 ===")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓: {'多头' if position_quantity > 0 else '空头'} {abs(position_quantity)} 股")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 入场价格: ${entry_price:.2f}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: ${current_price:.2f}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 未实现盈亏: ${unrealized_pnl:+.2f}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已实现: ${DAILY_PNL:+.2f}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日总盈亏: ${total_current_pnl:+.2f} ({total_loss_pct*100:.2f}%)")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 止损线: {MAX_DAILY_LOSS_PCT*100:.0f}% (距离: {(MAX_DAILY_LOSS_PCT - total_loss_pct)*100:.2f}%)")
-            
-            if current_loss_pct >= MAX_DAILY_LOSS_PCT:
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发日内止损 !!!!!")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已实现亏损: ${DAILY_PNL:.2f} ({current_loss_pct*100:.2f}%)")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 超过最大日内亏损限制 {MAX_DAILY_LOSS_PCT*100:.0f}%")
-                
-                # 使用已获取的当前价格
-                
-                side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损平仓订单已提交，ID: {close_order_id}")
-                
-                # 计算盈亏
-                if entry_price and current_price > 0:
-                    unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                    DAILY_PNL += unrealized_pnl
-                    TOTAL_PNL += unrealized_pnl
-                    # 记录平仓交易
-                    DAILY_TRADES.append({
-                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                        "action": "平仓(日内止损)",
-                        "side": side,
-                        "quantity": abs(position_quantity),
-                        "price": current_price,
-                        "pnl": unrealized_pnl
-                    })
-                
-                # 重置持仓状态
-                position_quantity = 0
-                entry_price = None
-                current_stop = None
-                
-                # 设置止损标志，今日不再交易
-                DAILY_STOP_TRIGGERED = True
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日不再进行新的交易")
-                print("=" * 60)
-                
-                # 继续下一次循环
-                continue
-            
-            # 如果未触发止损，等待1分钟后再检查
-            next_check_time = now + timedelta(minutes=1)
-            sleep_seconds = (next_check_time - now).total_seconds()
-            if sleep_seconds > 0:
-                if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 有持仓，1分钟后检查日内止损")
-                time_module.sleep(sleep_seconds)
-            continue  # 跳过后续的技术分析逻辑
-        
         if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 主循环开始")
         
@@ -823,6 +744,74 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 (current_hour < end_hour or (current_hour == end_hour and current_minute <= end_minute))
             )
         
+        # 如果有持仓且未触发日内止损，先进行日内止损检查
+        if position_quantity != 0 and not DAILY_STOP_TRIGGERED:
+            # 获取当前价格
+            quote = get_quote(symbol)
+            current_price = float(quote.get("last_done", 0))
+            
+            # 计算当前未实现盈亏
+            if entry_price and current_price > 0:
+                unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                total_current_pnl = DAILY_PNL + unrealized_pnl
+                total_loss_pct = abs(total_current_pnl / INITIAL_CAPITAL) if total_current_pnl < 0 else 0
+            else:
+                unrealized_pnl = 0
+                total_current_pnl = DAILY_PNL
+                total_loss_pct = abs(DAILY_PNL / INITIAL_CAPITAL) if DAILY_PNL < 0 else 0
+            
+            # 每分钟打印一次检查信息（如果详细日志开启）
+            if LOG_VERBOSE and now.second < 5:  # 每分钟的前5秒打印
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] === 日内止损检查 ===")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓: {'多头' if position_quantity > 0 else '空头'} {abs(position_quantity)} 股")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 入场价格: ${entry_price:.2f}")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: ${current_price:.2f}")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 未实现盈亏: ${unrealized_pnl:+.2f}")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已实现: ${DAILY_PNL:+.2f}")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日总盈亏: ${total_current_pnl:+.2f} ({total_loss_pct*100:.2f}%)")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 止损线: {MAX_DAILY_LOSS_PCT*100:.0f}% (距离: {(MAX_DAILY_LOSS_PCT - total_loss_pct)*100:.2f}%)")
+            
+            # 检查是否触发日内止损（基于总盈亏）
+            if total_loss_pct >= MAX_DAILY_LOSS_PCT:
+                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发日内止损 !!!!!")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日总亏损: ${total_current_pnl:.2f} ({total_loss_pct*100:.2f}%)")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 超过最大日内亏损限制 {MAX_DAILY_LOSS_PCT*100:.0f}%")
+                
+                side = "Sell" if position_quantity > 0 else "Buy"
+                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损平仓订单已提交，ID: {close_order_id}")
+                
+                # 计算最终盈亏
+                if entry_price and current_price > 0:
+                    pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                    DAILY_PNL += pnl
+                    TOTAL_PNL += pnl
+                    # 记录平仓交易
+                    DAILY_TRADES.append({
+                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                        "action": "平仓(日内止损)",
+                        "side": side,
+                        "quantity": abs(position_quantity),
+                        "price": current_price,
+                        "pnl": pnl
+                    })
+                
+                # 重置持仓状态
+                position_quantity = 0
+                entry_price = None
+                current_stop = None
+                
+                # 设置止损标志，今日不再交易
+                DAILY_STOP_TRIGGERED = True
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日不再进行新的交易")
+                print("=" * 60)
+        
+        # 如果不是策略检查时间点，且有持仓，继续等待
+        if not is_check_time and position_quantity != 0:
+            # 等待10秒后继续检查（避免过于频繁）
+            time_module.sleep(10)
+            continue
+            
         # 如果是交易时间内的检查时间点，且当前秒数小于59，等待K线完成
         if is_trading_hours and is_check_time and now.second < 59:
             # 计算需要等待的秒数，等到下一分钟的第1秒
@@ -846,61 +835,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if DEBUG_MODE:
             # 截断到调试时间之前的数据
             df = df[df["DateTime"] <= now]
-            
-        # 如果有持仓且未触发日内止损，只做日内止损检查（不做技术分析）
-        if position_quantity != 0 and not DAILY_STOP_TRIGGERED:
-            # 只检查日内止损，不获取历史数据和技术分析
-            current_loss_pct = abs(DAILY_PNL / INITIAL_CAPITAL) if DAILY_PNL < 0 else 0
-            
-            if current_loss_pct >= MAX_DAILY_LOSS_PCT:
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发日内止损 !!!!!")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已实现亏损: ${DAILY_PNL:.2f} ({current_loss_pct*100:.2f}%)")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 超过最大日内亏损限制 {MAX_DAILY_LOSS_PCT*100:.0f}%")
-                
-                # 获取当前价格用于计算盈亏
-                quote = get_quote(symbol)
-                current_price = float(quote.get("last_done", 0))
-                
-                side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损平仓订单已提交，ID: {close_order_id}")
-                
-                # 计算盈亏
-                if entry_price and current_price > 0:
-                    unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                    DAILY_PNL += unrealized_pnl
-                    TOTAL_PNL += unrealized_pnl
-                    # 记录平仓交易
-                    DAILY_TRADES.append({
-                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                        "action": "平仓(日内止损)",
-                        "side": side,
-                        "quantity": abs(position_quantity),
-                        "price": current_price,
-                        "pnl": unrealized_pnl
-                    })
-                
-                # 重置持仓状态
-                position_quantity = 0
-                entry_price = None
-                current_stop = None
-                
-                # 设置止损标志，今日不再交易
-                DAILY_STOP_TRIGGERED = True
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日不再进行新的交易")
-                print("=" * 60)
-                
-                # 继续下一次循环
-                continue
-            
-            # 如果未触发止损，等待1分钟后再检查
-            next_check_time = now + timedelta(minutes=1)
-            sleep_seconds = (next_check_time - now).total_seconds()
-            if sleep_seconds > 0:
-                if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 有持仓，1分钟后检查日内止损")
-                time_module.sleep(sleep_seconds)
-            continue  # 跳过后续的技术分析逻辑
             
         if not is_trading_hours:
             if LOG_VERBOSE:
@@ -1206,7 +1140,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"累计盈亏: ${TOTAL_PNL:+.2f}")
             break
             
-        # 无持仓或已触发止损，使用正常的检查间隔
+        next_check_time = now + timedelta(minutes=check_interval_minutes)
+        sleep_seconds = (next_check_time - now).total_seconds()
+        if sleep_seconds > 0:
             # 找到下一个检查时间点
             next_check = None
             current_minutes = current_hour * 60 + current_minute
