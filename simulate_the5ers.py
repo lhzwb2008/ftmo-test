@@ -1017,24 +1017,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日不再进行新的交易")
                 print("=" * 60)
         
-        # 如果不是策略检查时间点，且有持仓，继续等待
-        if not is_check_time and position_quantity != 0:
-            # 等待10秒后继续检查（避免过于频繁）
-            time_module.sleep(10)
-            continue
-            
-        # 如果是交易时间内的检查时间点，且当前秒数小于59，等待K线完成
-        if is_trading_hours and is_check_time and now.second < 59:
-            # 计算需要等待的秒数，等到下一分钟的第1秒
-            wait_to_next_minute = 60 - now.second + 1
-            if LOG_VERBOSE:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 检测到策略检查时间点({current_hour:02d}:{current_minute:02d})，等待{wait_to_next_minute}秒让K线完成...")
-            time_module.sleep(wait_to_next_minute)
-            # 更新时间
-            now = get_us_eastern_time()
-            # 注意：不要更新 current_hour 和 current_minute，保持原始的检查时间点
-            # 这样可以确保 is_last_check_time 的判断不会因为等待而失效
-            
         df = get_historical_data(symbol)
         if df.empty:
             print("Error: Could not get historical data")
