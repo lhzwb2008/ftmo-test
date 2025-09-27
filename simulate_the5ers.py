@@ -441,16 +441,35 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
         print(f"错误: 目标日期 {target_date} 数据为空")
         sys.exit(1)
     
-    # 使用第一根分钟K线的Open作为当天开盘价（与backtest.py一致）
-    day_open = target_day_data["Open"].iloc[0]
+    # 使用指定时间点的K线数据
+    # 获取当日09:30的开盘价
+    day_0930_data = target_day_data[target_day_data["Time"] == "09:30"]
+    if not day_0930_data.empty:
+        day_open = day_0930_data["Open"].iloc[0]
+        if LOG_VERBOSE:
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 使用09:30开盘价: {day_open}")
+    else:
+        # 如果没有09:30数据，回退到第一根K线
+        day_open = target_day_data["Open"].iloc[0]
+        if LOG_VERBOSE:
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 09:30数据缺失，使用第一根K线开盘价: {day_open}")
     
-    # 获取目标日期的前一日收盘价
+    # 获取前一日15:59的收盘价
     if target_date in unique_dates and unique_dates.index(target_date) > 0:
         prev_date = unique_dates[unique_dates.index(target_date) - 1]
         prev_day_data = df[df["Date"] == prev_date]
         if not prev_day_data.empty:
-            # 使用最后一根分钟K线的Close作为前一天收盘价（与backtest.py一致）
-            prev_close = prev_day_data["Close"].iloc[-1]
+            # 尝试获取15:59的收盘价
+            prev_1559_data = prev_day_data[prev_day_data["Time"] == "15:59"]
+            if not prev_1559_data.empty:
+                prev_close = prev_1559_data["Close"].iloc[0]
+                if LOG_VERBOSE:
+                    print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 使用前日15:59收盘价: {prev_close}")
+            else:
+                # 如果没有15:59数据，回退到最后一根K线
+                prev_close = prev_day_data["Close"].iloc[-1]
+                if LOG_VERBOSE:
+                    print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 15:59数据缺失，使用最后一根K线收盘价: {prev_close}")
         else:
             prev_close = None
     else:
