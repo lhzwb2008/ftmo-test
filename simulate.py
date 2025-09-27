@@ -644,7 +644,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 判断当前是否是触发时间点（允许前后30秒的误差）
         is_trigger_time = False
         for trigger_h, trigger_m in trigger_times:
-            trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=0, microsecond=0)
+            trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=1, microsecond=0)
             time_diff = abs((now - trigger_time).total_seconds())
             if time_diff <= 30:  # 30秒误差范围内都认为是触发时间
                 is_trigger_time = True
@@ -655,7 +655,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             closest_trigger_idx = None
             min_diff = float('inf')
             for i, (trigger_h, trigger_m) in enumerate(trigger_times):
-                trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=0, microsecond=0)
+                trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=1, microsecond=0)
                 time_diff = abs((now - trigger_time).total_seconds())
                 if time_diff < min_diff:
                     min_diff = time_diff
@@ -764,11 +764,21 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
             
+            # 获取实际平仓价格
+            try:
+                time_module.sleep(1)  # 等待订单执行
+                close_order_detail = TRADE_CTX.order_detail(close_order_id)
+                actual_close_price = float(close_order_detail.executed_price) if close_order_detail.executed_price else current_price
+            except Exception as e:
+                actual_close_price = current_price
+                if DEBUG_MODE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 获取平仓成交价格失败: {str(e)}")
+            
             # 计算盈亏
             if entry_price:
-                pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                pnl_pct = (current_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {current_price}")
+                pnl = (actual_close_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                pnl_pct = (actual_close_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {actual_close_price}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:.2f}%)")
                 # 更新收益统计
                 DAILY_PNL += pnl
@@ -779,11 +789,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     "action": "平仓",
                     "side": side,
                     "quantity": abs(position_quantity),
-                    "price": current_price,
+                    "price": actual_close_price,
                     "pnl": pnl
                 })
             else:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {current_price}")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {actual_close_price}")
                 
             position_quantity = 0
             entry_price = None
@@ -1054,11 +1064,21 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓订单已提交，ID: {close_order_id}")
                 
+                # 获取实际平仓价格
+                try:
+                    time_module.sleep(1)  # 等待订单执行
+                    close_order_detail = TRADE_CTX.order_detail(close_order_id)
+                    actual_exit_price = float(close_order_detail.executed_price) if close_order_detail.executed_price else exit_price
+                except Exception as e:
+                    actual_exit_price = exit_price
+                    if DEBUG_MODE:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 获取平仓成交价格失败: {str(e)}")
+                
                 # 计算盈亏
                 if entry_price:
-                    pnl = (exit_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
-                    pnl_pct = (exit_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {exit_price}")
+                    pnl = (actual_exit_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                    pnl_pct = (actual_exit_price / entry_price - 1) * 100 * (1 if position_quantity > 0 else -1)
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {abs(position_quantity)} {symbol} 价格: {actual_exit_price}")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:.2f}%)")
                     # 更新收益统计
                     DAILY_PNL += pnl
@@ -1069,7 +1089,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         "action": "平仓",
                         "side": side,
                         "quantity": abs(position_quantity),
-                        "price": exit_price,
+                        "price": actual_exit_price,
                         "pnl": pnl
                     })
                 
@@ -1186,7 +1206,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             next_check_minute = next_check_minute % 60
         
         # 创建下一个检查时间的datetime对象
-        next_check_time = now.replace(hour=next_check_hour, minute=next_check_minute, second=0, microsecond=0)
+        next_check_time = now.replace(hour=next_check_hour, minute=next_check_minute, second=1, microsecond=0)
         
         # 如果计算的时间已经过了，则加一天
         if next_check_time <= now:
