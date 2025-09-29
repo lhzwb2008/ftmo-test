@@ -1138,7 +1138,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_stop = new_stop
                 if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓检查: 数量={position_quantity}, 退出信号={exit_signal}, 当前止损={current_stop}")
-                if exit_signal:
+            if exit_signal:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号!")
                     
                     # 确保使用当前时间点的价格数据
@@ -1204,17 +1204,17 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     
                     position_quantity = 0
                     entry_price = None
-                else:
-                    # 检查是否已有持仓，如果有则不再开仓
-                    if position_quantity != 0:
-                        if LOG_VERBOSE:
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
-                        continue
-                    
-                    # 检查今日是否达到最大持仓数
-                    if positions_opened_today >= max_positions_per_day:
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已开仓 {positions_opened_today} 次，达到上限")
-                        continue
+        else:
+            # 检查是否已有持仓，如果有则不再开仓
+            if position_quantity != 0:
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
+                continue
+                
+            # 检查今日是否达到最大持仓数
+            if positions_opened_today >= max_positions_per_day:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已开仓 {positions_opened_today} 次，达到上限")
+                continue
                 
             # 使用检查时间点的完整K线数据
             # check_time_str 在前面已经设置为要检查的时间（如 "09:40"）
