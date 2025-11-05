@@ -916,6 +916,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         
         # 在每天9:30之后启动日内止损监控线程（只启动一次）
         # 判断当前时间是否在9:30之后且监控线程未启动
+        current_hour, current_minute = now.hour, now.minute
         is_after_930 = (current_hour > 9) or (current_hour == 9 and current_minute >= 30)
         if is_after_930 and (monitor_thread is None or not monitor_thread.is_alive()):
             # 计算今日最大允许亏损额
