@@ -42,7 +42,9 @@ LAST_STATS_DATE = None  # 上次统计日期
 DAILY_TRADES = []  # 当日交易记录
 DAILY_STOP_TRIGGERED = False  # 当日是否触发了日内止损
 INITIAL_CAPITAL = 10000.0  # 初始资金（用于计算亏损百分比）
-MAX_DAILY_LOSS_PCT = 0.04  # 日内最大亏损百分比（4%）
+MAX_DAILY_LOSS_PCT = 0.04  # 日内最大亏损百分比（设置为1000%以禁用日内止损）
+MAX_PROFIT_AMOUNT = 1000.0  # 最大盈利金额（设置为负数如-1则禁用止盈）
+PROFIT_TARGET_TRIGGERED = False  # 是否触发了止盈
 
 # 日内止损相关全局变量（供监控线程使用）
 MAX_DAILY_LOSS_AMOUNT = 0.0  # 今日最大允许亏损金额（在开盘时计算）
@@ -698,7 +700,7 @@ def is_trading_day(symbol=None):
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
-    global TOTAL_PNL, DAILY_PNL, LAST_STATS_DATE, DAILY_TRADES, DAILY_STOP_TRIGGERED
+    global TOTAL_PNL, DAILY_PNL, LAST_STATS_DATE, DAILY_TRADES, DAILY_STOP_TRIGGERED, PROFIT_TARGET_TRIGGERED
     global MAX_DAILY_LOSS_AMOUNT, DAILY_LOSS_MONITOR_ACTIVE, FORCE_CLOSE_POSITION
     
     now_et = get_us_eastern_time()
@@ -872,6 +874,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             positions_opened_today = 0
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
+            PROFIT_TARGET_TRIGGERED = False  # 重置止盈标志
             
             # 停止旧的监控线程
             if monitor_thread is not None and monitor_thread.is_alive():
@@ -1024,6 +1027,61 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             wait_seconds = (next_trigger_time - now).total_seconds()
             if wait_seconds > 0:
                 wait_seconds = min(wait_seconds, 300)  # 最多等待5分钟
+                
+                # 在等待前进行止盈和止损检查（每5分钟检查一次）
+                # 独立的止盈检查逻辑
+                if MAX_PROFIT_AMOUNT > 0 and not PROFIT_TARGET_TRIGGERED:
+                    # 获取当前价格用于计算未实现盈亏
+                    quote = get_quote(symbol)
+                    current_price = float(quote.get("last_done", 0))
+                    
+                    # 计算总盈利（已实现 + 未实现）
+                    if position_quantity != 0 and entry_price and current_price > 0:
+                        unrealized_pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                        total_profit = TOTAL_PNL + unrealized_pnl
+                    else:
+                        total_profit = TOTAL_PNL
+                    
+                    # 检查是否达到止盈目标
+                    if total_profit >= MAX_PROFIT_AMOUNT:
+                        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发止盈目标 !!!!!")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前总盈利: ${total_profit:.2f}")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
+                        
+                        # 如果有持仓，先平仓
+                        if position_quantity != 0:
+                            side = "Sell" if position_quantity > 0 else "Buy"
+                            close_order_id = submit_order(symbol, side, abs(position_quantity), outside_rth=outside_rth_setting)
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 止盈平仓订单已提交，ID: {close_order_id}")
+                            
+                            # 计算最终盈亏
+                            if entry_price and current_price > 0:
+                                pnl = (current_price - entry_price) * (1 if position_quantity > 0 else -1) * abs(position_quantity)
+                                DAILY_PNL += pnl
+                                TOTAL_PNL += pnl
+                                # 记录平仓交易
+                                DAILY_TRADES.append({
+                                    "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                                    "action": "平仓(止盈)",
+                                    "side": side,
+                                    "quantity": abs(position_quantity),
+                                    "price": current_price,
+                                    "pnl": pnl
+                                })
+                            
+                            # 重置持仓状态
+                            position_quantity = 0
+                            entry_price = None
+                            current_stop = None
+                        
+                        # 设置止盈标志，不再进行新的交易
+                        PROFIT_TARGET_TRIGGERED = True
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已达到止盈目标，不再进行新的交易")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 最终总盈利: ${TOTAL_PNL:.2f}")
+                        print("=" * 60)
+                
+                # 日内止损已由监控线程处理，此处不再检查
+                
                 if LOG_VERBOSE:
                     # 找到下一个K线检查时间用于显示
                     next_trigger_idx = None
@@ -1342,6 +1400,17 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
                 continue
                 
+            # 检查是否触发了止盈或止损，如果是则不再开仓
+            if PROFIT_TARGET_TRIGGERED:
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发止盈目标，跳过开仓检查")
+                continue
+            
+            if DAILY_STOP_TRIGGERED:
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
+                continue
+                
             # 检查今日是否达到最大持仓数
             if positions_opened_today >= max_positions_per_day:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已开仓 {positions_opened_today} 次，达到上限")
@@ -1504,6 +1573,8 @@ if __name__ == "__main__":
         print("详细日志: 已关闭")
     
     print(f"固定下单量: {FIXED_POSITION_SIZE} 股")
+    print(f"日内最大亏损: {MAX_DAILY_LOSS_PCT*100:.0f}% ({'已禁用' if MAX_DAILY_LOSS_PCT >= 1 else '已启用'})")
+    print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
     
     # 初始化SQLite数据库
     init_sqlite_database()
