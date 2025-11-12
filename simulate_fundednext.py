@@ -10,10 +10,40 @@ from dotenv import load_dotenv
 import numpy as np
 import sqlite3
 import threading
+import platform
 
 from longport.openapi import Config, TradeContext, QuoteContext, Period, OrderSide, OrderType, TimeInForceType, AdjustType, OutsideRTH
 
 load_dotenv(override=True)
+
+# 日志文件类 - 将输出同时写入控制台和文件
+class Logger:
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log_file = log_file
+        # 创建日志文件（追加模式）
+        self.log = open(log_file, 'a', encoding='utf-8', buffering=1)
+        # 写入分隔线标记新的启动
+        separator = "\n" + "="*80 + "\n"
+        separator += f"程序启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        separator += "="*80 + "\n"
+        self.log.write(separator)
+        self.log.flush()
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
+
+# 设置日志文件路径 - 直接放在当前目录
+LOG_FILE = "trading_fundednext.log"
 
 # 固定配置参数
 CHECK_INTERVAL_MINUTES = 15
@@ -55,7 +85,6 @@ FORCE_CLOSE_POSITION = False  # 强制平仓标志（监控线程设置）
 pnl_lock = threading.Lock()
 
 # SQLite数据库路径 - 使用MT5通用目录
-import platform
 if platform.system() == "Windows":
     # Windows系统：使用MT5通用目录
     appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
@@ -1553,9 +1582,16 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             time_module.sleep(sleep_seconds)
 
 if __name__ == "__main__":
-    print("\n长桥API交易策略启动 - 模拟模式")
+    # 启用日志记录（同时输出到控制台和文件）
+    sys.stdout = Logger(LOG_FILE)
+    sys.stderr = sys.stdout  # 错误信息也记录到日志
+    
+    print("\n长桥API交易策略启动 - 模拟模式 (FundedNext)")
     print("版本: 1.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
+    print(f"日志文件: {os.path.abspath(LOG_FILE)}")
+    print(f"初始 TOTAL_PNL: ${TOTAL_PNL:.2f}")
+    print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     
     # 显示配置状态
     if DEBUG_MODE:
