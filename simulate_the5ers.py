@@ -724,7 +724,13 @@ def is_trading_day(symbol=None):
     half_trading_dates = calendar_resp.half_trading_days
     is_trade_day = current_date in trading_dates
     is_half_trade_day = current_date in half_trading_dates
-    return is_trade_day or is_half_trade_day
+    
+    # 如果是半交易日，不进行交易
+    if is_half_trade_day:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，不进行交易")
+        return False
+    
+    return is_trade_day
 
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
