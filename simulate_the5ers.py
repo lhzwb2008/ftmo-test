@@ -651,15 +651,22 @@ def check_exit_conditions(df, position_quantity, current_stop):
 
 def daily_loss_monitor_thread(symbol, position_data):
     """
-    日内止损监控线程
-    每分钟检查一次当前总亏损（已实现+未实现），一旦超过限制立即设置强制平仓标志
+    日内止盈止损监控线程
+    每分钟检查一次当前总盈亏（已实现+未实现），一旦超过止盈或止损限制立即设置强制平仓标志
     注意：盈亏计算包含杠杆
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
-    global DAILY_PNL
+    global DAILY_PNL, PROFIT_TARGET_TRIGGERED
     
-    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止损监控线程已启动 ===")
-    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 最大允许亏损额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已启动 ===")
+    if MAX_PROFIT_AMOUNT > 0:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
+    else:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
+    if MAX_DAILY_LOSS_AMOUNT > 0:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 最大允许亏损额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
+    else:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 已禁用")
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
     
     while DAILY_LOSS_MONITOR_ACTIVE:
@@ -672,8 +679,8 @@ def daily_loss_monitor_thread(symbol, position_data):
             
             # 使用锁保护共享变量
             with pnl_lock:
-                # 如果已经触发止损，停止监控
-                if DAILY_STOP_TRIGGERED:
+                # 如果已经触发止损或止盈，停止监控
+                if DAILY_STOP_TRIGGERED or PROFIT_TARGET_TRIGGERED:
                     break
                 
                 # 获取持仓信息
@@ -682,8 +689,8 @@ def daily_loss_monitor_thread(symbol, position_data):
             
             # 只在交易时间内进行检查和打印
             if is_trading_hours:
-                # 计算当前总亏损
-                current_total_loss = 0.0
+                # 计算当前总盈亏
+                current_total_pnl = 0.0
                 
                 # 如果有持仓，获取当前价格并计算未实现盈亏
                 if position_quantity != 0 and entry_price is not None:
@@ -697,27 +704,41 @@ def daily_loss_monitor_thread(symbol, position_data):
                             unrealized_pnl, _ = calculate_pnl(entry_price, current_price, direction)
                             
                             with pnl_lock:
-                                # 总亏损 = 今日已实现盈亏 + 当前持仓未实现盈亏
-                                current_total_loss = DAILY_PNL + unrealized_pnl
+                                # 总盈亏 = 累计已实现盈亏 + 当前持仓未实现盈亏
+                                current_total_pnl = TOTAL_PNL + unrealized_pnl
                         else:
                             with pnl_lock:
-                                current_total_loss = DAILY_PNL
+                                current_total_pnl = TOTAL_PNL
                     except Exception as e:
                         if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 获取价格失败: {str(e)}")
                         with pnl_lock:
-                            current_total_loss = DAILY_PNL
+                            current_total_pnl = TOTAL_PNL
                 else:
                     # 没有持仓，只计算已实现盈亏
                     with pnl_lock:
-                        current_total_loss = DAILY_PNL
+                        current_total_pnl = TOTAL_PNL
+                
+                # 检查是否触发止盈（盈利时检查，且MAX_PROFIT_AMOUNT > 0时才启用）
+                if MAX_PROFIT_AMOUNT > 0 and current_total_pnl >= MAX_PROFIT_AMOUNT:
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 检测到达成止盈目标 !!!!!")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当前总盈利: ${current_total_pnl:.2f}")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 超出目标: ${current_total_pnl - MAX_PROFIT_AMOUNT:.2f}")
+                    
+                    with pnl_lock:
+                        FORCE_CLOSE_POSITION = True
+                        PROFIT_TARGET_TRIGGERED = True
+                    
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置止盈平仓标志")
+                    break
                 
                 # 检查是否触发止损（只有亏损时才检查，且MAX_DAILY_LOSS_AMOUNT > 0时才启用）
-                if MAX_DAILY_LOSS_AMOUNT > 0 and current_total_loss < 0 and abs(current_total_loss) >= MAX_DAILY_LOSS_AMOUNT:
+                if MAX_DAILY_LOSS_AMOUNT > 0 and current_total_pnl < 0 and abs(current_total_pnl) >= MAX_DAILY_LOSS_AMOUNT:
                     print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 检测到日内亏损超限 !!!!!")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当前总亏损: ${current_total_loss:.2f}")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当前总亏损: ${current_total_pnl:.2f}")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 最大允许亏损: ${-MAX_DAILY_LOSS_AMOUNT:.2f}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 超出金额: ${abs(current_total_loss) - MAX_DAILY_LOSS_AMOUNT:.2f}")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 超出金额: ${abs(current_total_pnl) - MAX_DAILY_LOSS_AMOUNT:.2f}")
                     
                     with pnl_lock:
                         FORCE_CLOSE_POSITION = True
@@ -726,15 +747,20 @@ def daily_loss_monitor_thread(symbol, position_data):
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置强制平仓标志")
                     break
                 else:
-                    # 只在交易时间内打印监控状态
+                    # 打印监控状态（显示止盈止损两个方向的距离）
+                    status_parts = [f"当前总盈亏: ${current_total_pnl:+.2f}"]
+                    
+                    if MAX_PROFIT_AMOUNT > 0:
+                        profit_remain = MAX_PROFIT_AMOUNT - current_total_pnl
+                        status_parts.append(f"距止盈: ${profit_remain:.2f}")
+                    
                     if MAX_DAILY_LOSS_AMOUNT > 0:
-                        loss_pct = (abs(current_total_loss) / MAX_DAILY_LOSS_AMOUNT * 100) if current_total_loss < 0 else 0
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当前总盈亏: ${current_total_loss:+.2f} | "
-                              f"距止损线: ${MAX_DAILY_LOSS_AMOUNT - abs(min(current_total_loss, 0)):.2f} ({100 - loss_pct:.1f}%剩余) | "
-                              f"持仓: {position_quantity}")
-                    else:
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当前总盈亏: ${current_total_loss:+.2f} | "
-                              f"日内止损已禁用 | 持仓: {position_quantity}")
+                        loss_remain = MAX_DAILY_LOSS_AMOUNT + current_total_pnl  # current_total_pnl可能是负数
+                        status_parts.append(f"距止损: ${loss_remain:.2f}")
+                    
+                    status_parts.append(f"持仓: {position_quantity}")
+                    
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] " + " | ".join(status_parts))
             
             # 等待60秒后再次检查
             time_module.sleep(60)
@@ -743,7 +769,7 @@ def daily_loss_monitor_thread(symbol, position_data):
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 发生错误: {str(e)}")
             time_module.sleep(60)
     
-    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止损监控线程已停止 ===")
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已停止 ===")
 
 def is_trading_day(symbol=None):
     market = None
@@ -860,16 +886,17 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 with pnl_lock:
                     DAILY_PNL += pnl
                     TOTAL_PNL += pnl
-                # 记录平仓交易
+                # 记录平仓交易（根据是止盈还是止损区分）
+                action_type = "平仓(止盈)" if PROFIT_TARGET_TRIGGERED else "平仓(止损)"
                 DAILY_TRADES.append({
                     "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                    "action": "平仓(强制止损)",
+                    "action": action_type,
                     "side": side,
                     "entry_price": entry_price,
                     "exit_price": current_price,
                     "pnl": pnl
                 })
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓完成: 价格=${current_price:.2f}, 盈亏=${pnl:+.2f} ({pnl_pct:+.2f}%)")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {action_type}完成: 价格=${current_price:.2f}, 盈亏=${pnl:+.2f} ({pnl_pct:+.2f}%)")
             
             # 重置持仓
             position_quantity = 0
@@ -1112,63 +1139,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             wait_seconds = (next_trigger_time - now).total_seconds()
             if wait_seconds > 0:
-                wait_seconds = min(wait_seconds, 300)  # 最多等待5分钟
+                wait_seconds = min(wait_seconds, 60)  # 最多等待1分钟，以便及时响应止盈止损信号
                 
-                # 在等待前进行止盈和止损检查（每5分钟检查一次）
-                # 独立的止盈检查逻辑
-                if MAX_PROFIT_AMOUNT > 0 and not PROFIT_TARGET_TRIGGERED:
-                    # 获取当前价格用于计算未实现盈亏
-                    quote = get_quote(symbol)
-                    current_price = float(quote.get("last_done", 0))
-                    
-                    # 计算总盈利（已实现 + 未实现，全仓计算）
-                    if position_quantity != 0 and entry_price and current_price > 0:
-                        direction = 1 if position_quantity > 0 else -1
-                        unrealized_pnl, _ = calculate_pnl(entry_price, current_price, direction)
-                        total_profit = TOTAL_PNL + unrealized_pnl
-                    else:
-                        total_profit = TOTAL_PNL
-                    
-                    # 检查是否达到止盈目标
-                    if total_profit >= MAX_PROFIT_AMOUNT:
-                        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 触发止盈目标 !!!!!")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前总盈利: ${total_profit:.2f}")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
-                        
-                        # 如果有持仓，先平仓
-                        if position_quantity != 0:
-                            side = "Sell" if position_quantity > 0 else "Buy"
-                            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 止盈平仓信号已发送，ID: {close_order_id}")
-                            
-                            # 计算最终盈亏（全仓计算）
-                            if entry_price and current_price > 0:
-                                direction = 1 if position_quantity > 0 else -1
-                                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
-                                DAILY_PNL += pnl
-                                TOTAL_PNL += pnl
-                                # 记录平仓交易
-                                DAILY_TRADES.append({
-                                    "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                                    "action": "平仓(止盈)",
-                                    "side": side,
-                                    "entry_price": entry_price,
-                                    "exit_price": current_price,
-                                    "pnl": pnl
-                                })
-                            
-                            # 重置持仓状态
-                            position_quantity = 0
-                            entry_price = None
-                            current_stop = None
-                        
-                        # 设置止盈标志，不再进行新的交易
-                        PROFIT_TARGET_TRIGGERED = True
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已达到止盈目标，不再进行新的交易")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 最终总盈利: ${TOTAL_PNL:.2f}")
-                        print("=" * 60)
-                
-                # 日内止损已由监控线程处理，此处不再检查
+                # 止盈止损检查已由监控线程处理，此处不再重复检查
                 
                 if LOG_VERBOSE:
                     # 找到下一个K线检查时间用于显示
