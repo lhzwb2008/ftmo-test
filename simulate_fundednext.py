@@ -42,6 +42,9 @@ LOOKBACK_DAYS = 1  # 回看天数（用于计算噪声区域）
 K1 = 1  # 上边界sigma乘数
 K2 = 1  # 下边界sigma乘数
 
+# VWAP开关：False=不使用VWAP作为入场/止损条件，True=使用VWAP
+USE_VWAP = False
+
 # 调试模式配置
 DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
 DEBUG_TIME = "2025-07-10 10:25:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
@@ -616,8 +619,8 @@ def check_exit_conditions(df, position_quantity, current_stop):
         return False, current_stop
     
     if position_quantity > 0:
-        # 检查上边界或VWAP是否为None
-        if upper is None or vwap is None:
+        # 检查上边界是否为None
+        if upper is None or (USE_VWAP and vwap is None):
             # 如果已有止损，继续使用
             if current_stop is not None:
                 new_stop = current_stop
@@ -627,13 +630,13 @@ def check_exit_conditions(df, position_quantity, current_stop):
                 return False, current_stop
         else:
             # 直接使用当前时刻的止损水平，不考虑历史止损
-            new_stop = max(upper, vwap)
+            new_stop = max(upper, vwap) if USE_VWAP else upper
             
         exit_signal = price < new_stop
         return exit_signal, new_stop
     elif position_quantity < 0:
-        # 检查下边界或VWAP是否为None
-        if lower is None or vwap is None:
+        # 检查下边界是否为None
+        if lower is None or (USE_VWAP and vwap is None):
             # 如果已有止损，继续使用
             if current_stop is not None:
                 new_stop = current_stop
@@ -643,7 +646,7 @@ def check_exit_conditions(df, position_quantity, current_stop):
                 return False, current_stop
         else:
             # 直接使用当前时刻的止损水平，不考虑历史止损
-            new_stop = min(lower, vwap)
+            new_stop = min(lower, vwap) if USE_VWAP else lower
             
         exit_signal = price > new_stop
         return exit_signal, new_stop
@@ -1373,13 +1376,13 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 根据持仓方向检查退出条件
                 exit_signal = False
                 if position_quantity > 0:  # 多头持仓
-                    # 使用检查时间点的上边界和VWAP作为止损
-                    new_stop = max(check_upper, check_vwap)
+                    # 使用检查时间点的上边界（和VWAP）作为止损
+                    new_stop = max(check_upper, check_vwap) if USE_VWAP else check_upper
                     exit_signal = check_price < new_stop
                     current_stop = new_stop
                 elif position_quantity < 0:  # 空头持仓
-                    # 使用检查时间点的下边界和VWAP作为止损
-                    new_stop = min(check_lower, check_vwap)
+                    # 使用检查时间点的下边界（和VWAP）作为止损
+                    new_stop = min(check_lower, check_vwap) if USE_VWAP else check_lower
                     exit_signal = check_price > new_stop
                     current_stop = new_stop
                 
@@ -1502,7 +1505,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             latest_row = check_data.iloc[0].copy()
             latest_price = float(latest_row["Close"])
             long_price_above_upper = latest_price > latest_row["UpperBound"]
-            long_price_above_vwap = latest_price > latest_row["VWAP"]
+            long_price_above_vwap = latest_price > latest_row["VWAP"] if USE_VWAP else True
             
             if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 检查 {check_time_str} 的数据:")
@@ -1516,15 +1519,15 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足多头入场条件!")
                 signal = 1
-                stop = max(latest_row["UpperBound"], latest_row["VWAP"])
+                stop = max(latest_row["UpperBound"], latest_row["VWAP"]) if USE_VWAP else latest_row["UpperBound"]
             else:
                 short_price_below_lower = latest_price < latest_row["LowerBound"]
-                short_price_below_vwap = latest_price < latest_row["VWAP"]
+                short_price_below_vwap = latest_price < latest_row["VWAP"] if USE_VWAP else True
                 if short_price_below_lower and short_price_below_vwap:
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 满足空头入场条件!")
                     signal = -1
-                    stop = min(latest_row["LowerBound"], latest_row["VWAP"])
+                    stop = min(latest_row["LowerBound"], latest_row["VWAP"]) if USE_VWAP else latest_row["LowerBound"]
                 else:
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
