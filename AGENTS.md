@@ -40,4 +40,16 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 - SQLite database files (`*.db`) are gitignored.
 - All comments and log messages are in Chinese (Simplified Chinese).
 - On Linux, SQLite DBs are created in the current working directory. On Windows, they go to the MT5 common files directory.
-- The MQ5 EAs rely on `OnTick()` to poll the database. If a broker (e.g. IC Markets) delivers ticks late at market open, signals may be delayed. The fix is adding `OnTimer()` as a fallback (already applied to `SQLiteSignalEA_icmarkets.mq5`).
+- The MQ5 EAs rely on `OnTick()` to poll the database. If a broker (e.g. IC Markets) delivers ticks late at market open, signals may be delayed. A potential fix is adding `OnTimer()` as a fallback.
+- IC Markets EA has a known issue: it frequently stops and restarts (visible in MT5 logs as repeated "EA已停止" → reinitialization cycles). Root cause is under investigation.
+
+### Quick verification
+
+```bash
+python3 -c "
+from longport.openapi import Config, QuoteContext
+ctx = QuoteContext(Config.from_env())
+q = ctx.quote(['QQQ.US'])[0]
+print(f'QQQ.US = \${q.last_done}')
+"
+```
