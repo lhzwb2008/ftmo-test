@@ -41,9 +41,13 @@ int OnInit()
         return(INIT_FAILED);
     }
     
+    // 启动定时器，每秒触发一次，确保即使没有tick也能轮询数据库
+    EventSetTimer(CheckIntervalSeconds);
+    
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
+    Print("⏱️ 定时器已启动，间隔: ", CheckIntervalSeconds, "秒");
     
     return(INIT_SUCCEEDED);
 }
@@ -53,6 +57,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    EventKillTimer();
+    
     if(db_handle != INVALID_HANDLE)
     {
         DatabaseClose(db_handle);
@@ -60,6 +66,14 @@ void OnDeinit(const int reason)
     }
     
     Print("EA已停止");
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - 定时轮询数据库，不依赖tick                        |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    CheckDatabaseSignals();
 }
 
 //+------------------------------------------------------------------+
