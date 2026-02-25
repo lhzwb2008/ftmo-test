@@ -36,6 +36,8 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 
 - The `.mq5` files are MetaTrader 5 Expert Advisors and **cannot be compiled or run on Linux**. They require a Windows machine with MT5 installed.
 - The main simulation scripts (`simulate_*.py`) connect to the Longport API at **module import time** (line 198 in `simulate_ftmo.py`: `QUOTE_CTX, TRADE_CTX = create_contexts()`). This means you cannot import or run them without valid API credentials.
+- **Longport access tokens expire**. If you get `401003 token expired`, the token must be regenerated from the [Longport OpenAPI console](https://open.longportapp.com/). The SDK's `config.refresh_access_token()` will also fail if the token is fully expired. Update `LONGPORT_ACCESS_TOKEN` after regeneration.
 - SQLite database files (`*.db`) are gitignored.
 - All comments and log messages are in Chinese (Simplified Chinese).
 - On Linux, SQLite DBs are created in the current working directory. On Windows, they go to the MT5 common files directory.
+- The MQ5 EAs rely on `OnTick()` to poll the database. If a broker (e.g. IC Markets) delivers ticks late at market open, signals may be delayed. The fix is adding `OnTimer()` as a fallback (already applied to `SQLiteSignalEA_icmarkets.mq5`).
