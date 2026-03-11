@@ -226,6 +226,21 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            
+            // 开单前最终保证金校验
+            double pre_margin = 0;
+            if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, ask, pre_margin))
+            {
+                double avail = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+                if(pre_margin > avail * 0.95)
+                {
+                    Print("❌ 开单前保证金校验失败：需要 $", DoubleToString(pre_margin, 2),
+                          " 可用 $", DoubleToString(avail, 2));
+                    MarkSignalConsumed(signal_id);
+                    return;
+                }
+            }
+            
             result = trade.Buy(lots, _Symbol, ask, 0, 0, "QQQ Signal Buy");
         }
     }
@@ -258,6 +273,21 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            
+            // 开单前最终保证金校验
+            double pre_margin_sell = 0;
+            if(OrderCalcMargin(ORDER_TYPE_SELL, _Symbol, lots, bid, pre_margin_sell))
+            {
+                double avail_sell = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+                if(pre_margin_sell > avail_sell * 0.95)
+                {
+                    Print("❌ 开单前保证金校验失败：需要 $", DoubleToString(pre_margin_sell, 2),
+                          " 可用 $", DoubleToString(avail_sell, 2));
+                    MarkSignalConsumed(signal_id);
+                    return;
+                }
+            }
+            
             result = trade.Sell(lots, _Symbol, bid, 0, 0, "QQQ Signal Sell");
         }
     }
@@ -283,7 +313,11 @@ void ProcessSignal(long signal_id, string action)
     }
     else
     {
-        Print("❌ 执行失败: ", trade.ResultRetcode());
+        uint retcode = trade.ResultRetcode();
+        Print("❌ 执行失败，错误码: ", retcode, " 描述: ", trade.ResultRetcodeDescription());
+        // 无论何种失败，都标记信号为已消费，避免无限重试
+        // 若需重试，应由Python端重新写入新信号
+        MarkSignalConsumed(signal_id);
     }
 }
 
@@ -497,19 +531,43 @@ double CalculateLotSize()
     Print("💰 实际所需保证金: $", DoubleToString(actual_margin_required, 2));
     Print("📊 实际杠杆: ", DoubleToString(actual_leverage, 2), "倍");
     
-    // 再次检查保证金是否充足
-    if(actual_margin_required > free_margin)
+    // 再次检查保证金是否充足（使用90%更保守）
+    if(actual_margin_required > free_margin * 0.90)
     {
-        Print("⚠️ 警告：所需保证金超过可用保证金！");
+        Print("⚠️ 警告：所需保证金超过可用保证金90%！");
         Print("⚠️ 所需保证金: $", DoubleToString(actual_margin_required, 2));
         Print("⚠️ 可用保证金: $", DoubleToString(free_margin, 2));
         
-        // 调整手数以适应可用保证金
-        lots = (free_margin * 0.95) / margin_for_one_lot;
+        if(margin_for_one_lot <= 0)
+        {
+            Print("❌ 无法计算1手保证金，放弃开仓");
+            return 0;
+        }
+        
+        // 按可用保证金的90%重新计算手数
+        lots = (free_margin * 0.90) / margin_for_one_lot;
         lots = MathFloor(lots / lot_step) * lot_step;
-        lots = MathMax(lots, min_lot);
         
         Print("📊 调整后手数: ", DoubleToString(lots, 2));
+        
+        // 注意：调整后不再强制套用min_lot，避免超保证金
+        if(lots < min_lot)
+        {
+            Print("❌ 调整后手数(", DoubleToString(lots, 2), ")小于最小手数(", DoubleToString(min_lot, 2), ")，余额不足无法开仓");
+            return 0;
+        }
+    }
+    
+    // 最终安全校验：再做一次保证金确认
+    double final_margin = 0;
+    if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, price, final_margin))
+    {
+        if(final_margin > free_margin * 0.95)
+        {
+            Print("❌ 最终校验失败：需要保证金 $", DoubleToString(final_margin, 2),
+                  " 超过可用保证金95% $", DoubleToString(free_margin * 0.95, 2));
+            return 0;
+        }
     }
     
     return lots;
