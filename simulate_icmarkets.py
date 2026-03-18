@@ -588,12 +588,13 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     
     return df
 
-def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None):
-    # 将下单改为写入数据库
-    action = "BUY" if side == "Buy" else "SELL"
+def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False):
+    if is_close:
+        action = "CLOSE"
+    else:
+        action = "BUY" if side == "Buy" else "SELL"
     signal_id = write_signal_to_sqlite(action)
-    
-    # 返回一个模拟的订单ID
+
     return f"SIM_{signal_id}" if signal_id else "SIM_ERROR"
 
 def check_exit_conditions(df, position_quantity, current_stop):
@@ -877,7 +878,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             # 执行平仓
             side = "Sell" if position_quantity > 0 else "Buy"
-            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 强制平仓信号已发送，ID: {close_order_id}")
             
             # 计算盈亏（全仓计算）
@@ -936,7 +937,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
                 
                 # 计算盈亏（全仓计算）
@@ -1227,7 +1228,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             # 执行平仓
             side = "Sell" if position_quantity > 0 else "Buy"
-            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
             
             # 计算盈亏（全仓计算）
@@ -1323,7 +1324,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
                 
                 # 计算盈亏（全仓计算）
@@ -1516,7 +1517,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     
                     # 执行平仓
                     side = "Sell" if position_quantity > 0 else "Buy"
-                    close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+                    close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
                     
                     # 计算盈亏（全仓计算）

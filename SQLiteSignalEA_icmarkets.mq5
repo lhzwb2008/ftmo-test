@@ -41,6 +41,9 @@ int OnInit()
         return(INIT_FAILED);
     }
     
+    // 启动定时器作为OnTick的补充，IC Markets断线时OnTick不触发，定时器可兜底
+    EventSetTimer(CheckIntervalSeconds);
+    
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
@@ -53,13 +56,15 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    EventKillTimer();
+    
     if(db_handle != INVALID_HANDLE)
     {
         DatabaseClose(db_handle);
         db_handle = INVALID_HANDLE;
     }
     
-    Print("EA已停止");
+    Print("EA已停止，原因代码: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -72,6 +77,14 @@ void OnTick()
         return;
         
     last_check_time = current_time;
+    CheckDatabaseSignals();
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - IC Markets断线时OnTick不触发，定时器兜底           |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
     CheckDatabaseSignals();
 }
 
@@ -155,7 +168,27 @@ void CheckDatabaseSignals()
     if(db_handle == INVALID_HANDLE)
         return;
     
-    // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
+    // 先统计未消费信号数量
+    int pending_count = CountPendingSignals();
+    if(pending_count <= 0)
+        return;
+    
+    if(pending_count > 1)
+    {
+        // 多条信号堆积 = 断线期间积压，信号已过期，全部丢弃并平仓
+        Print("⚠️ 检测到 ", pending_count, " 条堆积信号，判断为断线积压，全部丢弃");
+        MarkAllSignalsConsumed();
+        
+        int position_type = GetPositionType();
+        if(position_type != 0)
+        {
+            Print("🔄 断线恢复，平掉所有持仓以避免风险敞口");
+            CloseAllPositions();
+        }
+        return;
+    }
+    
+    // 只有1条未消费信号，正常实时处理
     string query = "SELECT id, action FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
     
     int request = DatabasePrepare(db_handle, query);
@@ -165,25 +198,52 @@ void CheckDatabaseSignals()
         return;
     }
     
-    // 读取查询结果
     if(DatabaseRead(request))
     {
-        long latest_signal_id;
-        string latest_action;
+        long signal_id;
+        string action;
         
-        DatabaseColumnLong(request, 0, latest_signal_id);
-        DatabaseColumnText(request, 1, latest_action);
+        DatabaseColumnLong(request, 0, signal_id);
+        DatabaseColumnText(request, 1, action);
         
-        Print("📊 检测到未消费信号，只执行最新的: ", latest_action, " (ID: ", latest_signal_id, ")");
-        
-        // 先标记所有未消费的信号为已消费（除了最新的这一条）
-        MarkOldSignalsConsumed(latest_signal_id);
-        
-        // 处理最新的信号
-        ProcessSignal(latest_signal_id, latest_action);
+        Print("📊 检测到未消费信号: ", action, " (ID: ", signal_id, ")");
+        ProcessSignal(signal_id, action);
     }
     
     DatabaseFinalize(request);
+}
+
+//+------------------------------------------------------------------+
+//| 统计未消费信号数量                                                 |
+//+------------------------------------------------------------------+
+int CountPendingSignals()
+{
+    string query = "SELECT COUNT(*) FROM signals WHERE consumed = 0";
+    int request = DatabasePrepare(db_handle, query);
+    if(request == INVALID_HANDLE)
+        return 0;
+    
+    int count = 0;
+    if(DatabaseRead(request))
+    {
+        long cnt;
+        DatabaseColumnLong(request, 0, cnt);
+        count = (int)cnt;
+    }
+    DatabaseFinalize(request);
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| 标记所有未消费信号为已消费                                          |
+//+------------------------------------------------------------------+
+void MarkAllSignalsConsumed()
+{
+    string update_query = "UPDATE signals SET consumed = 1 WHERE consumed = 0";
+    if(DatabaseExecute(db_handle, update_query))
+    {
+        Print("✅ 所有堆积信号已标记为已消费（丢弃）");
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -377,19 +437,6 @@ void CloseAllPositions()
                 trade.PositionClose(ticket);
             }
         }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| 标记旧信号为已消费（除了指定的最新信号）                            |
-//+------------------------------------------------------------------+
-void MarkOldSignalsConsumed(long latest_signal_id)
-{
-    string update_query = StringFormat("UPDATE signals SET consumed = 1 WHERE consumed = 0 AND id != %d", latest_signal_id);
-    
-    if(DatabaseExecute(db_handle, update_query))
-    {
-        Print("✅ 旧信号已全部标记为已消费");
     }
 }
 
