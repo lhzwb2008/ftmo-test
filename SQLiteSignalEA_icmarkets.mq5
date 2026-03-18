@@ -20,11 +20,14 @@ input int      MagicNumber = 20241228;                 // 魔术数字
 input double   Leverage = 8.0;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
+input int      PreMarketCleanupHour = 21;              // 开盘前清仓检查（服务器时间小时，21=美东9点）
+input int      PreMarketCleanupMinute = 30;            // 开盘前清仓检查（服务器时间分钟）
 
 //--- 全局变量
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+datetime last_cleanup_date = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -72,6 +75,8 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    PreMarketCleanup();
+    
     datetime current_time = TimeCurrent();
     if(current_time - last_check_time < CheckIntervalSeconds)
         return;
@@ -85,7 +90,39 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+    PreMarketCleanup();
     CheckDatabaseSignals();
+}
+
+//+------------------------------------------------------------------+
+//| 开盘前清仓：每天到指定时间检查是否有残留持仓，有则平掉              |
+//+------------------------------------------------------------------+
+void PreMarketCleanup()
+{
+    MqlDateTime dt;
+    TimeCurrent(dt);
+    
+    // 用日期做去重，每天只执行一次
+    datetime today = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
+    if(today == last_cleanup_date)
+        return;
+    
+    // 还没到指定时间则不执行
+    if(dt.hour < PreMarketCleanupHour || (dt.hour == PreMarketCleanupHour && dt.min < PreMarketCleanupMinute))
+        return;
+    
+    last_cleanup_date = today;
+    
+    int position_type = GetPositionType();
+    if(position_type != 0)
+    {
+        Print("⚠️ 开盘前检测到残留持仓（", (position_type == 1 ? "多仓" : "空仓"), "），执行清仓");
+        CloseAllPositions();
+        
+        // 同时清掉数据库中所有未消费的过期信号
+        if(db_handle != INVALID_HANDLE)
+            MarkAllSignalsConsumed();
+    }
 }
 
 //+------------------------------------------------------------------+
