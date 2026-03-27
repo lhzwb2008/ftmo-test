@@ -14,6 +14,8 @@ import platform
 
 from longport.openapi import Config, TradeContext, QuoteContext, Period, OrderSide, OrderType, TimeInForceType, AdjustType, OutsideRTH
 
+from trend_er5_gate import history_days_back, apply_er5_gate_to_signal
+
 load_dotenv(override=True)
 
 # ============================================================================
@@ -24,12 +26,12 @@ load_dotenv(override=True)
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
 # 资金和风控设置
-INITIAL_CAPITAL = 100000 # 初始资金（用于计算全仓盈亏）
+INITIAL_CAPITAL = 103000 # 初始资金（用于计算全仓盈亏）
 LEVERAGE = 1  # 杠杆倍数
 
 # 止盈止损设置（金额）
-MAX_PROFIT_AMOUNT = 50  # 止盈目标金额（设置为负数如-1则禁用止盈）
-MAX_DAILY_LOSS_AMOUNT = 500  # 日内最大亏损金额（设置为负数如-1则禁用日内止损）
+MAX_PROFIT_AMOUNT = 1300  # 止盈目标金额（设置为负数如-1则禁用止盈）
+MAX_DAILY_LOSS_AMOUNT = 4500  # 日内最大亏损金额（设置为负数如-1则禁用日内止损）
 
 # 交易时间设置
 TRADING_START_TIME = (9, 41)  # 交易开始时间：9点41分
@@ -44,6 +46,7 @@ K2 = 1  # 下边界sigma乘数
 
 # VWAP开关：False=不使用VWAP作为入场/止损条件，True=使用VWAP
 USE_VWAP = False
+# er5 开仓门控（与 Quantra/backtest 一致）：开关与阈值见 trend_er5_gate.py
 
 # 调试模式配置
 DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
@@ -240,7 +243,7 @@ def calculate_pnl(entry_price, exit_price, direction):
 def get_historical_data(symbol, days_back=None):
     # 简化天数计算逻辑
     if days_back is None:
-        days_back = LOOKBACK_DAYS + 5  # 简化为固定天数
+        days_back = history_days_back(LOOKBACK_DAYS)
         
     # 直接使用1分钟K线
     sdk_period = Period.Min_1
@@ -1521,6 +1524,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
+            signal = apply_er5_gate_to_signal(signal, df, LOG_VERBOSE, now.strftime('%Y-%m-%d %H:%M:%S'))
             if signal != 0:
                 # 保留交易信号日志，并添加VWAP和上下界信息
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")
