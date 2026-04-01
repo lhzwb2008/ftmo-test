@@ -114,12 +114,10 @@ else:
     DB_PATH = "trading_signals_ftmo.db"
 
 def init_sqlite_database():
-    """初始化SQLite数据库，每次启动时清空所有数据"""
+    """启动时清空信号：DROP 后重建 signals 表，删除全部历史行（含 consumed=0），避免 EA 误执行旧信号。"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
-        # 先删除现有表（如果存在）
         cursor.execute("DROP TABLE IF EXISTS signals")
         
         # 创建简化的交易信号表
@@ -134,8 +132,11 @@ def init_sqlite_database():
         
         conn.commit()
         conn.close()
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化成功（已清空历史数据）")
-        print(f"数据库路径: {os.path.abspath(DB_PATH)}")
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        abs_db = os.path.abspath(DB_PATH)
+        print(f"[{ts}] SQLite 已清空旧信号并重建表（未消费记录已删除）")
+        print(f"数据库路径: {abs_db}")
+        print(f"[{ts}] 建议：先启动本脚本再启动 MT5 EA；二者须使用上述同一 db 文件（同机同路径）。")
         
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
