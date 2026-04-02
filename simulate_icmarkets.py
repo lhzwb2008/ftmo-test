@@ -27,7 +27,7 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
 # 资金和风控设置
 INITIAL_CAPITAL = 100000 # 初始资金（用于计算全仓盈亏）
-LEVERAGE = 8  # 杠杆倍数
+LEVERAGE = 2  # 杠杆倍数
 
 # 止盈止损设置（金额）
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（设置为负数如-1则禁用止盈）
