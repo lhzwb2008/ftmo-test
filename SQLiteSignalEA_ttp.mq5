@@ -17,7 +17,7 @@
 input string   DBPath = "trading_signals_ttp.db";          // SQLite数据库文件名（The Trading Pit）
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
 input int      MagicNumber = 20250415;                 // 魔术数字（与 FTMO EA 区分）
-input double   Leverage = 1.5;                        // 杠杆倍数
+input double   Leverage = 2;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 
