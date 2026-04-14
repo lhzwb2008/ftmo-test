@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-测试文件：向三个不同数据库写入买入和卖出信号
+测试文件：向多个不同数据库写入买入和卖出信号
 每个数据库写入一个买入信号，持仓5分钟后写入一个卖出信号
-在一分钟内离散写入三个买入信号
+在一分钟内离散写入各库的买入信号
 """
 
 import sqlite3
@@ -113,9 +113,8 @@ def check_signals_in_db(db_path, db_label):
 
 def main():
     """主函数"""
-    print(f"[{get_current_time().strftime('%Y-%m-%d %H:%M:%S')}] 开始测试三个数据库信号写入")
+    print(f"[{get_current_time().strftime('%Y-%m-%d %H:%M:%S')}] 开始测试多数据库信号写入")
     
-    # 三个数据库配置
     databases = [
         {
             'name': 'trading_signals_ftmo.db',
@@ -123,15 +122,20 @@ def main():
             'path': None
         },
         {
-            'name': 'trading_signals_fundednext.db', 
+            'name': 'trading_signals_fundednext.db',
             'label': 'FundedNext',
             'path': None
         },
         {
             'name': 'trading_signals_the5ers.db',
-            'label': 'The5ers', 
+            'label': 'The5ers',
             'path': None
-        }
+        },
+        {
+            'name': 'trading_signals_ttp.db',
+            'label': 'The Trading Pit',
+            'path': None
+        },
     ]
     
     # 获取数据库路径并初始化
@@ -143,7 +147,7 @@ def main():
     
     print(f"\n[{get_current_time().strftime('%Y-%m-%d %H:%M:%S')}] 所有数据库初始化完成")
     
-    # 第一阶段：在一分钟内离散写入三个买入信号
+    # 第一阶段：在一分钟内离散写入各库买入信号
     print(f"\n[{get_current_time().strftime('%Y-%m-%d %H:%M:%S')}] 开始写入买入信号...")
     
     # 使用配置的买入信号间隔
@@ -208,7 +212,7 @@ def main():
     
     # 显示总结
     print("\n=== 测试总结 ===")
-    print("✅ 已向三个数据库分别写入:")
+    print("✅ 已向各数据库分别写入:")
     print("   - 1个买入信号 (BUY)")
     print("   - 1个卖出信号 (SELL)")
     print("✅ 买入信号在1分钟内离散写入")

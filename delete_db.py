@@ -51,7 +51,8 @@ def main():
         ("trading_signals.db", "Base"),
         ("trading_signals_ftmo.db", "FTMO"),
         ("trading_signals_fundednext.db", "FundedNext"),
-        ("trading_signals_the5ers.db", "The5ers")
+        ("trading_signals_the5ers.db", "The5ers"),
+        ("trading_signals_ttp.db", "The Trading Pit"),
     ]
     
     print("⚠️  警告: 此操作将删除所有交易信号数据库文件！")
