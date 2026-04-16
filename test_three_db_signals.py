@@ -136,6 +136,11 @@ def main():
             'label': 'The Trading Pit',
             'path': None
         },
+        {
+            'name': 'trading_signals_blueberry.db',
+            'label': 'Blueberry Funded',
+            'path': None
+        },
     ]
     
     # 获取数据库路径并初始化
