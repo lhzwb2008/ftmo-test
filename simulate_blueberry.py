@@ -25,13 +25,13 @@ load_dotenv(override=True)
 # 交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
-# 资金和风控设置（Blueberry Funded 50K；规则最大日内约 4%=$2000，脚本日内止损略低于该上限）
-INITIAL_CAPITAL = 50000  # 初始资金（用于计算全仓盈亏）
+# 资金和风控设置（Blueberry Funded 200K；止盈目标 8%=$16000；规则最大日内约 4%=$8000，脚本日内止损约 3.6%=$7200）
+INITIAL_CAPITAL = 200000  # 初始资金（用于计算全仓盈亏）
 LEVERAGE = 1.5  # 杠杆倍数
 
 # 止盈止损设置（金额）
-MAX_PROFIT_AMOUNT = 5000  # 止盈目标金额（约 10% 账户；设置为负数如-1则禁用止盈）
-MAX_DAILY_LOSS_AMOUNT = 1800  # 日内最大亏损金额（约 3.6%，低于 4% 规则；设置为负数如-1则禁用日内止损）
+MAX_PROFIT_AMOUNT = 16000  # 止盈目标金额（8% 账户=200K×8%；设置为负数如-1则禁用止盈）
+MAX_DAILY_LOSS_AMOUNT = 7200  # 日内最大亏损金额（约 3.6%，低于 4% 规则；设置为负数如-1则禁用日内止损）
 
 # 交易时间设置
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
