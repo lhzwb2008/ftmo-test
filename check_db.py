@@ -107,6 +107,7 @@ def main():
         ("trading_signals_the5ers.db", "The5ers"),
         ("trading_signals_ttp.db", "The Trading Pit"),
         ("trading_signals_blueberry.db", "Blueberry Funded"),
+        ("trading_signals_goat.db", "Goat Funded Trader"),
     ]
     
     # 检查每个数据库

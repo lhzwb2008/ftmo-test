@@ -141,6 +141,11 @@ def main():
             'label': 'Blueberry Funded',
             'path': None
         },
+        {
+            'name': 'trading_signals_goat.db',
+            'label': 'Goat Funded Trader',
+            'path': None
+        },
     ]
     
     # 获取数据库路径并初始化

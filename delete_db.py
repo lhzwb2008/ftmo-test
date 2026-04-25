@@ -54,6 +54,7 @@ def main():
         ("trading_signals_the5ers.db", "The5ers"),
         ("trading_signals_ttp.db", "The Trading Pit"),
         ("trading_signals_blueberry.db", "Blueberry Funded"),
+        ("trading_signals_goat.db", "Goat Funded Trader"),
     ]
     
     print("⚠️  警告: 此操作将删除所有交易信号数据库文件！")
