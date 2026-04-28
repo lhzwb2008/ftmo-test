@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import platform
 
-from longport.openapi import Config, TradeContext, QuoteContext, Period, OrderSide, OrderType, TimeInForceType, AdjustType, OutsideRTH
+from longport.openapi import OutsideRTH
 
 from trend_er5_gate import history_days_back, apply_er5_gate_to_signal
 
@@ -103,15 +103,76 @@ class Logger:
         self.log.close()
 
 # SQLite数据库路径 - 使用MT5通用目录
-if platform.system() == "Windows":
-    # Windows系统：使用MT5通用目录
-    appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
-    mt5_common_path = os.path.join(appdata_path, "MetaQuotes", "Terminal", "Common", "Files")
-    os.makedirs(mt5_common_path, exist_ok=True)
-    DB_PATH = os.path.join(mt5_common_path, "trading_signals_goat.db")
-else:
-    # 非Windows系统：使用当前目录
-    DB_PATH = "trading_signals_goat.db"
+def get_common_files_dir():
+    if platform.system() == "Windows":
+        appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
+        mt5_common_path = os.path.join(appdata_path, "MetaQuotes", "Terminal", "Common", "Files")
+        os.makedirs(mt5_common_path, exist_ok=True)
+        return mt5_common_path
+    return "."
+
+
+DB_PATH = os.path.join(get_common_files_dir(), "trading_signals_goat.db")
+
+
+def get_market_data_db_path():
+    return os.environ.get('MARKET_DATA_DB_PATH', os.path.join(get_common_files_dir(), "market_data_cache.db"))
+
+
+MARKET_DATA_DB_PATH = get_market_data_db_path()
+MARKET_DATA_MAX_AGE_SECONDS = int(os.environ.get('MARKET_DATA_MAX_AGE_SECONDS', '120'))
+
+
+def parse_cache_timestamp(value):
+    if not value:
+        return None
+    eastern = pytz.timezone('US/Eastern')
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        return eastern.localize(dt)
+    except ValueError:
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                return eastern.localize(dt)
+            return dt.astimezone(eastern)
+        except ValueError:
+            return None
+
+
+def ensure_market_data_service_available():
+    if not os.path.exists(MARKET_DATA_DB_PATH):
+        print(f"错误: 行情缓存数据库不存在: {os.path.abspath(MARKET_DATA_DB_PATH)}")
+        print("请先启动 longport_data_service.py，等待其写入 market_data_cache.db 后再启动本脚本")
+        return False
+
+    try:
+        conn = sqlite3.connect(MARKET_DATA_DB_PATH)
+        row = conn.execute("""
+        SELECT value FROM service_state
+        WHERE key = 'last_success_at'
+        """).fetchone()
+        conn.close()
+    except Exception as e:
+        print(f"错误: 无法读取行情服务心跳: {str(e)}")
+        return False
+
+    if row is None:
+        print("错误: 行情服务尚未写入成功心跳，请等待 longport_data_service.py 完成一次更新")
+        return False
+
+    last_success_at = parse_cache_timestamp(row[0])
+    if last_success_at is None:
+        print(f"错误: 行情服务心跳时间格式异常: {row[0]}")
+        return False
+
+    age_seconds = (get_us_eastern_time() - last_success_at).total_seconds()
+    if age_seconds > MARKET_DATA_MAX_AGE_SECONDS:
+        print(f"错误: 行情缓存过旧，最近成功更新时间: {row[0]}，距今 {age_seconds:.0f} 秒")
+        return False
+
+    print(f"行情缓存服务可用: {os.path.abspath(MARKET_DATA_DB_PATH)}，最近更新 {age_seconds:.0f} 秒前")
+    return True
 
 def init_sqlite_database():
     """启动时清空信号：DROP 后重建 signals 表，删除全部历史行（含 consumed=0），避免 EA 误执行旧信号。"""
@@ -177,31 +238,6 @@ def get_us_eastern_time():
     eastern = pytz.timezone('US/Eastern')
     return datetime.now(eastern)
 
-def create_contexts():
-    max_retries = 5
-    retry_delay = 5  # 秒
-    
-    for attempt in range(max_retries):
-        try:
-            config = Config.from_env()
-            quote_ctx = QuoteContext(config)
-            trade_ctx = TradeContext(config)
-            if LOG_VERBOSE:
-                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接成功")
-            return quote_ctx, trade_ctx
-        except Exception as e:
-            if attempt < max_retries - 1:
-                if LOG_VERBOSE:
-                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败 ({attempt + 1}/{max_retries}): {str(e)}")
-                    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {retry_delay}秒后重试...")
-                time_module.sleep(retry_delay)
-            else:
-                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] API连接失败，已达最大重试次数")
-                raise
-
-QUOTE_CTX, TRADE_CTX = create_contexts()
-
-
 def get_account_balance():
     """模拟模式：不需要获取实际账户余额"""
     # 返回一个模拟的余额值
@@ -242,169 +278,99 @@ def calculate_pnl(entry_price, exit_price, direction):
     return pnl, pnl_pct
 
 def get_historical_data(symbol, days_back=None):
-    # 简化天数计算逻辑
     if days_back is None:
         days_back = history_days_back(LOOKBACK_DAYS)
-        
-    # 直接使用1分钟K线
-    sdk_period = Period.Min_1
-    adjust_type = AdjustType.ForwardAdjust
-    eastern = pytz.timezone('US/Eastern')
+
     now_et = get_us_eastern_time()
     current_date = now_et.date()
-    
-    if LOG_VERBOSE:
-        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 开始获取历史数据: {symbol}")
-    
-    # 计算起始日期
     start_date = current_date - timedelta(days=days_back)
-    
-    # 对于1分钟数据使用按日获取的方式
-    all_candles = []
-    
-    # 尝试从今天开始向前获取足够的数据
-    date_to_check = current_date
-    api_call_count = 0
-    while date_to_check >= start_date:
-        # 跳过周末（周六=5, 周日=6）
-        if date_to_check.weekday() >= 5:
-            if LOG_VERBOSE:
-                print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 跳过周末: {date_to_check}")
-            date_to_check -= timedelta(days=1)
-            continue
-        day_start_time = datetime.combine(date_to_check, time(9, 30))
-        day_start_time_et = eastern.localize(day_start_time)
-        
-        # 添加API调用间隔控制
-        if api_call_count > 0:
-            time_module.sleep(0.2)  # 200毫秒延迟，避免触发限流
-        
-        # 重试机制
-        max_retries = 3
-        retry_delay = 1
-        day_candles = None
-        
-        for attempt in range(max_retries):
-            try:
-                # 使用history_candlesticks_by_date方法（与backtest数据源一致）
-                # 这个方法返回的是完整交易日的数据，避免了by_offset方法可能的日期错误
-                day_candles = QUOTE_CTX.history_candlesticks_by_date(
-                    symbol, sdk_period, adjust_type,
-                    date_to_check,  # 开始日期
-                    date_to_check   # 结束日期（同一天）
-                )
-                api_call_count += 1
-                break  # 成功则跳出重试循环
-            except Exception as e:
-                if "rate limit" in str(e).lower():
-                    if attempt < max_retries - 1:
-                        if LOG_VERBOSE:
-                            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，等待 {retry_delay} 秒后重试 ({attempt + 1}/{max_retries})")
-                        time_module.sleep(retry_delay)
-                        retry_delay *= 2  # 指数退避
-                    else:
-                        if LOG_VERBOSE:
-                            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] API限流，已达最大重试次数")
-                        raise
-                else:
-                    raise  # 其他错误直接抛出
-        
-        if day_candles:
-            all_candles.extend(day_candles)
-            if LOG_VERBOSE:
-                print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 获取 {date_to_check} 数据: {len(day_candles)} 条")
-            
-        date_to_check -= timedelta(days=1)
-    
-    # 处理数据并去重
+
+    if not ensure_market_data_service_available():
+        return pd.DataFrame()
+
+    if LOG_VERBOSE:
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 从本地行情缓存读取历史数据: {symbol}")
+
+    try:
+        conn = sqlite3.connect(MARKET_DATA_DB_PATH)
+        query = """
+        SELECT datetime_et, open, high, low, close, volume, turnover
+        FROM candles
+        WHERE symbol = ? AND date >= ? AND date <= ?
+        ORDER BY datetime_et ASC
+        """
+        rows = conn.execute(query, (symbol, start_date.isoformat(), current_date.isoformat())).fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 读取行情缓存失败: {str(e)}")
+        return pd.DataFrame()
+
+    eastern = pytz.timezone('US/Eastern')
     data = []
-    processed_timestamps = set()
-    
-    for candle in all_candles:
-        timestamp = candle.timestamp
-        if isinstance(timestamp, datetime):
-            ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            ts_str = str(timestamp)
-            
-        # 去重处理
-        if ts_str in processed_timestamps:
-            continue
-        processed_timestamps.add(ts_str)
-        
-        # 标准化时区
-        if isinstance(timestamp, datetime):
-            if timestamp.tzinfo is None:
-                hour = timestamp.hour
-                if symbol.endswith(".US") and 9 <= hour < 17:
-                    dt = eastern.localize(timestamp)
-                elif symbol.endswith(".US") and (hour >= 21 or hour < 5):
-                    beijing = pytz.timezone('Asia/Shanghai')
-                    dt = beijing.localize(timestamp).astimezone(eastern)
-                else:
-                    utc = pytz.utc
-                    dt = utc.localize(timestamp).astimezone(eastern)
-            else:
-                dt = timestamp.astimezone(eastern)
-        else:
-            dt = datetime.fromtimestamp(timestamp, eastern)
-        
-        # 过滤未来日期
-        if dt.date() > current_date:
-            continue
-            
-        # 添加到数据列表
+    for row in rows:
+        dt = eastern.localize(datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S"))
         data.append({
-            "Close": float(candle.close),
-            "Open": float(candle.open),
-            "High": float(candle.high),
-            "Low": float(candle.low),
-            "Volume": float(candle.volume),
-            "Turnover": float(candle.turnover),
-            "DateTime": dt
+            "Close": float(row[4]),
+            "Open": float(row[1]),
+            "High": float(row[2]),
+            "Low": float(row[3]),
+            "Volume": float(row[5]),
+            "Turnover": float(row[6]),
+            "DateTime": dt,
         })
-    
-    # 转换为DataFrame并进行后处理
+
     df = pd.DataFrame(data)
     if df.empty:
         return df
-        
+
     df["Date"] = df["DateTime"].dt.date
     df["Time"] = df["DateTime"].dt.strftime('%H:%M')
-    
-    # 过滤交易时间
+
     if symbol.endswith(".US"):
         df = df[df["Time"].between("09:30", "16:00")]
-        
-    # 去除重复数据
+
     df = df.drop_duplicates(subset=['Date', 'Time'])
-    
-    # 过滤掉未来日期的数据（双重保险）
     df = df[df["Date"] <= current_date]
-    
-    # 过滤周末数据（双重保险）
     weekday_mask = df["Date"].apply(lambda x: x.weekday() < 5 if isinstance(x, date_type) else True)
     df = df[weekday_mask]
-    
+
     if LOG_VERBOSE and not df.empty:
         unique_dates = sorted(df["Date"].unique())
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 最终数据包含的日期: {unique_dates}")
-    
+        latest_row = df.sort_values(by=["Date", "Time"]).iloc[-1]
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 缓存数据日期: {unique_dates}, 最新K线: {latest_row['Date']} {latest_row['Time']}")
+
     return df
 
 def get_quote(symbol):
-    quotes = QUOTE_CTX.quote([symbol])
-    quote_data = {
-        "symbol": quotes[0].symbol,
-        "last_done": str(quotes[0].last_done),
-        "open": str(quotes[0].open),
-        "high": str(quotes[0].high),
-        "low": str(quotes[0].low),
-        "volume": str(quotes[0].volume),
-        "turnover": str(quotes[0].turnover),
-        "timestamp": quotes[0].timestamp.isoformat()
+    if not ensure_market_data_service_available():
+        return {}
+
+    try:
+        conn = sqlite3.connect(MARKET_DATA_DB_PATH)
+        row = conn.execute("""
+        SELECT symbol, last_done, open, high, low, volume, turnover, quote_timestamp
+        FROM quotes
+        WHERE symbol = ?
+        """, (symbol,)).fetchone()
+        conn.close()
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 读取报价缓存失败: {str(e)}")
+        return {}
+
+    if row is None:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 报价缓存为空: {symbol}")
+        return {}
+
+    return {
+        "symbol": row[0],
+        "last_done": row[1],
+        "open": row[2],
+        "high": row[3],
+        "low": row[4],
+        "volume": row[5],
+        "turnover": row[6],
+        "timestamp": row[7],
     }
-    return quote_data
 
 def calculate_vwap(df):
     # 创建一个结果DataFrame的副本
@@ -768,39 +734,36 @@ def daily_loss_monitor_thread(symbol, position_data):
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已停止 ===")
 
 def is_trading_day(symbol=None):
-    market = None
-    if symbol:
-        if symbol.endswith(".US"):
-            market = "US"
-        elif symbol.endswith(".HK"):
-            market = "HK"
-        elif symbol.endswith(".SH") or symbol.endswith(".SZ"):
-            market = "CN"
-        elif symbol.endswith(".SG"):
-            market = "SG"
-    if not market:
-        market = "US"
+    if not ensure_market_data_service_available():
+        return False
+
     now_et = get_us_eastern_time()
     current_date = now_et.date()
-    from longport.openapi import Market
-    market_mapping = {
-        "US": Market.US, "HK": Market.HK, "CN": Market.CN, "SG": Market.SG
-    }
-    sdk_market = market_mapping.get(market, Market.US)
-    calendar_resp = QUOTE_CTX.trading_days(
-        sdk_market, current_date, current_date
-    )
-    trading_dates = calendar_resp.trading_days
-    half_trading_dates = calendar_resp.half_trading_days
-    is_trade_day = current_date in trading_dates
-    is_half_trade_day = current_date in half_trading_dates
-    
-    # 如果是半交易日，不进行交易
-    if is_half_trade_day:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，不进行交易")
+    try:
+        conn = sqlite3.connect(MARKET_DATA_DB_PATH)
+        rows = conn.execute("""
+        SELECT key, value FROM service_state
+        WHERE key IN ('calendar_date', 'is_trading_day', 'is_half_trading_day')
+        """).fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 读取交易日历缓存失败: {str(e)}")
         return False
-    
-    return is_trade_day
+
+    state = {key: value for key, value in rows}
+    if state.get('calendar_date') != current_date.isoformat():
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存不是今天: {state.get('calendar_date')}")
+        return False
+
+    if state.get('is_half_trading_day') == '1':
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，不进行交易")
+        return False
+
+    if state.get('is_trading_day') != '1':
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日不是交易日，不进行交易")
+        return False
+
+    return True
 
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
@@ -1623,6 +1586,7 @@ if __name__ == "__main__":
     print("版本: 1.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
+    print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
     
     print("\n--- 用户配置参数 ---")
     print(f"交易品种: {SYMBOL}")
@@ -1652,12 +1616,11 @@ if __name__ == "__main__":
     print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     print("=" * 60 + "\n")
     
+    if not ensure_market_data_service_available():
+        sys.exit(1)
+
     # 初始化SQLite数据库
     init_sqlite_database()
-    
-    if QUOTE_CTX is None or TRADE_CTX is None:
-        print("错误: 无法创建API上下文")
-        sys.exit(1)
         
     run_trading_strategy(
         symbol=SYMBOL,
