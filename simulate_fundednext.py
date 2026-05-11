@@ -26,12 +26,12 @@ load_dotenv(override=True)
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
 # 资金和风控设置
-INITIAL_CAPITAL = 5757 # 初始资金（用于计算全仓盈亏）
+INITIAL_CAPITAL = 98827 # 初始资金（用于计算全仓盈亏）
 LEVERAGE = 2  # 杠杆倍数
 
 # 止盈止损设置（金额）
-MAX_PROFIT_AMOUNT = 550  # 止盈目标金额（设置为负数如-1则禁用止盈）
-MAX_DAILY_LOSS_AMOUNT = 250  # 日内最大亏损金额（设置为负数如-1则禁用日内止损）
+MAX_PROFIT_AMOUNT = 9200  # 止盈目标金额（设置为负数如-1则禁用止盈）
+MAX_DAILY_LOSS_AMOUNT = 4500  # 日内最大亏损金额（设置为负数如-1则禁用日内止损）
 
 # 交易时间设置
 TRADING_START_TIME = (9, 39)  # 交易开始时间：9点39分
