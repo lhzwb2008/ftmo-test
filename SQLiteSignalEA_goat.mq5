@@ -25,6 +25,7 @@ input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+bool last_terminal_connected = true;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -41,6 +42,9 @@ int OnInit()
         return(INIT_FAILED);
     }
     
+    // 启动定时器：Goat 原生 MT5 长时间挂机易断线，断线后 OnTick 不触发，定时器兜底轮询 DB
+    EventSetTimer(CheckIntervalSeconds);
+    
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
@@ -53,13 +57,15 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    EventKillTimer();
+    
     if(db_handle != INVALID_HANDLE)
     {
         DatabaseClose(db_handle);
         db_handle = INVALID_HANDLE;
     }
     
-    Print("EA已停止");
+    Print("EA已停止，原因代码: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -72,6 +78,21 @@ void OnTick()
         return;
         
     last_check_time = current_time;
+    CheckDatabaseSignals();
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - 断线/无 tick 时 OnTick 不触发，定时器兜底轮询 DB   |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+    if(!connected && last_terminal_connected)
+        Print("⚠️ 终端与 broker 断连，OnTick 已停止；定时器仍在轮询 DB，但下单需等重连后才会成功");
+    else if(connected && !last_terminal_connected)
+        Print("✅ 终端已重新连接 broker");
+    last_terminal_connected = connected;
+
     CheckDatabaseSignals();
 }
 
