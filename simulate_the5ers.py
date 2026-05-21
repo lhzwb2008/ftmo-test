@@ -52,7 +52,7 @@ USE_VWAP = False
 DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
 DEBUG_TIME = "2025-07-10 10:25:00"  # 调试使用的时间，格式: "YYYY-MM-DD HH:MM:SS"
 DEBUG_ONCE = True  # 是否只运行一次就退出（仅在DEBUG_MODE=True时有效）
-LOG_VERBOSE = True   # 设置为True开启详细日志打印
+LOG_VERBOSE = False  # 设置为True开启详细日志（主循环/等待/时间精度等周期性输出）
 
 # ============================================================================
 # 程序内部变量 - 请勿手动修改
@@ -171,7 +171,8 @@ def ensure_market_data_service_available():
         print(f"错误: 行情缓存过旧，最近成功更新时间: {row[0]}，距今 {age_seconds:.0f} 秒")
         return False
 
-    print(f"行情缓存服务可用: {os.path.abspath(MARKET_DATA_DB_PATH)}，最近更新 {age_seconds:.0f} 秒前")
+    if LOG_VERBOSE:
+        print(f"行情缓存服务可用: {os.path.abspath(MARKET_DATA_DB_PATH)}，最近更新 {age_seconds:.0f} 秒前")
     return True
 
 def init_sqlite_database():
@@ -722,7 +723,8 @@ def daily_loss_monitor_thread(symbol, position_data):
                     
                     status_parts.append(f"持仓: {position_quantity}")
                     
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] " + " | ".join(status_parts))
+                    if LOG_VERBOSE:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] " + " | ".join(status_parts))
             
             # 等待60秒后再次检查
             time_module.sleep(60)
