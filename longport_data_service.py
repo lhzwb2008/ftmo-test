@@ -279,6 +279,13 @@ def run_service():
     print(f"刷新间隔: {REFRESH_INTERVAL_SECONDS} 秒")
 
     while True:
+        # 交易日历优先更新，避免 K 线拉取失败导致 calendar_date 滞留
+        try:
+            upsert_trading_calendar(quote_ctx, SYMBOL)
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存更新完成")
+        except Exception as e:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存更新失败: {str(e)}")
+
         try:
             rows = fetch_historical_candles(quote_ctx, SYMBOL)
             if rows:
@@ -288,8 +295,6 @@ def run_service():
                 print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 警告: 本轮没有获取到K线")
             upsert_quote(quote_ctx, SYMBOL)
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 报价缓存更新完成")
-            upsert_trading_calendar(quote_ctx, SYMBOL)
-            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存更新完成")
         except Exception as e:
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 行情缓存更新失败: {str(e)}")
 

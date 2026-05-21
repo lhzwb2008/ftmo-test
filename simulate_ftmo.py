@@ -736,8 +736,9 @@ def daily_loss_monitor_thread(symbol, position_data):
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已停止 ===")
 
 def is_trading_day(symbol=None):
+    """返回 (是否交易日, 日历是否过期)。日历过期时应短间隔重试。"""
     if not ensure_market_data_service_available():
-        return False
+        return False, True
 
     now_et = get_us_eastern_time()
     current_date = now_et.date()
@@ -750,22 +751,22 @@ def is_trading_day(symbol=None):
         conn.close()
     except Exception as e:
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 读取交易日历缓存失败: {str(e)}")
-        return False
+        return False, True
 
     state = {key: value for key, value in rows}
     if state.get('calendar_date') != current_date.isoformat():
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存不是今天: {state.get('calendar_date')}")
-        return False
+        return False, True
 
     if state.get('is_half_trading_day') == '1':
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，不进行交易")
-        return False
+        return False, False
 
     if state.get('is_trading_day') != '1':
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日不是交易日，不进行交易")
-        return False
+        return False, False
 
-    return True
+    return True, False
 
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
@@ -876,12 +877,21 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             entry_price = None
         
         # 检查是否是交易日（调试模式下保持原有逻辑）
-        is_today_trading_day = is_trading_day(symbol)
+        is_today_trading_day, calendar_stale = is_trading_day(symbol)
         if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 是否交易日: {is_today_trading_day}")
             
         if not is_today_trading_day:
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今天不是交易日，跳过交易")
+            if monitor_thread is not None and monitor_thread.is_alive():
+                DAILY_LOSS_MONITOR_ACTIVE = False
+                monitor_thread.join(timeout=5)
+                monitor_thread = None
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 跳过交易，监控线程已停止")
+
+            if calendar_stale:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存过期，跳过交易")
+            else:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今天不是交易日，跳过交易")
             if position_quantity != 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 非交易日，执行平仓")
                 
@@ -940,8 +950,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"  当日盈亏: ${DAILY_PNL:+.2f}")
                     print(f"  累计盈亏: ${TOTAL_PNL:+.2f}")
                     print("=" * 50)
-            next_check_time = now + timedelta(hours=12)
+            retry_hours = 1 if calendar_stale else 12
+            next_check_time = now + timedelta(hours=retry_hours)
             wait_seconds = (next_check_time - now).total_seconds()
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {retry_hours} 小时后重新检查")
             time_module.sleep(wait_seconds)
             continue
             
