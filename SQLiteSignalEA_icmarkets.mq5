@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 // 添加必要的权限声明
@@ -20,14 +20,155 @@ input int      MagicNumber = 20241228;                 // 魔术数字
 input double   Leverage = 2.0;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
-input int      PreMarketCleanupHour = 21;              // 开盘前清仓检查（服务器时间小时，21=美东9点）
-input int      PreMarketCleanupMinute = 30;            // 开盘前清仓检查（服务器时间分钟）
+input int      PreMarketCleanupHour = 9;               // 开盘前清仓：美东时间小时（与 Python 策略一致）
+input int      PreMarketCleanupMinute = 25;            // 开盘前清仓：美东时间分钟（默认9:25，美股9:30开盘）
+input int      MaxSignalAgeMinutes = 20;               // 信号最大有效分钟数（SQLite UTC 时间戳，超时丢弃）
 
 //--- 全局变量
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
-datetime last_cleanup_date = 0;
+datetime last_cleanup_us_date = 0;
+bool last_terminal_connected = true;
+
+//+------------------------------------------------------------------+
+//| 将 UTC 年月日时分秒转为 MQL5 datetime（与 TimeGMT 可比）           |
+//+------------------------------------------------------------------+
+datetime MakeUtcDatetime(int year, int mon, int day, int hour, int min, int sec)
+{
+    MqlDateTime dt;
+    dt.year = year;
+    dt.mon = mon;
+    dt.day = day;
+    dt.hour = hour;
+    dt.min = min;
+    dt.sec = sec;
+    datetime local_parsed = StructToTime(dt);
+    return local_parsed + (TimeCurrent() - TimeGMT());
+}
+
+//+------------------------------------------------------------------+
+//| 某月第 N 个星期 X 的日期（dow: 0=周日）                            |
+//+------------------------------------------------------------------+
+int NthWeekdayOfMonth(int year, int month, int nth, int dow)
+{
+    MqlDateTime dt;
+    dt.year = year;
+    dt.mon = month;
+    dt.day = 1;
+    dt.hour = 12;
+    dt.min = 0;
+    dt.sec = 0;
+    datetime first = StructToTime(dt);
+    TimeToStruct(first, dt);
+    int first_dow = dt.day_of_week;
+    return 1 + ((dow - first_dow + 7) % 7) + (nth - 1) * 7;
+}
+
+//+------------------------------------------------------------------+
+//| 美国东部是否处于夏令时（基于 UTC，自动处理 DST 切换）               |
+//+------------------------------------------------------------------+
+bool IsUsDaylightSavingTime(datetime utc_time)
+{
+    MqlDateTime dt;
+    TimeToStruct(utc_time, dt);
+    int y = dt.year;
+
+    int march_day = NthWeekdayOfMonth(y, 3, 2, 0);
+    datetime dst_start = MakeUtcDatetime(y, 3, march_day, 7, 0, 0);
+
+    int nov_day = NthWeekdayOfMonth(y, 11, 1, 0);
+    datetime dst_end = MakeUtcDatetime(y, 11, nov_day, 6, 0, 0);
+
+    return utc_time >= dst_start && utc_time < dst_end;
+}
+
+//+------------------------------------------------------------------+
+//| 当前美东时间（与 simulate_icmarkets.py 的 get_us_eastern_time 对齐）|
+//+------------------------------------------------------------------+
+datetime TimeUsEastern()
+{
+    datetime utc = TimeGMT();
+    int offset = IsUsDaylightSavingTime(utc) ? -4 * 3600 : -5 * 3600;
+    return utc + offset;
+}
+
+//+------------------------------------------------------------------+
+//| 美东时间是否已到指定时刻                                           |
+//+------------------------------------------------------------------+
+bool IsUsEasternAtOrAfter(int target_hour, int target_minute)
+{
+    MqlDateTime dt;
+    TimeToStruct(TimeUsEastern(), dt);
+    if(dt.hour > target_hour)
+        return true;
+    if(dt.hour == target_hour && dt.min >= target_minute)
+        return true;
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| 解析 SQLite UTC 时间戳 "YYYY-MM-DD HH:MM:SS"                       |
+//+------------------------------------------------------------------+
+datetime ParseUtcTimestamp(string ts)
+{
+    string parts[];
+    if(StringSplit(ts, ' ', parts) != 2)
+        return 0;
+
+    string date_parts[], time_parts[];
+    if(StringSplit(parts[0], '-', date_parts) != 3)
+        return 0;
+    if(StringSplit(parts[1], ':', time_parts) != 3)
+        return 0;
+
+    return MakeUtcDatetime(
+        (int)StringToInteger(date_parts[0]),
+        (int)StringToInteger(date_parts[1]),
+        (int)StringToInteger(date_parts[2]),
+        (int)StringToInteger(time_parts[0]),
+        (int)StringToInteger(time_parts[1]),
+        (int)StringToInteger(time_parts[2])
+    );
+}
+
+//+------------------------------------------------------------------+
+//| 信号是否已过期（created_at 为 SQLite UTC，与 TimeGMT 比较）         |
+//+------------------------------------------------------------------+
+bool IsSignalExpired(string created_at)
+{
+    if(MaxSignalAgeMinutes <= 0)
+        return false;
+
+    datetime signal_utc = ParseUtcTimestamp(created_at);
+    if(signal_utc <= 0)
+        return false;
+
+    return (TimeGMT() - signal_utc) > MaxSignalAgeMinutes * 60;
+}
+
+//+------------------------------------------------------------------+
+//| 启动时打印时间诊断信息                                             |
+//+------------------------------------------------------------------+
+void LogTimeDiagnostics()
+{
+    MqlDateTime srv, et;
+    TimeToStruct(TimeCurrent(), srv);
+    TimeToStruct(TimeUsEastern(), et);
+
+    int server_gmt_offset_hours = (int)((TimeCurrent() - TimeGMT()) / 3600);
+    string dst_label = IsUsDaylightSavingTime(TimeGMT()) ? "EDT(UTC-4)" : "EST(UTC-5)";
+
+    Print("=== IC Markets 时间诊断 ===");
+    Print("服务器时间: ", TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+    Print("UTC/GMT: ", TimeToString(TimeGMT(), TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+    Print("美东时间: ", TimeToString(TimeUsEastern(), TIME_DATE|TIME_MINUTES|TIME_SECONDS), " (", dst_label, ")");
+    Print("服务器 GMT 偏移: GMT", (server_gmt_offset_hours >= 0 ? "+" : ""), server_gmt_offset_hours,
+          " （IC 官方: 冬 GMT+2 / 夏 GMT+3，随美国 DST 切换）");
+    Print("开盘前清仓触发: 美东 ", PreMarketCleanupHour, ":", StringFormat("%02d", PreMarketCleanupMinute),
+          " （旧版误用服务器21:30≈美东14:30，会在盘中误触发）");
+    Print("信号有效期: ", MaxSignalAgeMinutes, " 分钟");
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -46,6 +187,8 @@ int OnInit()
     
     // 启动定时器作为OnTick的补充，IC Markets断线时OnTick不触发，定时器可兜底
     EventSetTimer(CheckIntervalSeconds);
+    
+    LogTimeDiagnostics();
     
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
@@ -90,36 +233,40 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+    bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+    if(!connected && last_terminal_connected)
+        Print("⚠️ 终端与 IC Markets 断连，OnTick 已停止；定时器仍在轮询 DB");
+    else if(connected && !last_terminal_connected)
+        Print("✅ 终端已重新连接 IC Markets");
+    last_terminal_connected = connected;
+
     PreMarketCleanup();
     CheckDatabaseSignals();
 }
 
 //+------------------------------------------------------------------+
-//| 开盘前清仓：每天到指定时间检查是否有残留持仓，有则平掉              |
+//| 开盘前清仓：按美东时间触发，避免 IC 服务器 GMT+2/+3 与本地时间混淆  |
 //+------------------------------------------------------------------+
 void PreMarketCleanup()
 {
-    MqlDateTime dt;
-    TimeCurrent(dt);
-    
-    // 用日期做去重，每天只执行一次
-    datetime today = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
-    if(today == last_cleanup_date)
+    if(!IsUsEasternAtOrAfter(PreMarketCleanupHour, PreMarketCleanupMinute))
         return;
-    
-    // 还没到指定时间则不执行
-    if(dt.hour < PreMarketCleanupHour || (dt.hour == PreMarketCleanupHour && dt.min < PreMarketCleanupMinute))
+
+    MqlDateTime et;
+    TimeToStruct(TimeUsEastern(), et);
+    datetime today_us = StringToTime(StringFormat("%04d.%02d.%02d", et.year, et.mon, et.day));
+    if(today_us == last_cleanup_us_date)
         return;
-    
-    last_cleanup_date = today;
-    
+
+    last_cleanup_us_date = today_us;
+
     int position_type = GetPositionType();
     if(position_type != 0)
     {
-        Print("⚠️ 开盘前检测到残留持仓（", (position_type == 1 ? "多仓" : "空仓"), "），执行清仓");
+        Print("⚠️ 美东 ", et.hour, ":", StringFormat("%02d", et.min),
+              " 开盘前检测到残留持仓（", (position_type == 1 ? "多仓" : "空仓"), "），执行清仓");
         CloseAllPositions();
-        
-        // 同时清掉数据库中所有未消费的过期信号
+
         if(db_handle != INVALID_HANDLE)
             MarkAllSignalsConsumed();
     }
@@ -226,7 +373,7 @@ void CheckDatabaseSignals()
     }
     
     // 只有1条未消费信号，正常实时处理
-    string query = "SELECT id, action FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
+    string query = "SELECT id, action, created_at FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
     
     int request = DatabasePrepare(db_handle, query);
     if(request == INVALID_HANDLE)
@@ -239,11 +386,23 @@ void CheckDatabaseSignals()
     {
         long signal_id;
         string action;
+        string created_at;
         
         DatabaseColumnLong(request, 0, signal_id);
         DatabaseColumnText(request, 1, action);
+        DatabaseColumnText(request, 2, created_at);
         
-        Print("📊 检测到未消费信号: ", action, " (ID: ", signal_id, ")");
+        if(IsSignalExpired(created_at))
+        {
+            long age_sec = TimeGMT() - ParseUtcTimestamp(created_at);
+            Print("⚠️ 信号已过期，丢弃: ", action, " (ID: ", signal_id,
+                  ", 年龄 ", age_sec / 60, " 分钟, 上限 ", MaxSignalAgeMinutes, " 分钟)");
+            MarkSignalConsumed(signal_id);
+            DatabaseFinalize(request);
+            return;
+        }
+        
+        Print("📊 检测到未消费信号: ", action, " (ID: ", signal_id, ", UTC: ", created_at, ")");
         ProcessSignal(signal_id, action);
     }
     
