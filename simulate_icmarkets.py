@@ -25,13 +25,18 @@ load_dotenv(override=True)
 # 交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
-# 资金和风控设置
-INITIAL_CAPITAL = 100000 # 初始资金（用于计算全仓盈亏）
+# 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/止损金额）
+ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
+INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
 LEVERAGE = 2  # 杠杆倍数
 
-# 止盈止损设置（金额）
-MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（设置为负数如-1则禁用止盈）
-MAX_DAILY_LOSS_AMOUNT = -1  # 日内最大亏损金额（设置为负数如-1则禁用日内止损）
+# 风控比例（IC Markets 为实盘经纪商，非 prop firm 考试，无官方目标/日亏规则；设为负数保持禁用，可按需启用）
+PROFIT_TARGET_PCT = -1   # 账户止盈目标比例（负数=禁用）
+DAILY_LOSS_PCT = -1      # 日内止损比例（负数=禁用）
+
+# 止盈止损设置（金额）——启动时按上述比例自动计算，请勿手动修改
+MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
+MAX_DAILY_LOSS_AMOUNT = -1  # 日内最大亏损金额（自动计算；负数表示未初始化/禁用）
 
 # 交易时间设置
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
@@ -106,6 +111,52 @@ class Logger:
     
     def close(self):
         self.log.close()
+
+def prompt_capital_settings():
+    """启动时交互输入账户起始资金与当前金额，并按比例自动计算账户止盈/日内止损金额（比例为负时禁用）"""
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
+    
+    while True:
+        try:
+            start_str = input("请输入账户起始资金（如 100000）: ").strip()
+            current_str = input("请输入账户当前金额（如 100000）: ").strip()
+            start_balance = float(start_str)
+            current_balance = float(current_str)
+            if start_balance <= 0 or current_balance <= 0:
+                print("错误: 金额必须大于 0，请重新输入")
+                continue
+            break
+        except ValueError:
+            print("错误: 输入格式不正确，请输入数字")
+        except EOFError:
+            print("错误: 无法读取输入（非交互环境），程序退出")
+            sys.exit(1)
+    
+    ACCOUNT_START_BALANCE = start_balance
+    INITIAL_CAPITAL = current_balance
+    
+    print(f"账户起始资金: ${start_balance:.2f}")
+    print(f"账户当前金额: ${current_balance:.2f}")
+    print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
+    
+    if PROFIT_TARGET_PCT > 0:
+        # 账户止盈金额 = 起始资金 × 目标比例 − 已有盈利（即距离达标还需赚的金额）
+        MAX_PROFIT_AMOUNT = start_balance * PROFIT_TARGET_PCT - (current_balance - start_balance)
+        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 起始资金 × {PROFIT_TARGET_PCT*100:.1f}% − 已有盈亏)")
+        if MAX_PROFIT_AMOUNT <= 0:
+            print("警告: 当前金额已达到/超过账户止盈目标，无需继续交易，程序退出")
+            sys.exit(0)
+    else:
+        MAX_PROFIT_AMOUNT = -1
+        print("账户止盈: 已禁用（PROFIT_TARGET_PCT 为负）")
+    
+    if DAILY_LOSS_PCT > 0:
+        # 日内止损金额 = min(起始资金, 当前金额) × 比例（取较小者更保守）
+        MAX_DAILY_LOSS_AMOUNT = min(start_balance, current_balance) * DAILY_LOSS_PCT
+        print(f"日内止损金额: ${MAX_DAILY_LOSS_AMOUNT:.2f} (= min(起始资金, 当前金额) × {DAILY_LOSS_PCT*100:.1f}%)")
+    else:
+        MAX_DAILY_LOSS_AMOUNT = -1
+        print("日内止损: 已禁用（DAILY_LOSS_PCT 为负）")
 
 # SQLite数据库路径 - 使用MT5通用目录
 def get_common_files_dir():
@@ -808,6 +859,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     # 🎯 动态追踪止盈状态变量
     max_profit_price = None         # 持仓期间的最优价格（多头：最高价，空头：最低价）
     trailing_tp_activated = False   # 追踪止盈是否已激活
+    trailing_tp_day_stop = False    # 当日是否已因追踪止盈平仓（触发后当日不再开仓）
     
     # 持仓数据字典（供监控线程使用）
     position_data = {
@@ -982,6 +1034,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
             PROFIT_TARGET_TRIGGERED = False  # 重置止盈标志
+            trailing_tp_day_stop = False  # 🎯 重置追踪止盈当日停止开仓标志
             
             # 停止旧的监控线程
             if monitor_thread is not None and monitor_thread.is_alive():
@@ -1034,7 +1087,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 判断当前时间是否在9:30之后且监控线程未启动
         current_hour, current_minute = now.hour, now.minute
         is_after_930 = (current_hour > 9) or (current_hour == 9 and current_minute >= 30)
-        if is_after_930 and (monitor_thread is None or not monitor_thread.is_alive()):
+        # 已触发止盈/止损或已收盘时不再重启监控线程，避免每分钟重复打印启动/停止日志
+        monitor_needed = is_after_930 and current_hour < 16 and not (PROFIT_TARGET_TRIGGERED or DAILY_STOP_TRIGGERED)
+        if monitor_needed and (monitor_thread is None or not monitor_thread.is_alive()):
             print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] === 初始化日内止损监控 ===")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 初始资金: ${INITIAL_CAPITAL:.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日盈亏: ${DAILY_PNL:+.2f}")
@@ -1456,6 +1511,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 如果没有检查时间点的数据，使用原有逻辑
                 exit_signal, new_stop = check_exit_conditions(df, position_quantity, current_stop)
                 current_stop = new_stop
+                trailing_tp_exit = False  # 此路径无追踪止盈判断，避免沿用上一轮的旧值
                 exit_reason = "Stop Loss"  # 默认使用止损退出原因
                 if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓检查: 数量={position_quantity}, 退出信号={exit_signal}, 当前止损={current_stop}")
@@ -1528,6 +1584,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     # 🎯 重置动态追踪止盈状态
                     max_profit_price = None
                     trailing_tp_activated = False
+                    
+                    # 🎯 追踪止盈触发后，当日不再开新仓
+                    if trailing_tp_exit:
+                        trailing_tp_day_stop = True
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 🎯 追踪止盈已触发，今日不再开新仓")
         else:
             # 检查是否已有持仓，如果有则不再开仓
             if position_quantity != 0:
@@ -1545,10 +1606,17 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
                 continue
+            
+            # 🎯 追踪止盈当日已触发，不再开仓
+            if trailing_tp_day_stop:
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已触发追踪止盈，跳过开仓检查")
+                continue
                 
             # 检查今日是否达到最大持仓数
             if positions_opened_today >= max_positions_per_day:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已开仓 {positions_opened_today} 次，达到上限")
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日已开仓 {positions_opened_today} 次，达到上限")
                 continue
             
             # 使用检查时间点的完整K线数据
@@ -1694,6 +1762,10 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("长桥API交易策略启动 - 模拟模式 (ICmarkets)")
     print("=" * 60)
+    
+    print("\n--- 账户资金设置 ---")
+    prompt_capital_settings()
+    
     print("版本: 1.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
@@ -1701,7 +1773,8 @@ if __name__ == "__main__":
     
     print("\n--- 用户配置参数 ---")
     print(f"交易品种: {SYMBOL}")
-    print(f"初始资金: ${INITIAL_CAPITAL:.2f}")
+    print(f"账户起始资金: ${ACCOUNT_START_BALANCE:.2f}")
+    print(f"账户当前金额(仓位基准): ${INITIAL_CAPITAL:.2f}")
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
@@ -1716,6 +1789,7 @@ if __name__ == "__main__":
     if ENABLE_TRAILING_TAKE_PROFIT:
         print(f"  激活阈值: {TRAILING_TP_ACTIVATION_PCT*100:.1f}% (浮盈达到此比例后激活)")
         print(f"  保护比例: {TRAILING_TP_CALLBACK_PCT*100:.0f}% (保护最大浮盈的此比例)")
+        print("  触发后当日停止开仓: 是")
     
     print("\n--- 调试配置 ---")
     if DEBUG_MODE:
