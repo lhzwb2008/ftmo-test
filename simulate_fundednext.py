@@ -149,12 +149,13 @@ def prompt_capital_settings():
     if phase == "funded":
         while True:
             try:
-                lev_str = input(f"请输入杠杆倍数（直接回车使用默认 {LEVERAGE}x）: ").strip()
+                lev_str = input(f"请输入交易杠杆倍数，范围 1~3（直接回车使用默认 {LEVERAGE}x）: ").strip()
                 if not lev_str:
+                    print(f"使用默认杠杆: {LEVERAGE}x")
                     break
                 lev = float(lev_str)
-                if lev <= 0 or lev > 5:
-                    print("错误: 杠杆必须在 0~5 之间，请重新输入")
+                if lev < 1 or lev > 3:
+                    print("错误: 杠杆必须在 1~3 之间，请重新输入")
                     continue
                 LEVERAGE = lev
                 break
