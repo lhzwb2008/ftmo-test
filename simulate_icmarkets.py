@@ -33,6 +33,7 @@ LEVERAGE = 2  # 杠杆倍数
 # 风控比例（IC Markets 为实盘经纪商，非 prop firm 考试，无官方目标/日亏规则；设为负数保持禁用，可按需启用）
 PROFIT_TARGET_PCT = -1   # 账户止盈目标比例（负数=禁用）
 DAILY_LOSS_PCT = -1      # 日内止损比例（负数=禁用）
+TP_BUFFER_PCT = 0.002    # 止盈余量比例（按起始资金的 0.2% 上调止盈目标，覆盖点差/滑点/跟踪误差，避免提前止盈）
 
 # 止盈止损设置（金额）——启动时按上述比例自动计算，请勿手动修改
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
@@ -140,9 +141,10 @@ def prompt_capital_settings():
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
     
     if PROFIT_TARGET_PCT > 0:
-        # 账户止盈金额 = 起始资金 × 目标比例 − 已有盈利（即距离达标还需赚的金额）
-        MAX_PROFIT_AMOUNT = start_balance * PROFIT_TARGET_PCT - (current_balance - start_balance)
-        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 起始资金 × {PROFIT_TARGET_PCT*100:.1f}% − 已有盈亏)")
+        # 账户止盈金额 = 起始资金 × 目标比例 − 已有盈利 + 余量（起始资金 × TP_BUFFER_PCT，覆盖点差/滑点等损耗）
+        tp_buffer = start_balance * TP_BUFFER_PCT
+        MAX_PROFIT_AMOUNT = start_balance * PROFIT_TARGET_PCT - (current_balance - start_balance) + tp_buffer
+        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 起始资金 × {PROFIT_TARGET_PCT*100:.1f}% − 已有盈亏 + 余量 ${tp_buffer:.2f})")
         if MAX_PROFIT_AMOUNT <= 0:
             print("警告: 当前金额已达到/超过账户止盈目标，无需继续交易，程序退出")
             sys.exit(0)
