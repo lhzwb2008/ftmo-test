@@ -35,7 +35,7 @@ INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全
 # 杠杆 1.5x 为 VaR 测算最优值（darwinex_var_analysis.py，2026-06）：
 # 月 VaR95 ≈ 6.92% ≈ 目标 6.5%，缩放系数 0.94，DARWIN 等效年化 24.8%，信号账户 MDD 8.1%。
 # 加杠杆不会提高投资人收益（Risk Engine 按 VaR 归一化），请保持固定。
-LEVERAGE = 1.5  # 杠杆倍数（默认值，启动时可修改；建议固定不变以稳定 VaR）
+LEVERAGE = 1.5  # 杠杆倍数（固定 1.5x，保持风险一致以稳定 VaR）
 
 PROFIT_TARGET_PCT = -1     # Darwinex 无利润目标，账户止盈固定禁用
 DAILY_LOSS_PCT = 0.03      # 日内止损比例（自律风控，非平台规则；启动时可修改或禁用）
@@ -141,25 +141,6 @@ def prompt_capital_settings():
     
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
-
-    # 杠杆输入：Darwinex 无规则限制，但 Risk Engine 会按 VaR 缩放，建议固定杠杆保持风险一致
-    while True:
-        try:
-            lev_str = input(f"请输入交易杠杆倍数，范围 1~3（直接回车使用默认 {LEVERAGE}x，建议长期固定）: ").strip()
-            if not lev_str:
-                print(f"使用默认杠杆: {LEVERAGE}x")
-                break
-            lev = float(lev_str)
-            if lev < 1 or lev > 3:
-                print("错误: 杠杆必须在 1~3 之间，请重新输入")
-                continue
-            LEVERAGE = lev
-            break
-        except ValueError:
-            print("错误: 输入格式不正确，请输入数字")
-        except EOFError:
-            print("错误: 无法读取输入（非交互环境），程序退出")
-            sys.exit(1)
 
     # 日内止损输入（可选自律风控，非 Darwinex 平台规则）
     while True:

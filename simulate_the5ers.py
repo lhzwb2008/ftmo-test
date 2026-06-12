@@ -144,26 +144,6 @@ def prompt_capital_settings():
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
     LEVERAGE = PHASE_LEVERAGE[phase]
-
-    # Funded 账户允许自定义杠杆（仅影响倍数，不影响止盈/止损逻辑）
-    if phase == "funded":
-        while True:
-            try:
-                lev_str = input(f"请输入交易杠杆倍数，范围 1~3（直接回车使用默认 {LEVERAGE}x）: ").strip()
-                if not lev_str:
-                    print(f"使用默认杠杆: {LEVERAGE}x")
-                    break
-                lev = float(lev_str)
-                if lev < 1 or lev > 3:
-                    print("错误: 杠杆必须在 1~3 之间，请重新输入")
-                    continue
-                LEVERAGE = lev
-                break
-            except ValueError:
-                print("错误: 输入格式不正确，请输入数字")
-            except EOFError:
-                print("错误: 无法读取输入（非交互环境），程序退出")
-                sys.exit(1)
     
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")

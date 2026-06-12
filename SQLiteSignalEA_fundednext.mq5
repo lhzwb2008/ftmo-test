@@ -17,9 +17,12 @@
 input string   DBPath = "trading_signals_fundednext.db";          // SQLite数据库文件名
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
 input int      MagicNumber = 20241228;                 // 魔术数字
-input double   Leverage = 2.0;                        // 杠杆倍数
+input double   Leverage = 1.5;                        // 杠杆倍数（Funded账户默认1.5x）
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
+input double   InitialBalance = 6000.0;                // 账户初始资金（FundedNext风控按初始资金计算）
+input double   HardSLRiskPercent = 2.5;                // 硬止损风险比例(%)（FundedNext上限3%，留0.5%余量）
+input bool     DryRun = true;                         // 演练模式：只打日志不下单（上线前务必先测）
 
 //--- 全局变量
 CTrade trade;
@@ -44,6 +47,12 @@ int OnInit()
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
+    Print("🛡️ 硬止损: 初始资金 $", DoubleToString(InitialBalance, 2), " × ", HardSLRiskPercent, "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2));
+    if(DryRun)
+        Print("🧪 演练模式已开启：将计算手数/止损并写日志，但不会向服务器发送任何订单");
+    
+    // 启动时立即检查已有持仓是否缺SL（FundedNext要求所有持仓必须有SL）
+    EnsureStopLosses();
     
     return(INIT_SUCCEEDED);
 }
@@ -72,7 +81,77 @@ void OnTick()
         return;
         
     last_check_time = current_time;
+    EnsureStopLosses();
     CheckDatabaseSignals();
+}
+
+//+------------------------------------------------------------------+
+//| 计算硬止损距离（价格单位）                                         |
+//| FundedNext要求每笔单必须挂SL，且累计风险≤初始资金3%                 |
+//| 风险金额 = 初始资金 × HardSLRiskPercent%，换算成价格距离            |
+//+------------------------------------------------------------------+
+double CalcHardSLDistance(double lots)
+{
+    if(lots <= 0) return 0;
+    
+    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tick_value <= 0 || tick_size <= 0) return 0;
+    
+    // 每1.0手每1个价格单位的亏损金额
+    double loss_per_unit = tick_value / tick_size;
+    double risk_amount = InitialBalance * (HardSLRiskPercent / 100.0);
+    
+    double distance = risk_amount / (loss_per_unit * lots);
+    
+    // 不能小于经纪商允许的最小止损距离
+    double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(distance < min_stop) distance = min_stop;
+    
+    return distance;
+}
+
+//+------------------------------------------------------------------+
+//| 检查所有持仓，没有SL的立即补挂（FundedNext要求开仓3分钟内必须有SL）  |
+//+------------------------------------------------------------------+
+void EnsureStopLosses()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!PositionSelectByTicket(ticket))
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+            continue;
+        if(PositionGetDouble(POSITION_SL) > 0)
+            continue;
+        
+        double lots = PositionGetDouble(POSITION_VOLUME);
+        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        double tp = PositionGetDouble(POSITION_TP);
+        double distance = CalcHardSLDistance(lots);
+        if(distance <= 0)
+        {
+            Print("❌ 无法计算硬止损距离，持仓 ", ticket, " 仍无SL！");
+            continue;
+        }
+        
+        int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        double sl = (type == POSITION_TYPE_BUY) ? open_price - distance : open_price + distance;
+        sl = NormalizeDouble(sl, digits);
+        
+        if(DryRun)
+        {
+            Print("🧪 [演练] 将为持仓 ", ticket, " 补挂硬止损: ", DoubleToString(sl, digits), " (风险 ", HardSLRiskPercent, "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2), ")");
+            continue;
+        }
+        
+        if(trade.PositionModify(ticket, sl, tp))
+            Print("🛡️ 已为持仓 ", ticket, " 补挂硬止损: ", DoubleToString(sl, digits), " (风险 ", HardSLRiskPercent, "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2), ")");
+        else
+            Print("❌ 补挂止损失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode());
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -209,8 +288,8 @@ void ProcessSignal(long signal_id, string action)
         else if(position_type == -1)
         {
             // 有空仓，先平仓
-            Print("🔄 检测到买入信号，先平掉现有空仓");
-            CloseAllPositions();
+            Print(DryRun ? "🧪 [演练] 检测到买入信号，将平掉现有空仓" : "🔄 检测到买入信号，先平掉现有空仓");
+            if(!DryRun) CloseAllPositions();
             MarkSignalConsumed(signal_id);
             return;
         }
@@ -226,7 +305,19 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            result = trade.Buy(lots, _Symbol, ask, 0, 0, "QQQ Signal Buy");
+            double sl_distance = CalcHardSLDistance(lots);
+            double sl = (sl_distance > 0) ? NormalizeDouble(ask - sl_distance, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) : 0;
+            if(DryRun)
+            {
+                Print("🧪 [演练] BUY 手数=", DoubleToString(lots, 2), " 价格=", DoubleToString(ask, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
+                      " SL=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
+                      " 止损距离=", DoubleToString(sl_distance, 2), " 风险=$", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2));
+                result = true;
+            }
+            else
+            {
+                result = trade.Buy(lots, _Symbol, ask, sl, 0, "QQQ Signal Buy");
+            }
         }
     }
     else if(action == "SELL")
@@ -241,8 +332,8 @@ void ProcessSignal(long signal_id, string action)
         else if(position_type == 1)
         {
             // 有多仓，先平仓
-            Print("🔄 检测到卖出信号，先平掉现有多仓");
-            CloseAllPositions();
+            Print(DryRun ? "🧪 [演练] 检测到卖出信号，将平掉现有多仓" : "🔄 检测到卖出信号，先平掉现有多仓");
+            if(!DryRun) CloseAllPositions();
             MarkSignalConsumed(signal_id);
             return;
         }
@@ -258,7 +349,19 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            result = trade.Sell(lots, _Symbol, bid, 0, 0, "QQQ Signal Sell");
+            double sl_distance = CalcHardSLDistance(lots);
+            double sl = (sl_distance > 0) ? NormalizeDouble(bid + sl_distance, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) : 0;
+            if(DryRun)
+            {
+                Print("🧪 [演练] SELL 手数=", DoubleToString(lots, 2), " 价格=", DoubleToString(bid, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
+                      " SL=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
+                      " 止损距离=", DoubleToString(sl_distance, 2), " 风险=$", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2));
+                result = true;
+            }
+            else
+            {
+                result = trade.Sell(lots, _Symbol, bid, sl, 0, "QQQ Signal Sell");
+            }
         }
     }
     else if(action == "CLOSE")
@@ -266,8 +369,16 @@ void ProcessSignal(long signal_id, string action)
         // 平仓所有持仓
         if(position_type != 0)
         {
-            CloseAllPositions();
-            result = true;
+            if(DryRun)
+            {
+                Print("🧪 [演练] CLOSE 将平掉所有持仓");
+                result = true;
+            }
+            else
+            {
+                CloseAllPositions();
+                result = true;
+            }
         }
         else
         {
