@@ -7,7 +7,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 // 添加必要的权限声明
@@ -23,11 +23,153 @@ input int      MagicNumber = 20260612;                 // 魔术数字
 input double   Leverage = 1.5;                      // 杠杆倍数（VaR 测算最优值，与 simulate_darwinex.py 保持一致）
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
+input int      PreMarketCleanupHour = 9;               // 开盘前清仓：美东时间小时（与 Python 策略一致）
+input int      PreMarketCleanupMinute = 25;            // 开盘前清仓：美东时间分钟（默认9:25，美股9:30开盘）
+input int      MaxSignalAgeMinutes = 20;               // 信号最大有效分钟数（SQLite UTC 时间戳，超时丢弃）
 
 //--- 全局变量
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+datetime last_cleanup_us_date = 0;
+bool last_terminal_connected = true;
+
+//+------------------------------------------------------------------+
+//| 将 UTC 年月日时分秒转为 MQL5 datetime（与 TimeGMT 可比）           |
+//+------------------------------------------------------------------+
+datetime MakeUtcDatetime(int year, int mon, int day, int hour, int min, int sec)
+{
+    MqlDateTime dt;
+    dt.year = year;
+    dt.mon = mon;
+    dt.day = day;
+    dt.hour = hour;
+    dt.min = min;
+    dt.sec = sec;
+    datetime local_parsed = StructToTime(dt);
+    return local_parsed + (TimeCurrent() - TimeGMT());
+}
+
+//+------------------------------------------------------------------+
+//| 某月第 N 个星期 X 的日期（dow: 0=周日）                            |
+//+------------------------------------------------------------------+
+int NthWeekdayOfMonth(int year, int month, int nth, int dow)
+{
+    MqlDateTime dt;
+    dt.year = year;
+    dt.mon = month;
+    dt.day = 1;
+    dt.hour = 12;
+    dt.min = 0;
+    dt.sec = 0;
+    datetime first = StructToTime(dt);
+    TimeToStruct(first, dt);
+    int first_dow = dt.day_of_week;
+    return 1 + ((dow - first_dow + 7) % 7) + (nth - 1) * 7;
+}
+
+//+------------------------------------------------------------------+
+//| 美国东部是否处于夏令时（基于 UTC，自动处理 DST 切换）               |
+//+------------------------------------------------------------------+
+bool IsUsDaylightSavingTime(datetime utc_time)
+{
+    MqlDateTime dt;
+    TimeToStruct(utc_time, dt);
+    int y = dt.year;
+
+    int march_day = NthWeekdayOfMonth(y, 3, 2, 0);
+    datetime dst_start = MakeUtcDatetime(y, 3, march_day, 7, 0, 0);
+
+    int nov_day = NthWeekdayOfMonth(y, 11, 1, 0);
+    datetime dst_end = MakeUtcDatetime(y, 11, nov_day, 6, 0, 0);
+
+    return utc_time >= dst_start && utc_time < dst_end;
+}
+
+//+------------------------------------------------------------------+
+//| 当前美东时间（与 simulate_darwinex.py 对齐）                        |
+//+------------------------------------------------------------------+
+datetime TimeUsEastern()
+{
+    datetime utc = TimeGMT();
+    int offset = IsUsDaylightSavingTime(utc) ? -4 * 3600 : -5 * 3600;
+    return utc + offset;
+}
+
+//+------------------------------------------------------------------+
+//| 美东时间是否已到指定时刻                                           |
+//+------------------------------------------------------------------+
+bool IsUsEasternAtOrAfter(int target_hour, int target_minute)
+{
+    MqlDateTime dt;
+    TimeToStruct(TimeUsEastern(), dt);
+    if(dt.hour > target_hour)
+        return true;
+    if(dt.hour == target_hour && dt.min >= target_minute)
+        return true;
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| 解析 SQLite UTC 时间戳 "YYYY-MM-DD HH:MM:SS"                       |
+//+------------------------------------------------------------------+
+datetime ParseUtcTimestamp(string ts)
+{
+    string parts[];
+    if(StringSplit(ts, ' ', parts) != 2)
+        return 0;
+
+    string date_parts[], time_parts[];
+    if(StringSplit(parts[0], '-', date_parts) != 3)
+        return 0;
+    if(StringSplit(parts[1], ':', time_parts) != 3)
+        return 0;
+
+    return MakeUtcDatetime(
+        (int)StringToInteger(date_parts[0]),
+        (int)StringToInteger(date_parts[1]),
+        (int)StringToInteger(date_parts[2]),
+        (int)StringToInteger(time_parts[0]),
+        (int)StringToInteger(time_parts[1]),
+        (int)StringToInteger(time_parts[2])
+    );
+}
+
+//+------------------------------------------------------------------+
+//| 信号是否已过期（created_at 为 SQLite UTC，与 TimeGMT 比较）         |
+//+------------------------------------------------------------------+
+bool IsSignalExpired(string created_at)
+{
+    if(MaxSignalAgeMinutes <= 0)
+        return false;
+
+    datetime signal_utc = ParseUtcTimestamp(created_at);
+    if(signal_utc <= 0)
+        return false;
+
+    return (TimeGMT() - signal_utc) > MaxSignalAgeMinutes * 60;
+}
+
+//+------------------------------------------------------------------+
+//| 启动时打印时间诊断信息                                             |
+//+------------------------------------------------------------------+
+void LogTimeDiagnostics()
+{
+    MqlDateTime srv, et;
+    TimeToStruct(TimeCurrent(), srv);
+    TimeToStruct(TimeUsEastern(), et);
+
+    int server_gmt_offset_hours = (int)((TimeCurrent() - TimeGMT()) / 3600);
+    string dst_label = IsUsDaylightSavingTime(TimeGMT()) ? "EDT(UTC-4)" : "EST(UTC-5)";
+
+    Print("=== Darwinex 时间诊断 ===");
+    Print("服务器时间: ", TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+    Print("UTC/GMT: ", TimeToString(TimeGMT(), TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+    Print("美东时间: ", TimeToString(TimeUsEastern(), TIME_DATE|TIME_MINUTES|TIME_SECONDS), " (", dst_label, ")");
+    Print("服务器 GMT 偏移: GMT", (server_gmt_offset_hours >= 0 ? "+" : ""), server_gmt_offset_hours);
+    Print("开盘前清仓触发: 美东 ", PreMarketCleanupHour, ":", StringFormat("%02d", PreMarketCleanupMinute));
+    Print("信号有效期: ", MaxSignalAgeMinutes, " 分钟");
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -44,6 +186,11 @@ int OnInit()
         return(INIT_FAILED);
     }
     
+    // 启动定时器作为OnTick的补充，断线时OnTick不触发，定时器可兜底
+    EventSetTimer(CheckIntervalSeconds);
+    
+    LogTimeDiagnostics();
+    
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
@@ -56,13 +203,15 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    EventKillTimer();
+    
     if(db_handle != INVALID_HANDLE)
     {
         DatabaseClose(db_handle);
         db_handle = INVALID_HANDLE;
     }
     
-    Print("EA已停止");
+    Print("EA已停止，原因代码: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -70,12 +219,58 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    PreMarketCleanup();
+    
     datetime current_time = TimeCurrent();
     if(current_time - last_check_time < CheckIntervalSeconds)
         return;
         
     last_check_time = current_time;
     CheckDatabaseSignals();
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - 断线时OnTick不触发，定时器兜底                     |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+    if(!connected && last_terminal_connected)
+        Print("⚠️ 终端与 Darwinex 断连，OnTick 已停止；定时器仍在轮询 DB，但下单需等重连后才会成功");
+    else if(connected && !last_terminal_connected)
+        Print("✅ 终端已重新连接 Darwinex");
+    last_terminal_connected = connected;
+
+    PreMarketCleanup();
+    CheckDatabaseSignals();
+}
+
+//+------------------------------------------------------------------+
+//| 开盘前清仓：按美东时间触发，避免服务器时区与本地时间混淆            |
+//+------------------------------------------------------------------+
+void PreMarketCleanup()
+{
+    if(!IsUsEasternAtOrAfter(PreMarketCleanupHour, PreMarketCleanupMinute))
+        return;
+
+    MqlDateTime et;
+    TimeToStruct(TimeUsEastern(), et);
+    datetime today_us = StringToTime(StringFormat("%04d.%02d.%02d", et.year, et.mon, et.day));
+    if(today_us == last_cleanup_us_date)
+        return;
+
+    last_cleanup_us_date = today_us;
+
+    int position_type = GetPositionType();
+    if(position_type != 0)
+    {
+        Print("⚠️ 美东 ", et.hour, ":", StringFormat("%02d", et.min),
+              " 开盘前检测到残留持仓（", (position_type == 1 ? "多仓" : "空仓"), "），执行清仓");
+        CloseAllPositions();
+
+        if(db_handle != INVALID_HANDLE)
+            MarkAllSignalsConsumed();
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -158,8 +353,28 @@ void CheckDatabaseSignals()
     if(db_handle == INVALID_HANDLE)
         return;
     
-    // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
-    string query = "SELECT id, action FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
+    // 先统计未消费信号数量
+    int pending_count = CountPendingSignals();
+    if(pending_count <= 0)
+        return;
+    
+    if(pending_count > 1)
+    {
+        // 多条信号堆积 = 断线期间积压，信号已过期，全部丢弃并平仓
+        Print("⚠️ 检测到 ", pending_count, " 条堆积信号，判断为断线积压，全部丢弃");
+        MarkAllSignalsConsumed();
+        
+        int position_type = GetPositionType();
+        if(position_type != 0)
+        {
+            Print("🔄 断线恢复，平掉所有持仓以避免风险敞口");
+            CloseAllPositions();
+        }
+        return;
+    }
+    
+    // 只有1条未消费信号，正常实时处理
+    string query = "SELECT id, action, created_at FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
     
     int request = DatabasePrepare(db_handle, query);
     if(request == INVALID_HANDLE)
@@ -168,25 +383,64 @@ void CheckDatabaseSignals()
         return;
     }
     
-    // 读取查询结果
     if(DatabaseRead(request))
     {
-        long latest_signal_id;
-        string latest_action;
+        long signal_id;
+        string action;
+        string created_at;
         
-        DatabaseColumnLong(request, 0, latest_signal_id);
-        DatabaseColumnText(request, 1, latest_action);
+        DatabaseColumnLong(request, 0, signal_id);
+        DatabaseColumnText(request, 1, action);
+        DatabaseColumnText(request, 2, created_at);
         
-        Print("📊 检测到未消费信号，只执行最新的: ", latest_action, " (ID: ", latest_signal_id, ")");
+        if(IsSignalExpired(created_at))
+        {
+            long age_sec = TimeGMT() - ParseUtcTimestamp(created_at);
+            Print("⚠️ 信号已过期，丢弃: ", action, " (ID: ", signal_id,
+                  ", 年龄 ", age_sec / 60, " 分钟, 上限 ", MaxSignalAgeMinutes, " 分钟)");
+            MarkSignalConsumed(signal_id);
+            DatabaseFinalize(request);
+            return;
+        }
         
-        // 先标记所有未消费的信号为已消费（除了最新的这一条）
-        MarkOldSignalsConsumed(latest_signal_id);
-        
-        // 处理最新的信号
-        ProcessSignal(latest_signal_id, latest_action);
+        Print("📊 检测到未消费信号: ", action, " (ID: ", signal_id, ", UTC: ", created_at, ")");
+        ProcessSignal(signal_id, action);
     }
     
     DatabaseFinalize(request);
+}
+
+//+------------------------------------------------------------------+
+//| 统计未消费信号数量                                                 |
+//+------------------------------------------------------------------+
+int CountPendingSignals()
+{
+    string query = "SELECT COUNT(*) FROM signals WHERE consumed = 0";
+    int request = DatabasePrepare(db_handle, query);
+    if(request == INVALID_HANDLE)
+        return 0;
+    
+    int count = 0;
+    if(DatabaseRead(request))
+    {
+        long cnt;
+        DatabaseColumnLong(request, 0, cnt);
+        count = (int)cnt;
+    }
+    DatabaseFinalize(request);
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| 标记所有未消费信号为已消费                                          |
+//+------------------------------------------------------------------+
+void MarkAllSignalsConsumed()
+{
+    string update_query = "UPDATE signals SET consumed = 1 WHERE consumed = 0";
+    if(DatabaseExecute(db_handle, update_query))
+    {
+        Print("✅ 所有堆积信号已标记为已消费（丢弃）");
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -229,6 +483,21 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            
+            // 开单前最终保证金校验
+            double pre_margin = 0;
+            if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, ask, pre_margin))
+            {
+                double avail = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+                if(pre_margin > avail * 0.95)
+                {
+                    Print("❌ 开单前保证金校验失败：需要 $", DoubleToString(pre_margin, 2),
+                          " 可用 $", DoubleToString(avail, 2));
+                    MarkSignalConsumed(signal_id);
+                    return;
+                }
+            }
+            
             result = trade.Buy(lots, _Symbol, ask, 0, 0, "QQQ Signal Buy");
         }
     }
@@ -261,6 +530,21 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            
+            // 开单前最终保证金校验
+            double pre_margin_sell = 0;
+            if(OrderCalcMargin(ORDER_TYPE_SELL, _Symbol, lots, bid, pre_margin_sell))
+            {
+                double avail_sell = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+                if(pre_margin_sell > avail_sell * 0.95)
+                {
+                    Print("❌ 开单前保证金校验失败：需要 $", DoubleToString(pre_margin_sell, 2),
+                          " 可用 $", DoubleToString(avail_sell, 2));
+                    MarkSignalConsumed(signal_id);
+                    return;
+                }
+            }
+            
             result = trade.Sell(lots, _Symbol, bid, 0, 0, "QQQ Signal Sell");
         }
     }
@@ -286,7 +570,11 @@ void ProcessSignal(long signal_id, string action)
     }
     else
     {
-        Print("❌ 执行失败: ", trade.ResultRetcode());
+        uint retcode = trade.ResultRetcode();
+        Print("❌ 执行失败，错误码: ", retcode, " 描述: ", trade.ResultRetcodeDescription());
+        // 无论何种失败，都标记信号为已消费，避免无限重试
+        // 若需重试，应由Python端重新写入新信号
+        MarkSignalConsumed(signal_id);
     }
 }
 
@@ -346,19 +634,6 @@ void CloseAllPositions()
                 trade.PositionClose(ticket);
             }
         }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| 标记旧信号为已消费（除了指定的最新信号）                            |
-//+------------------------------------------------------------------+
-void MarkOldSignalsConsumed(long latest_signal_id)
-{
-    string update_query = StringFormat("UPDATE signals SET consumed = 1 WHERE consumed = 0 AND id != %d", latest_signal_id);
-    
-    if(DatabaseExecute(db_handle, update_query))
-    {
-        Print("✅ 旧信号已全部标记为已消费");
     }
 }
 
@@ -500,19 +775,43 @@ double CalculateLotSize()
     Print("💰 实际所需保证金: $", DoubleToString(actual_margin_required, 2));
     Print("📊 实际杠杆: ", DoubleToString(actual_leverage, 2), "倍");
     
-    // 再次检查保证金是否充足
-    if(actual_margin_required > free_margin)
+    // 再次检查保证金是否充足（使用90%更保守）
+    if(actual_margin_required > free_margin * 0.90)
     {
-        Print("⚠️ 警告：所需保证金超过可用保证金！");
+        Print("⚠️ 警告：所需保证金超过可用保证金90%！");
         Print("⚠️ 所需保证金: $", DoubleToString(actual_margin_required, 2));
         Print("⚠️ 可用保证金: $", DoubleToString(free_margin, 2));
         
-        // 调整手数以适应可用保证金
-        lots = (free_margin * 0.95) / margin_for_one_lot;
+        if(margin_for_one_lot <= 0)
+        {
+            Print("❌ 无法计算1手保证金，放弃开仓");
+            return 0;
+        }
+        
+        // 按可用保证金的90%重新计算手数
+        lots = (free_margin * 0.90) / margin_for_one_lot;
         lots = MathFloor(lots / lot_step) * lot_step;
-        lots = MathMax(lots, min_lot);
         
         Print("📊 调整后手数: ", DoubleToString(lots, 2));
+        
+        // 注意：调整后不再强制套用min_lot，避免超保证金
+        if(lots < min_lot)
+        {
+            Print("❌ 调整后手数(", DoubleToString(lots, 2), ")小于最小手数(", DoubleToString(min_lot, 2), ")，余额不足无法开仓");
+            return 0;
+        }
+    }
+    
+    // 最终安全校验：再做一次保证金确认
+    double final_margin = 0;
+    if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, price, final_margin))
+    {
+        if(final_margin > free_margin * 0.95)
+        {
+            Print("❌ 最终校验失败：需要保证金 $", DoubleToString(final_margin, 2),
+                  " 超过可用保证金95% $", DoubleToString(free_margin * 0.95, 2));
+            return 0;
+        }
     }
     
     return lots;
