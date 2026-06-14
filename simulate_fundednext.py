@@ -41,9 +41,13 @@ TP_BUFFER_PCT = 0.002      # 止盈余量比例（按起始资金的 0.2% 上调
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
 MAX_DAILY_LOSS_AMOUNT = -1  # 日内最大亏损金额（自动计算；负数表示未初始化/禁用）
 
-# 交易时间设置
-TRADING_START_TIME = (9, 39)  # 交易开始时间：9点39分
-TRADING_END_TIME = (15, 39)   # 交易结束时间：15点39分
+# 交易时间设置（Challenge 9:39；Funded 启动时自动切换为 9:41，与 challenge 错开避免 copy 嫌疑）
+CHALLENGE_TRADING_START_TIME = (9, 39)
+CHALLENGE_TRADING_END_TIME = (15, 39)
+FUNDED_TRADING_START_TIME = (9, 41)
+FUNDED_TRADING_END_TIME = (15, 41)
+TRADING_START_TIME = CHALLENGE_TRADING_START_TIME
+TRADING_END_TIME = CHALLENGE_TRADING_END_TIME
 CHECK_INTERVAL_MINUTES = 15   # 检查间隔（分钟）
 MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 
@@ -118,7 +122,7 @@ class Logger:
 def prompt_capital_settings():
     """启动时交互输入考试轮次、账户起始资金与当前金额；按轮次自动设置杠杆并计算账户止盈/日内止损金额"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
-    global PROFIT_TARGET_PCT, LEVERAGE
+    global PROFIT_TARGET_PCT, LEVERAGE, TRADING_START_TIME, TRADING_END_TIME
     
     while True:
         try:
@@ -144,10 +148,19 @@ def prompt_capital_settings():
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
     LEVERAGE = PHASE_LEVERAGE[phase]
-    
+    if phase == "funded":
+        TRADING_START_TIME = FUNDED_TRADING_START_TIME
+        TRADING_END_TIME = FUNDED_TRADING_END_TIME
+    else:
+        TRADING_START_TIME = CHALLENGE_TRADING_START_TIME
+        TRADING_END_TIME = CHALLENGE_TRADING_END_TIME
+
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
+    print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - "
+          f"{TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}"
+          f"{' (Funded 实盘序列)' if phase == 'funded' else ' (Challenge 序列)'}")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
