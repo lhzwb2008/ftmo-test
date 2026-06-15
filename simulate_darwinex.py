@@ -28,7 +28,7 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额）
 # Darwinex 不是 prop firm：没有利润目标、没有每日/总回撤淘汰规则。
 # 平台通过 Risk Engine（月 VaR 6.5%）和 D-Score 管控风险，
-# 因此本脚本禁用"账户止盈"，日内止损仅作为可选的自律风控（默认启用 3%，可在启动时跳过）。
+# 因此本脚本禁用"账户止盈"与"日内止损"（非 Darwinex 平台规则，与 simulate_icmarkets 一致）。
 # 注意：保持每天风格一致的杠杆/手数最重要，忽大忽小会被 Risk Engine 降杠杆，损害 DARWIN 跟踪效果。
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
@@ -38,7 +38,7 @@ INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全
 LEVERAGE = 1.5  # 杠杆倍数（固定 1.5x，保持风险一致以稳定 VaR）
 
 PROFIT_TARGET_PCT = -1     # Darwinex 无利润目标，账户止盈固定禁用
-DAILY_LOSS_PCT = 0.03      # 日内止损比例（自律风控，非平台规则；启动时可修改或禁用）
+DAILY_LOSS_PCT = -1        # 日内止损比例（负数=禁用，非 Darwinex 平台规则）
 
 # 止盈止损设置（金额）——启动时按上述比例自动计算，请勿手动修改
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
@@ -119,14 +119,13 @@ class Logger:
         self.log.close()
 
 def prompt_capital_settings():
-    """启动时交互输入账户起始资金与当前金额；Darwinex 无利润目标，止盈禁用，日内止损为可选自律风控"""
+    """启动时交互输入账户起始资金与当前金额；Darwinex 无利润目标，止盈/日内止损均禁用"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
-    global DAILY_LOSS_PCT, LEVERAGE
     
     while True:
         try:
-            start_str = input("请输入账户起始资金（Darwinex Zero 默认 100000）: ").strip()
-            current_str = input("请输入账户当前金额（如 100000）: ").strip()
+            start_str = input("请输入账户起始资金（Darwinex Zero Stocks 默认 1000000）: ").strip()
+            current_str = input("请输入账户当前金额（如 1000000）: ").strip()
             start_balance = float(start_str)
             current_balance = float(current_str)
             if start_balance <= 0 or current_balance <= 0:
@@ -141,24 +140,6 @@ def prompt_capital_settings():
     
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
-
-    # 日内止损输入（可选自律风控，非 Darwinex 平台规则）
-    while True:
-        try:
-            dl_str = input(f"请输入日内止损比例（如 0.03 = 3%；输入 0 禁用；直接回车使用默认 {DAILY_LOSS_PCT}）: ").strip()
-            if not dl_str:
-                break
-            dl = float(dl_str)
-            if dl < 0 or dl > 0.2:
-                print("错误: 比例必须在 0~0.2 之间，请重新输入")
-                continue
-            DAILY_LOSS_PCT = dl
-            break
-        except ValueError:
-            print("错误: 输入格式不正确，请输入数字")
-        except EOFError:
-            print("错误: 无法读取输入（非交互环境），程序退出")
-            sys.exit(1)
     
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"账户起始资金: ${start_balance:.2f}")
