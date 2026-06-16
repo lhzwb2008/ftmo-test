@@ -32,10 +32,11 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 # 注意：保持每天风格一致的杠杆/手数最重要，忽大忽小会被 Risk Engine 降杠杆，损害 DARWIN 跟踪效果。
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-# 杠杆 1.5x 为 VaR 测算最优值（darwinex_var_analysis.py，2026-06）：
-# 月 VaR95 ≈ 6.92% ≈ 目标 6.5%，缩放系数 0.94，DARWIN 等效年化 24.8%，信号账户 MDD 8.1%。
-# 加杠杆不会提高投资人收益（Risk Engine 按 VaR 归一化），请保持固定。
-LEVERAGE = 1.5  # 杠杆倍数（固定 1.5x，保持风险一致以稳定 VaR）
+# 杠杆统一设 1.0：Darwinex Risk Engine 按 VaR 归一化（DARWIN 收益 ≈ 收益/VaR × 6.5%），
+# 杠杆线性缩放在归一化后会被抵消，D-Score / 回撤% / Sharpe 等评分指标几乎不随杠杆变化。
+# 现金 QQQ 账户实际还受 MT5「最大量 1000」上限锁定（约 0.74x），杠杆设多少成交都一样。
+# 因此无需追求高杠杆；1.0 最贴近 quantra 现货回测口径，且账户最干净。
+LEVERAGE = 1.0  # 杠杆倍数（现金账户成交受 broker 最大量上限约束，提高杠杆不改变实际敞口）
 
 PROFIT_TARGET_PCT = -1     # Darwinex 无利润目标，账户止盈固定禁用
 DAILY_LOSS_PCT = -1        # 日内止损比例（负数=禁用，非 Darwinex 平台规则）

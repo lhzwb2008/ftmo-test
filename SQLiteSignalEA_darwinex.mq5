@@ -20,7 +20,7 @@
 input string   DBPath = "trading_signals_darwinex.db";      // SQLite数据库文件名
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
 input int      MagicNumber = 20260612;                 // 魔术数字
-input double   Leverage = 1.5;                      // 杠杆倍数（VaR 测算最优值，与 simulate_darwinex.py 保持一致）
+input double   Leverage = 1.0;                      // 杠杆倍数（现金账户受最大量上限锁定，提高无效；Risk Engine 按VaR归一化，评分与杠杆无关）
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 input int      PreMarketCleanupHour = 9;               // 开盘前清仓：美东时间小时（与 Python 策略一致）
