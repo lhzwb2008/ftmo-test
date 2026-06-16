@@ -41,13 +41,17 @@ TP_BUFFER_PCT = 0.002      # 止盈余量比例（按起始资金的 0.2% 上调
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
 MAX_DAILY_LOSS_AMOUNT = -1  # 日内最大亏损金额（自动计算；负数表示未初始化/禁用）
 
-# 交易时间设置（Challenge 9:39；Funded 启动时自动切换为 9:41，与 challenge 错开避免 copy 嫌疑）
-CHALLENGE_TRADING_START_TIME = (9, 39)
-CHALLENGE_TRADING_END_TIME = (15, 39)
-FUNDED_TRADING_START_TIME = (9, 41)
-FUNDED_TRADING_END_TIME = (15, 41)
-TRADING_START_TIME = CHALLENGE_TRADING_START_TIME
-TRADING_END_TIME = CHALLENGE_TRADING_END_TIME
+# 交易时间设置（FundedNext 专用：启动时手动选择，与轮次无关；多账户错开开仓时间避免 copy 嫌疑）
+TRADING_SESSION_HOURS = 6  # 交易窗口长度（小时），结束时间 = 开始时间 + 此值
+TRADING_TIME_PRESETS = {
+    "1": (9, 39, "09:39 (Challenge 常用)"),
+    "2": (9, 41, "09:41 (Funded 常用)"),
+    "3": (9, 40, "09:40"),
+    "4": (9, 42, "09:42"),
+    "5": (9, 43, "09:43"),
+}
+TRADING_START_TIME = (9, 39)  # 启动时交互选择
+TRADING_END_TIME = (15, 39)  # 启动时根据开始时间自动计算
 CHECK_INTERVAL_MINUTES = 15   # 检查间隔（分钟）
 MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 
@@ -119,10 +123,64 @@ class Logger:
     def close(self):
         self.log.close()
 
+def trading_end_from_start(start_time, session_hours=TRADING_SESSION_HOURS):
+    """根据开始时间计算结束时间（默认 +6 小时交易窗口）"""
+    h, m = start_time
+    total_minutes = h * 60 + m + session_hours * 60
+    return total_minutes // 60, total_minutes % 60
+
+
+def parse_trading_time_input(raw):
+    """解析用户输入的交易时间，支持 HH:MM / HHMM"""
+    raw = raw.strip()
+    if ":" in raw:
+        parts = raw.split(":")
+        if len(parts) != 2:
+            raise ValueError("时间格式应为 HH:MM")
+        h, m = int(parts[0]), int(parts[1])
+    elif len(raw) == 4 and raw.isdigit():
+        h, m = int(raw[:2]), int(raw[2:])
+    else:
+        raise ValueError("无法解析时间，请输入预设编号、HH:MM 或 HHMM")
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError("小时或分钟超出有效范围")
+    return h, m
+
+
+def prompt_trading_time():
+    """FundedNext 专用：启动时手动选择交易开始时间，与轮次无关，便于多账户错开避免 copy"""
+    global TRADING_START_TIME, TRADING_END_TIME
+
+    print("\n--- 交易时间设置 (FundedNext: 多账户请手动错开开仓时间，避免 copy 嫌疑) ---")
+    for key, (h, m, label) in TRADING_TIME_PRESETS.items():
+        print(f"  {key} = {label}")
+    print("  或直接输入时间 HH:MM / HHMM（如 9:45）")
+
+    while True:
+        try:
+            choice = input("请选择开仓时间: ").strip()
+            if choice in TRADING_TIME_PRESETS:
+                h, m, _ = TRADING_TIME_PRESETS[choice]
+                start_time = (h, m)
+            else:
+                start_time = parse_trading_time_input(choice)
+            break
+        except ValueError as e:
+            print(f"错误: {e}，请重新输入")
+        except EOFError:
+            print("错误: 无法读取输入（非交互环境），程序退出")
+            sys.exit(1)
+
+    TRADING_START_TIME = start_time
+    TRADING_END_TIME = trading_end_from_start(start_time)
+    print(f"已设置交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - "
+          f"{TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
+
+
 def prompt_capital_settings():
     """启动时交互输入考试轮次、账户起始资金与当前金额；按轮次自动设置杠杆并计算账户止盈/日内止损金额"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
-    global PROFIT_TARGET_PCT, LEVERAGE, TRADING_START_TIME, TRADING_END_TIME
+    global PROFIT_TARGET_PCT, LEVERAGE
     
     while True:
         try:
@@ -148,19 +206,11 @@ def prompt_capital_settings():
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
     LEVERAGE = PHASE_LEVERAGE[phase]
-    if phase == "funded":
-        TRADING_START_TIME = FUNDED_TRADING_START_TIME
-        TRADING_END_TIME = FUNDED_TRADING_END_TIME
-    else:
-        TRADING_START_TIME = CHALLENGE_TRADING_START_TIME
-        TRADING_END_TIME = CHALLENGE_TRADING_END_TIME
+    prompt_trading_time()
 
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
-    print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - "
-          f"{TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}"
-          f"{' (Funded 实盘序列)' if phase == 'funded' else ' (Challenge 序列)'}")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
