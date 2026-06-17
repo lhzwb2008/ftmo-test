@@ -15,6 +15,7 @@ import platform
 from longport.openapi import OutsideRTH
 
 from trend_er5_gate import history_days_back, apply_er5_gate_to_signal
+from k_side_adjust import effective_k1_for_time, format_k_strategy_params
 
 load_dotenv(override=True)
 
@@ -49,8 +50,9 @@ MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 
 # 策略参数
 LOOKBACK_DAYS = 1  # 回看天数（用于计算噪声区域）
-K1 = 1  # 上边界sigma乘数
-K2 = 1  # 下边界sigma乘数
+K1 = 1  # 上边界sigma乘数（多头基准）
+K2 = 1  # 下边界sigma乘数（空头）
+ENABLE_K_SIDE_ADJUSTMENT = True  # 午后收紧多头 K（午前1.0/午后0.9）；False=全天固定 K1
 
 # VWAP开关：False=不使用VWAP作为入场/止损条件，True=使用VWAP
 USE_VWAP = False
@@ -610,8 +612,9 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
         sigma = time_sigma.get((target_date, tm))
         
         if sigma is not None:
-            # 使用时间点特定的sigma计算上下边界，应用K1和K2乘数
-            upper_bound = upper_ref * (1 + K1 * sigma)
+            # 使用时间点特定的sigma计算上下边界（K1 可按午后规则动态调整，见 k_side_adjust）
+            k1_eff = effective_k1_for_time(tm, K1, ENABLE_K_SIDE_ADJUSTMENT)
+            upper_bound = upper_ref * (1 + k1_eff * sigma)
             lower_bound = lower_ref * (1 - K2 * sigma)
             
             # 更新df中的边界值
@@ -1787,7 +1790,7 @@ if __name__ == "__main__":
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")
-    print(f"策略参数: K1={K1}, K2={K2}, 回看天数={LOOKBACK_DAYS}")
+    print(f"策略参数: {format_k_strategy_params(K1, K2, LOOKBACK_DAYS, ENABLE_K_SIDE_ADJUSTMENT)}")
     
     print("\n--- 动态追踪止盈配置 ---")
     print(f"动态追踪止盈: {'已启用' if ENABLE_TRAILING_TAKE_PROFIT else '已禁用'}")
