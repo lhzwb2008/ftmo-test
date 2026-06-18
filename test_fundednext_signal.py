@@ -56,7 +56,7 @@ def print_prerequisites():
     print("  [ ] 图表已挂载 SQLiteSignalEA_fundednext（不是 Momentum）")
     print("  [ ] EA 已重新编译")
     print("  [ ] DryRun = true（演练模式，不下真单）")
-    print("  [ ] Leverage = 1.5")
+    print("  [ ] Leverage = 3（Funded 账户；需与 simulate_fundednext.py 选 funded 时一致）")
     print("  [ ] InitialBalance = 6000")
     print("  [ ] HardSLRiskPercent = 2.5")
     print("  [ ] 顶部「算法交易」为绿色开启")

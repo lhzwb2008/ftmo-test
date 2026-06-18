@@ -150,6 +150,8 @@ def prompt_capital_settings():
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
+    if phase == "funded":
+        print("⚠️ 提醒: 杠杆不会自动同步到 MT5。Funded 账户请在 EA 输入参数中将 Leverage 手动改为 1.5，否则实盘手数与模拟不一致")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")

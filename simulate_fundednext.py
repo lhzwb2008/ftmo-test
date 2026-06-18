@@ -33,7 +33,7 @@ LEVERAGE = 2  # 杠杆倍数（默认值，启动时按轮次自动设置）
 
 # 风控比例（FundedNext Stellar 2-Step 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏均 5%）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
-PHASE_LEVERAGE = {"1": 2, "2": 2, "funded": 1.5}  # 各轮次杠杆倍数
+PHASE_LEVERAGE = {"1": 2, "2": 2, "funded": 3}  # 各轮次杠杆倍数（FundedNext Funded 专用 3x）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 DAILY_LOSS_PCT = 0.045     # 日内止损比例（官方 5%，留 10% 缓冲，各轮次相同）
 TP_BUFFER_PCT = 0.002      # 止盈余量比例（按起始资金的 0.2% 上调止盈目标，覆盖点差/滑点/跟踪误差，避免提前止盈）
@@ -213,6 +213,8 @@ def prompt_capital_settings():
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
+    if phase == "funded":
+        print("⚠️ 提醒: FundedNext Funded 模拟杠杆为 3x，不会自动同步到 MT5。请修改 SQLiteSignalEA_fundednext.mq5 中 Leverage 为 3 并重新编译（或在 EA 输入参数中手动设为 3），否则实盘手数与模拟不一致")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")

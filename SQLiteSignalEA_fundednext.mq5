@@ -17,7 +17,7 @@
 input string   DBPath = "trading_signals_fundednext.db";          // SQLite数据库文件名
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
 input int      MagicNumber = 20241228;                 // 魔术数字
-input double   Leverage = 1.5;                        // 杠杆倍数（Funded账户默认1.5x）
+input double   Leverage = 2;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 input double   InitialBalance = 6000.0;                // 账户初始资金（FundedNext风控按初始资金计算）
