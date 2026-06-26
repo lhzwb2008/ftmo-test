@@ -614,9 +614,14 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     
     return df
 
-def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None):
+def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False):
     # 将下单改为写入数据库
-    action = "BUY" if side == "Buy" else "SELL"
+    # 平仓时写入 CLOSE：在 MT5 已无持仓（例如 EA 硬止损先平仓）时，EA 会忽略 CLOSE，
+    # 避免被当作反向开仓而留下意外持仓
+    if is_close:
+        action = "CLOSE"
+    else:
+        action = "BUY" if side == "Buy" else "SELL"
     signal_id = write_signal_to_sqlite(action)
     
     # 返回一个模拟的订单ID
@@ -872,6 +877,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     max_profit_price = None         # 持仓期间的最优价格（多头：最高价，空头：最低价）
     trailing_tp_activated = False   # 追踪止盈是否已激活
     trailing_tp_day_stop = False    # 当日是否已因追踪止盈平仓（触发后当日不再开仓）
+    last_processed_trigger = None    # 已处理的触发点(date, k_h, k_m)，用于触发窗口内去重，避免空转刷屏
     
     while True:
         now = get_us_eastern_time()
@@ -903,7 +909,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             # 执行平仓
             side = "Sell" if position_quantity > 0 else "Buy"
-            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 强制平仓信号已发送，ID: {close_order_id}")
             
             # 计算盈亏（全仓计算）
@@ -971,7 +977,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
                 
                 # 计算盈亏（全仓计算）
@@ -1166,6 +1172,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             if closest_trigger_idx is not None:
                 k_h, k_m = k_line_check_times[closest_trigger_idx]
+                # 去重：同一触发点在±30秒窗口内只处理一次，避免触发窗口内 continue 不睡眠导致空转刷屏
+                if last_processed_trigger == (now.date(), k_h, k_m):
+                    time_module.sleep(5)
+                    continue
+                last_processed_trigger = (now.date(), k_h, k_m)
                 check_time_str = f"{k_h:02d}:{k_m:02d}"
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发检查，使用 {check_time_str} 的K线数据")
             else:
@@ -1267,7 +1278,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             # 执行平仓
             side = "Sell" if position_quantity > 0 else "Buy"
-            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
             
             # 计算盈亏（全仓计算）
@@ -1363,7 +1374,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 current_price = float(quote.get("last_done", 0))
                 
                 side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
                 
                 # 计算盈亏（全仓计算）
@@ -1553,7 +1564,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     
                     # 执行平仓
                     side = "Sell" if position_quantity > 0 else "Buy"
-                    close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting)
+                    close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓信号已发送，ID: {close_order_id}")
                     
                     # 计算盈亏（全仓计算）
@@ -1727,6 +1738,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"累计盈亏: ${TOTAL_PNL:+.2f}")
             break
             
+        # 同步持仓状态给监控线程：平仓后本轮会进入长时间 sleep，若不立即同步，
+        # 监控线程会读到已平仓的旧持仓并把未实现盈亏重复计入，导致日内止损被误触发
+        with pnl_lock:
+            position_data['quantity'] = position_quantity
+            position_data['entry_price'] = entry_price
+
         # 计算下一个精确的检查时间点（避免累积误差）
         current_time = now.time()
         current_hour, current_minute = current_time.hour, current_time.minute
