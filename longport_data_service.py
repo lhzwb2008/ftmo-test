@@ -251,9 +251,20 @@ def get_market(symbol):
 def upsert_trading_calendar(quote_ctx, symbol):
     now_et = get_us_eastern_time()
     current_date = now_et.date()
-    calendar_resp = quote_ctx.trading_days(get_market(symbol), current_date, current_date)
+    # 往前多查一段日历，以便判断上一个交易日是否为半交易日
+    # （半交易日次日午后历史分钟数据缺失，会污染噪声区间计算，策略需跳过该日）
+    lookback_start = current_date - timedelta(days=15)
+    calendar_resp = quote_ctx.trading_days(get_market(symbol), lookback_start, current_date)
+    half_trading_days = set(calendar_resp.half_trading_days)
+    # trading_days 与 half_trading_days 是独立列表，全交易日历需取并集
+    all_trading_days = sorted(set(calendar_resp.trading_days) | half_trading_days)
     is_trade_day = current_date in calendar_resp.trading_days
-    is_half_trade_day = current_date in calendar_resp.half_trading_days
+    is_half_trade_day = current_date in half_trading_days
+
+    # 找到当前日期之前最近的一个交易日（含半日），判断它是否为半交易日
+    prev_days = [d for d in all_trading_days if d < current_date]
+    prev_trading_day = prev_days[-1] if prev_days else None
+    prev_is_half = prev_trading_day is not None and prev_trading_day in half_trading_days
     updated_at = now_et.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = sqlite3.connect(MARKET_DATA_DB_PATH)
@@ -265,6 +276,8 @@ def upsert_trading_calendar(quote_ctx, symbol):
         ("calendar_date", current_date.isoformat(), updated_at),
         ("is_trading_day", "1" if is_trade_day else "0", updated_at),
         ("is_half_trading_day", "1" if is_half_trade_day else "0", updated_at),
+        ("prev_trading_day", prev_trading_day.isoformat() if prev_trading_day else "", updated_at),
+        ("prev_trading_day_is_half", "1" if prev_is_half else "0", updated_at),
     ])
     conn.commit()
     conn.close()

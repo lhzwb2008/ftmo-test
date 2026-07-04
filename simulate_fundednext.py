@@ -885,7 +885,7 @@ def is_trading_day(symbol=None):
         conn = sqlite3.connect(MARKET_DATA_DB_PATH)
         rows = conn.execute("""
         SELECT key, value FROM service_state
-        WHERE key IN ('calendar_date', 'is_trading_day', 'is_half_trading_day')
+        WHERE key IN ('calendar_date', 'is_trading_day', 'is_half_trading_day', 'prev_trading_day_is_half')
         """).fetchall()
         conn.close()
     except Exception as e:
@@ -903,6 +903,11 @@ def is_trading_day(symbol=None):
 
     if state.get('is_trading_day') != '1':
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日不是交易日，不进行交易")
+        return False, False
+
+    # 上一交易日为半交易日时，其午后分钟数据缺失会污染噪声区间计算（lookback=1 时下午 sigma 完全缺失），跳过当日交易
+    if state.get('prev_trading_day_is_half') == '1':
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 上一交易日为半交易日，历史数据不完整，不进行交易")
         return False, False
 
     return True, False
