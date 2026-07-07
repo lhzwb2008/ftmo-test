@@ -31,11 +31,14 @@ ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
 LEVERAGE = 2  # 杠杆倍数（默认值，启动时按轮次自动设置）
 
-# 风控比例（The Trading Pit CFD 2-Phase 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏均 5%。若为 1-Phase 产品: 目标 10%、日亏仅 4%）
-PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
-PHASE_LEVERAGE = {"1": 2, "2": 2, "funded": 1.5}  # 各轮次杠杆倍数
+# 风控比例（The Trading Pit CFD 官方规则:
+#   2-Phase: Phase1 目标 8% / Phase2 5% / Funded 无目标；每日回撤 4% / 最大回撤 8%（追踪日终 EOD）⚠️ 若官方为 4% 则 0.045 偏高，需人工确认后改为 0.036
+#   1-Phase(1p): 目标 10%；每日回撤 3% / 最大回撤 6%（追踪日终 EOD））
+PHASE_PROFIT_TARGET_PCT = {"1p": 0.10, "1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
+PHASE_LEVERAGE = {"1p": 1.5, "1": 2, "2": 2, "funded": 1.5}  # 各轮次杠杆倍数（1p 回撤更严，降杠杆至 1.5）
+PHASE_DAILY_LOSS_PCT = {"1p": 0.028, "1": 0.045, "2": 0.045, "funded": 0.045}  # 各轮次日内止损比例（官方限额留缓冲: 1-Phase 3%→2.8%, 2-Phase 5%→4.5%）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
-DAILY_LOSS_PCT = 0.045     # 日内止损比例（2-Phase 官方 5%，留 10% 缓冲；1-Phase 官方 4% 时请改为 0.036）
+DAILY_LOSS_PCT = 0.045     # 日内止损比例（默认值，启动时按轮次自动设置）
 TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标；账户达标会被平台自动关停，止盈只是兜底，宁可超出也不能因检测/成交间价格回撤而差一点没到）
 
 # 止盈止损设置（金额）——启动时按上述比例自动计算，请勿手动修改
@@ -120,13 +123,13 @@ class Logger:
 def prompt_capital_settings():
     """启动时交互输入考试轮次、账户起始资金与当前金额；按轮次自动设置杠杆并计算账户止盈/日内止损金额"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
-    global PROFIT_TARGET_PCT, LEVERAGE
+    global PROFIT_TARGET_PCT, LEVERAGE, DAILY_LOSS_PCT
     
     while True:
         try:
-            phase = input("请输入当前轮次（1=第一轮 / 2=第二轮 / funded=已通过考试）: ").strip().lower()
+            phase = input("请输入当前轮次（1p=一阶段账户 / 1=两阶段第一轮 / 2=两阶段第二轮 / funded=已通过考试）: ").strip().lower()
             if phase not in PHASE_PROFIT_TARGET_PCT:
-                print("错误: 轮次必须是 1、2 或 funded，请重新输入")
+                print("错误: 轮次必须是 1p、1、2 或 funded，请重新输入")
                 continue
             start_str = input("请输入账户起始资金（如 100000）: ").strip()
             current_str = input("请输入账户当前金额（如 100000）: ").strip()
@@ -146,10 +149,15 @@ def prompt_capital_settings():
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
     LEVERAGE = PHASE_LEVERAGE[phase]
+    DAILY_LOSS_PCT = PHASE_DAILY_LOSS_PCT[phase]
     
-    phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
+    phase_label = {"1p": "一阶段账户(1-Phase)", "1": "两阶段第一轮", "2": "两阶段第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
+    print(f"日内止损比例: {DAILY_LOSS_PCT*100:.1f}% (按轮次自动设置)")
+    if phase == "1p":
+        print("⚠️ 提醒: 1-Phase 账户最大回撤为 6%（追踪日终 EOD 高水位），比两阶段的 8% 更严格，注意控制连续亏损日")
+        print("⚠️ 提醒: 杠杆不会自动同步到 MT5。1-Phase 账户请在 EA 输入参数中将 Leverage 手动改为 1.5，否则实盘手数与模拟不一致")
     if phase == "funded":
         print("⚠️ 提醒: 杠杆不会自动同步到 MT5。Funded 账户请在 EA 输入参数中将 Leverage 手动改为 1.5，否则实盘手数与模拟不一致")
     print(f"账户起始资金: ${start_balance:.2f}")
