@@ -1945,7 +1945,7 @@ if __name__ == "__main__":
     NT8_CLIENT = create_client_or_none(NT8_ACCOUNT, NT8_INSTRUMENT, NT8_INCOMING_DIR)
     if NT8_CLIENT is not None:
         print("⚠️ 提醒: ATI 文件接口无法查询持仓, 本程序假设启动时账户无持仓; 若 NT8 中已有持仓请先手动平掉")
-        print("⚠️ 提醒: 每季度合约换月时, 请更新 .env 中的 NT8_INSTRUMENT (如 MNQ 12-26 → MNQ 03-27)")
+        print("⚠️ 提醒: 每季度合约换月时, 请更新本文件顶部的 NT8_INSTRUMENT (如 MNQ 09-26 → MNQ 12-26)")
 
     run_trading_strategy(
         symbol=SYMBOL,
