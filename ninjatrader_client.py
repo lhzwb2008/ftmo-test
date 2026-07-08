@@ -11,10 +11,10 @@ Windows 服务器上的准备工作:
     2. Tools → Options → Automated trading interface → 勾选 "AT Interface" 启用 ATI
     3. NT8 与本脚本跑在同一台 Windows 机器上
 
-环境变量（写在 .env 中）:
-    NT8_ACCOUNT=FNFTCHWENBOZHANG87184   # NT8 里的账户名（Accounts 标签页 Name 列, 非 Display Name）
-    NT8_INSTRUMENT=MNQ 12-26            # NT8 格式的合约名（含到期月, 每季度换月时需手动更新!）
-    NT8_INCOMING_DIR=                   # 可选: incoming 文件夹路径, 默认 ~/Documents/NinjaTrader 8/incoming
+账户/合约配置直接写在各 simulate_*.py 顶部（同一台机器可运行多家 prop firm 的程序, 各自传入自己的账户）:
+    NT8_ACCOUNT   NT8 里的账户名（Accounts 标签页 Name 列, 非 Display Name）
+    NT8_INSTRUMENT  NT8 格式的合约名（含到期月, 每季度换月时需手动更新!）
+    incoming_dir  可选: incoming 文件夹路径, 默认 ~/Documents/NinjaTrader 8/incoming（同机所有程序共用同一目录）
 
 ATI 指令格式（分号分隔, 可选字段留空但保留分号）:
     PLACE;<账户>;<合约>;<BUY|SELL>;<手数>;MARKET;0;0;DAY;;;;
@@ -39,17 +39,17 @@ def default_incoming_dir():
 
 
 class NinjaTraderClient:
-    def __init__(self):
-        self.account = os.environ.get("NT8_ACCOUNT")
-        self.instrument = os.environ.get("NT8_INSTRUMENT")
-        self.incoming_dir = os.environ.get("NT8_INCOMING_DIR") or default_incoming_dir()
+    def __init__(self, account, instrument, incoming_dir=None):
+        self.account = account
+        self.instrument = instrument
+        self.incoming_dir = incoming_dir or default_incoming_dir()
 
         missing = [k for k, v in {
-            "NT8_ACCOUNT": self.account,
-            "NT8_INSTRUMENT": self.instrument,
+            "account": self.account,
+            "instrument": self.instrument,
         }.items() if not v]
         if missing:
-            raise NinjaTraderError(f"缺少环境变量: {', '.join(missing)}")
+            raise NinjaTraderError(f"缺少配置: {', '.join(missing)}（请在 simulate 脚本顶部填写）")
 
         if not os.path.isdir(self.incoming_dir):
             raise NinjaTraderError(
@@ -91,10 +91,10 @@ class NinjaTraderClient:
         return os.path.basename(path)
 
 
-def create_client_or_none(logger_print=print):
+def create_client_or_none(account, instrument, incoming_dir=None, logger_print=print):
     """尝试创建客户端; 缺少配置或 incoming 目录不可用时返回 None(仅记录信号模式)。"""
     try:
-        client = NinjaTraderClient()
+        client = NinjaTraderClient(account, instrument, incoming_dir)
         logger_print(f"NinjaTrader ATI 已就绪: 账户={client.account}, 合约={client.instrument}")
         logger_print(f"OIF 指令目录: {os.path.abspath(client.incoming_dir)}")
         logger_print("⚠️ 请确认 NT8 客户端已登录且 ATI 开关已启用, 否则指令文件不会被执行")

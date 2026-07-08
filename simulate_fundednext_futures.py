@@ -31,6 +31,11 @@ load_dotenv(override=True)
 # 信号计算品种（行情来自 longport_data_service 缓存, QQQ 与 NQ 高度同步）
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
+# NinjaTrader 8 ATI 账户配置（直接写在本文件里, 一台机器可同时运行多家 prop firm 程序, 各用各的账户）
+NT8_ACCOUNT = "FNFTCHWENBOZHANG87184"  # NT8 Accounts 标签页 Name 列的账户名（非 Display Name）
+NT8_INSTRUMENT = "MNQ 09-26"  # NT8 格式合约名; ⚠️ 每季度换月手动更新（3/6/9/12 月, 如 MNQ 09-26 → MNQ 12-26）
+NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming（同机所有程序共用）
+
 # 期货合约换算: MNQ 每点 $2, MNQ 名义价值 = NQ指数 × $2 ≈ QQQ价格 × NQ_QQQ_RATIO × $2
 MNQ_POINT_VALUE = 2.0
 NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.0'))  # NQ 指数 / QQQ 价格 比例（会随分红缓慢漂移, 定期核对）
@@ -1937,7 +1942,7 @@ if __name__ == "__main__":
 
     # 初始化 NinjaTrader ATI 客户端（缺配置时进入仅记录信号模式）
     print("\n--- NinjaTrader ATI 连接 ---")
-    NT8_CLIENT = create_client_or_none()
+    NT8_CLIENT = create_client_or_none(NT8_ACCOUNT, NT8_INSTRUMENT, NT8_INCOMING_DIR)
     if NT8_CLIENT is not None:
         print("⚠️ 提醒: ATI 文件接口无法查询持仓, 本程序假设启动时账户无持仓; 若 NT8 中已有持仓请先手动平掉")
         print("⚠️ 提醒: 每季度合约换月时, 请更新 .env 中的 NT8_INSTRUMENT (如 MNQ 12-26 → MNQ 03-27)")
