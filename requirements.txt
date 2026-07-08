@@ -3,3 +3,4 @@ numpy
 pytz
 python-dotenv
 longport
+requests
