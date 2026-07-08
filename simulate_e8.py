@@ -715,7 +715,7 @@ def check_exit_conditions(df, position_quantity, current_stop):
 def daily_loss_monitor_thread(symbol, position_data):
     """
     日内止盈止损监控线程
-    每分钟检查一次当前总盈亏（已实现+未实现），一旦超过止盈或止损限制立即设置强制平仓标志
+    每10秒检查一次当前总盈亏（已实现+未实现），一旦超过止盈或止损限制立即设置强制平仓标志
     注意：盈亏计算包含杠杆
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
@@ -828,12 +828,12 @@ def daily_loss_monitor_thread(symbol, position_data):
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] " + " | ".join(status_parts))
             
-            # 等待60秒后再次检查
-            time_module.sleep(60)
+            # 等待10秒后再次检查（缩短轮询间隔，减少日内止损触发到平仓的延迟）
+            time_module.sleep(10)
             
         except Exception as e:
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 发生错误: {str(e)}")
-            time_module.sleep(60)
+            time_module.sleep(10)
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已停止 ===")
 
@@ -1249,7 +1249,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             wait_seconds = (next_trigger_time - now).total_seconds()
             if wait_seconds > 0:
-                wait_seconds = min(wait_seconds, 60)  # 最多等待1分钟，以便及时响应止盈止损信号
+                wait_seconds = min(wait_seconds, 15)  # 最多等待15秒，以便及时响应监控线程设置的强制平仓标志
                 
                 # 止盈止损检查已由监控线程处理，此处不再重复检查
                 
