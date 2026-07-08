@@ -38,7 +38,7 @@ NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming（�
 
 # 期货合约换算: MNQ 每点 $2, MNQ 名义价值 = NQ指数 × $2 ≈ QQQ价格 × NQ_QQQ_RATIO × $2
 MNQ_POINT_VALUE = 2.0
-NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.0'))  # NQ 指数 / QQQ 价格 比例（会随分红缓慢漂移, 定期核对）
+NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ 指数 / QQQ 价格 比例（2026-07-08 校准: 29200/704.4; 会随分红缓慢漂移, 建议每季度换月时一并核对）
 MAX_CONTRACTS = 50  # Flex 合约上限: 50 Micros
 
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/风控金额）
