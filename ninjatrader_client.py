@@ -58,16 +58,28 @@ class NinjaTraderClient:
                 "或通过 NT8_INCOMING_DIR 指定正确路径"
             )
 
+    MAX_WRITE_RETRIES = 6
+
     def _write_oif(self, lines):
-        """原子写入 OIF 文件: 先写临时文件再改名, 避免 NT8 读到半截文件。返回最终文件路径。"""
-        fname = f"oif_{int(time.time() * 1000)}"
-        tmp_path = os.path.join(self.incoming_dir, fname + ".tmp")
-        final_path = os.path.join(self.incoming_dir, fname + ".txt")
-        with open(tmp_path, "w", encoding="ascii", newline="\r\n") as f:
-            for line in lines:
-                f.write(line + "\n")
-        os.rename(tmp_path, final_path)
-        return final_path
+        """直接写 .txt 到 incoming 目录。
+        ⚠️ 不能用 tmp+rename 的原子写法: NT8 ATI 监听的是文件"创建"事件——
+        改名不触发处理(指令被无视), 而 .tmp 落盘会被 NT8 立刻抢占报 Unknown OIF file type
+        并锁住文件导致改名 WinError 5(2026-07-08 实盘已踩坑)。
+        指令只有一行, 单次 write+close 足够快, 半截文件风险可忽略。
+        失败(目录被杀毒软件等瞬时锁定)则指数退避重试, 每次换新文件名。"""
+        last_err = None
+        for attempt in range(self.MAX_WRITE_RETRIES):
+            fname = f"oif_{int(time.time() * 1000)}_{attempt}"
+            final_path = os.path.join(self.incoming_dir, fname + ".txt")
+            try:
+                with open(final_path, "w", encoding="ascii", newline="\r\n") as f:
+                    for line in lines:
+                        f.write(line + "\n")
+                return final_path
+            except OSError as e:
+                last_err = e
+                time.sleep(0.5 * (attempt + 1))
+        raise NinjaTraderError(f"OIF 写入重试 {self.MAX_WRITE_RETRIES} 次后仍失败: {last_err}")
 
     def place_market_order(self, action, qty):
         """市价单。action: 'Buy'/'Sell', qty: 手数(正整数)。返回 OIF 文件名作为订单标识。"""

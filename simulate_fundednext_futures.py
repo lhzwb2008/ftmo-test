@@ -699,6 +699,15 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
             return oif_name
     except Exception as e:
         print(f"[{ts}] ❌ NT8 指令写入失败: {str(e)}")
+        if is_close:
+            # 平仓失败绝不能不了了之: 用 FLATTENEVERYTHING 兜底(平掉该 NT8 下所有持仓+撤销挂单)
+            try:
+                oif_name = NT8_CLIENT.flatten_everything()
+                print(f"[{ts}] ⚠️ 平仓指令失败, 已改用 FLATTENEVERYTHING 兜底 ({oif_name}), 请到 NT8 核对持仓已清零")
+                return oif_name
+            except Exception as e2:
+                print(f"[{ts}] ❌❌❌ FLATTENEVERYTHING 兜底也失败: {str(e2)}")
+                print(f"[{ts}] ❌❌❌ 严重: 平仓指令未能送达 NT8, 真实持仓可能仍然敞口, 请立即人工到 NT8 平仓!!!")
         return "ATI_ERROR"
 
 def check_exit_conditions(df, position_quantity, current_stop):
