@@ -1271,6 +1271,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
         # 检查是否是交易时间结束点，如果是且有持仓，则强制平仓
         is_trading_end = (current_hour, current_minute) == (trading_end_time[0], trading_end_time[1])
+        # 兜底：到达交易结束时间点时，空仓也不再开新仓，避免尾盘开仓被持仓过夜
+        if is_trading_end and position_quantity == 0:
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已到交易结束时间 {trading_end_time[0]:02d}:{trading_end_time[1]:02d}，当前空仓，跳过开仓检查")
+            continue
         if is_trading_end and position_quantity != 0:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间为交易结束时间 {trading_end_time[0]}:{trading_end_time[1]}，执行平仓")
             
