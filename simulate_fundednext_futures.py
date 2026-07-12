@@ -14,7 +14,7 @@ import platform
 
 from trend_er5_gate import history_days_back, apply_er5_gate_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
-from ninjatrader_client import create_client_or_none
+from ninjatrader_client import create_client_or_none, sanitize_file_tag
 
 load_dotenv(override=True)
 
@@ -27,15 +27,19 @@ load_dotenv(override=True)
 #   合约上限: 5 Minis 或 50 Micros（MNQ）
 # 回测结论（真实两年数据）: 不加日内止损、保留策略自带追踪止损, 杠杆 1.0x
 # （1.0x 使每一份 Flex 购买费用对应的风险/收益价值最大化）
+#
+# 多账户并行: 一进程一账户。启动时交互输入 NT8 账户名与资金;
+# tag 由账户名自动生成, 日志与信号库按 tag 隔离; 行情缓存与 NT8 incoming 共用。
 # ============================================================================
 
 # 信号计算品种（行情来自 longport_data_service 缓存, QQQ 与 NQ 高度同步）
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
-# NinjaTrader 8 ATI 账户配置（直接写在本文件里, 一台机器可同时运行多家 prop firm 程序, 各用各的账户）
-NT8_ACCOUNT = "FNFTCHWENBOZHANG87184"  # NT8 Accounts 标签页 Name 列的账户名（非 Display Name）
-NT8_INSTRUMENT = "MNQ 09-26"  # NT8 格式合约名; ⚠️ 每季度换月手动更新（3/6/9/12 月, 如 MNQ 09-26 → MNQ 12-26）
-NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming（同机所有程序共用）
+# NinjaTrader 8 ATI（账户在启动时交互输入; 合约写在此处, 换月时改）
+NT8_ACCOUNT = ""  # 启动时交互输入: NT8 Accounts 标签页 Name 列（非 Display Name）
+NT8_INSTRUMENT = "MNQ 09-26"  # ⚠️ 每季度换月手动更新（3/6/9/12 月）
+NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming
+INSTANCE_TAG = None  # 由账户名自动生成, 用于日志/DB/OIF 隔离
 
 # 期货合约换算: MNQ 每点 $2, MNQ 名义价值 = NQ指数 × $2 ≈ QQQ价格 × NQ_QQQ_RATIO × $2
 MNQ_POINT_VALUE = 2.0
@@ -61,7 +65,7 @@ MAX_DAILY_LOSS_AMOUNT = -1  # 日内止损: Flex 无日损限制且回测证明�
 MAX_DAILY_PROFIT_AMOUNT = -1  # 单日利润上限: Flex 无此规则, 固定禁用
 MAX_LOSS_FUSE_AMOUNT = -1  # 追踪回撤保险丝金额（自动计算 = 起始资金 × 2.5% × 90%）
 
-# 交易时间设置
+# 交易时间设置（写死; 多开时各进程策略相同, 靠不同 NT8 账户隔离）
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
 TRADING_END_TIME = (15, 40)   # 交易结束时间：15点40分
 CHECK_INTERVAL_MINUTES = 15   # 检查间隔（分钟）
@@ -92,8 +96,9 @@ LOG_VERBOSE = False  # 设置为True开启详细日志（主循环/等待/时间
 # 程序内部变量 - 请勿手动修改
 # ============================================================================
 
-# 日志文件路径
+# 日志 / 信号库路径（启动确定 INSTANCE_TAG 后由 apply_instance_paths 赋值）
 LOG_FILE = "trading_fundednext_futures.log"
+DB_PATH = "trading_signals_fundednext_futures.db"
 
 # 收益统计变量
 TOTAL_PNL = 0.0  # 总收益（累计）
@@ -122,6 +127,9 @@ class Logger:
     def __init__(self, log_file):
         self.terminal = sys.stdout
         self.log_file = log_file
+        log_dir = os.path.dirname(os.path.abspath(log_file))
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         # 创建日志文件（追加模式）
         self.log = open(log_file, 'a', encoding='utf-8', buffering=1)
         # 写入分隔线标记新的启动
@@ -143,11 +151,44 @@ class Logger:
     def close(self):
         self.log.close()
 
+
+def apply_instance_paths(tag):
+    """按 tag 隔离日志与信号库; 行情缓存仍共用。"""
+    global INSTANCE_TAG, LOG_FILE, DB_PATH
+    INSTANCE_TAG = sanitize_file_tag(tag)
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    LOG_FILE = os.path.join(log_dir, f"fn_futures_{INSTANCE_TAG}.log")
+    DB_PATH = os.path.join(get_common_files_dir(), f"trading_signals_fn_futures_{INSTANCE_TAG}.db")
+    return INSTANCE_TAG
+
+
+def prompt_instance_identity():
+    """交互输入 NT8 账户名; tag 由账户名自动生成。"""
+    global NT8_ACCOUNT
+
+    account = ""
+    while not account:
+        try:
+            account = input("请输入 NT8 账户名（Accounts 标签页 Name 列, 必填）: ").strip()
+        except EOFError:
+            print("错误: 无法读取输入，程序退出")
+            sys.exit(1)
+        if not account:
+            print("错误: 账户名不能为空")
+
+    NT8_ACCOUNT = account
+    apply_instance_paths(account)
+    print(f"实例账户: {NT8_ACCOUNT}")
+    print(f"实例 tag(自动): {INSTANCE_TAG}")
+    return INSTANCE_TAG
+
+
 def prompt_capital_settings():
-    """启动时交互输入考试轮次、账户起始资金与当前金额；按轮次自动设置杠杆并计算止盈/追踪回撤保险丝金额"""
+    """启动时交互输入考试轮次、账户起始资金与当前金额。"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_LOSS_FUSE_AMOUNT
     global PROFIT_TARGET_PCT, LEVERAGE, EOD_HIGH_WATER
-    
+
     while True:
         try:
             phase = input("请输入当前轮次（1=挑战阶段(FundedNext Flex) / funded=已通过考试）: ").strip().lower()
@@ -170,15 +211,15 @@ def prompt_capital_settings():
         except ValueError:
             print("错误: 输入格式不正确，请输入数字")
         except EOFError:
-            print("错误: 无法读取输入（非交互环境），程序退出")
+            print("错误: 无法读取输入，程序退出")
             sys.exit(1)
-    
+
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
     EOD_HIGH_WATER = high_water
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
     LEVERAGE = PHASE_LEVERAGE[phase]
-    
+
     phase_label = {"1": "挑战阶段(FundedNext Flex)", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     print(f"杠杆倍数: {LEVERAGE}x (最优: 1.0x 单位 Flex 费用价值最大, 不加日内止损)")
@@ -189,9 +230,8 @@ def prompt_capital_settings():
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"EOD 高水位: ${high_water:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
-    
+
     if PROFIT_TARGET_PCT > 0:
-        # 账户止盈金额 = 起始资金 × 目标比例 − 已有盈利 + 余量（覆盖手续费/滑点损耗）
         tp_buffer = start_balance * TP_BUFFER_PCT
         MAX_PROFIT_AMOUNT = start_balance * PROFIT_TARGET_PCT - (current_balance - start_balance) + tp_buffer
         print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 起始资金 × {PROFIT_TARGET_PCT*100:.1f}% − 已有盈亏 + 余量 ${tp_buffer:.2f})")
@@ -201,15 +241,15 @@ def prompt_capital_settings():
     else:
         MAX_PROFIT_AMOUNT = -1
         print("账户止盈: 已禁用（Funded 账户无利润目标）")
-    
-    # 追踪回撤保险丝 = 起始资金 × 2.5% × 90% 缓冲（相对 EOD 高水位; 触及即全平并永久停止, 防止真实穿线违规）
+
     MAX_LOSS_FUSE_AMOUNT = start_balance * MAX_LOSS_PCT * MAX_LOSS_BUFFER
     fuse_floor = EOD_HIGH_WATER - MAX_LOSS_FUSE_AMOUNT
     official_floor = EOD_HIGH_WATER - start_balance * MAX_LOSS_PCT
     print(f"追踪回撤保险丝: 净值 ≤ ${fuse_floor:.2f} 即强制全平停机 (官方违规线 ${official_floor:.2f}, 预留 {MAX_LOSS_PCT*(1-MAX_LOSS_BUFFER)*100:.2f}% 缓冲)")
     print("ℹ️ 日内止损: 已禁用（Flex 无日损规则; 真实回测显示叠加日内止损会掐掉日内回血、恶化通过率）")
 
-# SQLite数据库路径 - 使用MT5通用目录
+
+# SQLite / 公共目录工具（信号库路径由 apply_instance_paths 按 tag 设置）
 def get_common_files_dir():
     if platform.system() == "Windows":
         appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
@@ -217,9 +257,6 @@ def get_common_files_dir():
         os.makedirs(mt5_common_path, exist_ok=True)
         return mt5_common_path
     return "."
-
-
-DB_PATH = os.path.join(get_common_files_dir(), "trading_signals_fundednext_futures.db")
 
 
 def get_market_data_db_path():
@@ -689,26 +726,27 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
     try:
         if is_close:
             oif_name, _ = NT8_CLIENT.close_all()
-            print(f"[{ts}] NT8 平仓指令已写入: CLOSEPOSITION ({oif_name})")
+            print(f"[{ts}] NT8 平仓指令已写入: CLOSEPOSITION 账户={NT8_CLIENT.account} ({oif_name})")
             return oif_name
         else:
             if quantity <= 0:
                 print(f"[{ts}] 错误: 开仓手数为 0, 不下单")
                 return "QTY_ERROR"
             oif_name = NT8_CLIENT.place_market_order(side, quantity)
-            print(f"[{ts}] NT8 开仓指令已写入: {side} {quantity} 手 {NT8_CLIENT.instrument} ({oif_name})")
+            print(f"[{ts}] NT8 开仓指令已写入: {side} {quantity} 手 {NT8_CLIENT.instrument} 账户={NT8_CLIENT.account} ({oif_name})")
             return oif_name
     except Exception as e:
         print(f"[{ts}] ❌ NT8 指令写入失败: {str(e)}")
         if is_close:
-            # 平仓失败绝不能不了了之: 用 FLATTENEVERYTHING 兜底(平掉该 NT8 下所有持仓+撤销挂单)
+            # 多账户并行时禁止 FLATTENEVERYTHING（会误伤其他账户）; 仅重试本账户 CLOSEPOSITION
             try:
-                oif_name = NT8_CLIENT.flatten_everything()
-                print(f"[{ts}] ⚠️ 平仓指令失败, 已改用 FLATTENEVERYTHING 兜底 ({oif_name}), 请到 NT8 核对持仓已清零")
+                oif_name, _ = NT8_CLIENT.close_all()
+                print(f"[{ts}] ⚠️ 平仓指令首次失败后已重试 CLOSEPOSITION 账户={NT8_CLIENT.account} ({oif_name})")
                 return oif_name
             except Exception as e2:
-                print(f"[{ts}] ❌❌❌ FLATTENEVERYTHING 兜底也失败: {str(e2)}")
+                print(f"[{ts}] ❌❌❌ CLOSEPOSITION 重试仍失败: {str(e2)}")
                 print(f"[{ts}] ❌❌❌ 严重: 平仓指令未能送达 NT8, 真实持仓可能仍然敞口, 请立即人工到 NT8 平仓!!!")
+                print(f"[{ts}] ❌❌❌ 未使用 FLATTENEVERYTHING（多账户模式下会误平其他账户）")
         return "ATI_ERROR"
 
 def check_exit_conditions(df, position_quantity, current_stop):
@@ -1894,22 +1932,32 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             time_module.sleep(sleep_seconds)
 
 if __name__ == "__main__":
-    # 启用日志记录（同时输出到控制台和文件）
-    sys.stdout = Logger(LOG_FILE)
-    sys.stderr = sys.stdout  # 错误信息也记录到日志
-    
+    # 先确定账户/tag 与隔离路径, 再接管 stdout 写日志
     print("\n" + "=" * 60)
-    print("FundedNext Futures Flex 交易策略启动 (NinjaTrader ATI, MNQ)")
+    print("FundedNext Futures Flex 交易策略启动 (NinjaTrader ATI, MNQ, 多账户可并行)")
     print("=" * 60)
-    
+    print("\n--- 实例身份 (一进程一账户) ---")
+    prompt_instance_identity()
+
+    sys.stdout = Logger(LOG_FILE)
+    sys.stderr = sys.stdout
+
+    print("\n" + "=" * 60)
+    print(f"实例 tag={INSTANCE_TAG} | NT8账户={NT8_ACCOUNT}")
+    print("=" * 60)
+
     print("\n--- 账户资金设置 ---")
     prompt_capital_settings()
-    
-    print("版本: 1.0.0")
+
+    print("版本: 1.1.0 (multi-account)")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
+    print(f"实例 tag: {INSTANCE_TAG}")
+    print(f"NT8 账户: {NT8_ACCOUNT}")
+    print(f"NT8 合约: {NT8_INSTRUMENT}")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
-    print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
-    
+    print(f"信号数据库: {os.path.abspath(DB_PATH)}")
+    print(f"行情缓存数据库(共用): {os.path.abspath(MARKET_DATA_DB_PATH)}")
+
     print("\n--- 用户配置参数 ---")
     print(f"信号品种: {SYMBOL} (行情) → 交易合约: MNQ (NinjaTrader ATI)")
     print(f"NQ/QQQ 换算比例: {NQ_QQQ_RATIO} (请定期核对, 会随分红缓慢漂移)")
@@ -1924,14 +1972,14 @@ if __name__ == "__main__":
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")
     print(f"策略参数: {format_k_strategy_params(K1, K2, LOOKBACK_DAYS, ENABLE_K_SIDE_ADJUSTMENT)}")
-    
+
     print("\n--- 动态追踪止盈配置 ---")
     print(f"动态追踪止盈: {'已启用' if ENABLE_TRAILING_TAKE_PROFIT else '已禁用'}")
     if ENABLE_TRAILING_TAKE_PROFIT:
         print(f"  激活阈值: {TRAILING_TP_ACTIVATION_PCT*100:.1f}% (浮盈达到此比例后激活)")
         print(f"  保护比例: {TRAILING_TP_CALLBACK_PCT*100:.0f}% (保护最大浮盈的此比例)")
         print("  触发后当日停止开仓: 是")
-    
+
     print("\n--- 调试配置 ---")
     if DEBUG_MODE:
         print("调试模式: 已开启（使用固定时间）")
@@ -1942,24 +1990,25 @@ if __name__ == "__main__":
     else:
         print("调试模式: 已关闭（使用当前时间）")
     print(f"详细日志: {'已开启' if LOG_VERBOSE else '已关闭'}")
-    
+
     print("\n--- 运行时状态 ---")
     print(f"初始 TOTAL_PNL: ${TOTAL_PNL:.2f}")
     print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     print("=" * 60 + "\n")
-    
+
     if not ensure_market_data_service_available():
         sys.exit(1)
 
-    # 初始化SQLite数据库
     init_sqlite_database()
 
-    # 初始化 NinjaTrader ATI 客户端（缺配置时进入仅记录信号模式）
     print("\n--- NinjaTrader ATI 连接 ---")
-    NT8_CLIENT = create_client_or_none(NT8_ACCOUNT, NT8_INSTRUMENT, NT8_INCOMING_DIR)
+    NT8_CLIENT = create_client_or_none(
+        NT8_ACCOUNT, NT8_INSTRUMENT, NT8_INCOMING_DIR, file_tag=INSTANCE_TAG
+    )
     if NT8_CLIENT is not None:
-        print("⚠️ 提醒: ATI 文件接口无法查询持仓, 本程序假设启动时账户无持仓; 若 NT8 中已有持仓请先手动平掉")
+        print("⚠️ 提醒: ATI 文件接口无法查询持仓, 本程序假设启动时该账户无持仓; 若 NT8 中已有持仓请先手动平掉")
         print("⚠️ 提醒: 每季度合约换月时, 请更新本文件顶部的 NT8_INSTRUMENT (如 MNQ 09-26 → MNQ 12-26)")
+        print("⚠️ 提醒: 多账户并行时仅对本账户发 CLOSEPOSITION, 不会使用 FLATTENEVERYTHING")
 
     run_trading_strategy(
         symbol=SYMBOL,

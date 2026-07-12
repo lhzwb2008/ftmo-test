@@ -11,17 +11,19 @@ Windows 服务器上的准备工作:
     2. Tools → Options → Automated trading interface → 勾选 "AT Interface" 启用 ATI
     3. NT8 与本脚本跑在同一台 Windows 机器上
 
-账户/合约配置直接写在各 simulate_*.py 顶部（同一台机器可运行多家 prop firm 的程序, 各自传入自己的账户）:
-    NT8_ACCOUNT   NT8 里的账户名（Accounts 标签页 Name 列, 非 Display Name）
-    NT8_INSTRUMENT  NT8 格式的合约名（含到期月, 每季度换月时需手动更新!）
+账户/合约配置由各 simulate_*.py 在启动时传入（一台机器可多开多个进程, 各管各的账户）:
+    account       NT8 里的账户名（Accounts 标签页 Name 列, 非 Display Name）
+    instrument    NT8 格式的合约名（含到期月, 每季度换月时需手动更新!）
     incoming_dir  可选: incoming 文件夹路径, 默认 ~/Documents/NinjaTrader 8/incoming（同机所有程序共用同一目录）
+    file_tag      可选: 写入 OIF 文件名的短标签, 多进程并行时避免文件名碰撞
 
 ATI 指令格式（分号分隔, 可选字段留空但保留分号）:
     PLACE;<账户>;<合约>;<BUY|SELL>;<手数>;MARKET;0;0;DAY;;;;
     CLOSEPOSITION;<账户>;<合约>;;;;;;;;;;
-    FLATTENEVERYTHING;;;;;;;;;;;;
+    FLATTENEVERYTHING;;;;;;;;;;;;   # 危险: 平掉该 NT8 下全部账户; 多账户场景请勿使用
 """
 import os
+import re
 import time
 import platform
 
@@ -38,18 +40,27 @@ def default_incoming_dir():
     return os.path.join(".", "nt8_incoming")
 
 
+def sanitize_file_tag(tag):
+    """OIF 文件名只保留安全字符, 避免路径/空格问题。"""
+    if not tag:
+        return "nt8"
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(tag).strip())
+    return cleaned[:48] or "nt8"
+
+
 class NinjaTraderClient:
-    def __init__(self, account, instrument, incoming_dir=None):
+    def __init__(self, account, instrument, incoming_dir=None, file_tag=None):
         self.account = account
         self.instrument = instrument
         self.incoming_dir = incoming_dir or default_incoming_dir()
+        self.file_tag = sanitize_file_tag(file_tag or account)
 
         missing = [k for k, v in {
             "account": self.account,
             "instrument": self.instrument,
         }.items() if not v]
         if missing:
-            raise NinjaTraderError(f"缺少配置: {', '.join(missing)}（请在 simulate 脚本顶部填写）")
+            raise NinjaTraderError(f"缺少配置: {', '.join(missing)}（请在启动参数或脚本中填写）")
 
         if not os.path.isdir(self.incoming_dir):
             raise NinjaTraderError(
@@ -66,10 +77,11 @@ class NinjaTraderClient:
         改名不触发处理(指令被无视), 而 .tmp 落盘会被 NT8 立刻抢占报 Unknown OIF file type
         并锁住文件导致改名 WinError 5(2026-07-08 实盘已踩坑)。
         指令只有一行, 单次 write+close 足够快, 半截文件风险可忽略。
-        失败(目录被杀毒软件等瞬时锁定)则指数退避重试, 每次换新文件名。"""
+        失败(目录被杀毒软件等瞬时锁定)则指数退避重试, 每次换新文件名。
+        文件名含 file_tag, 多进程并行时避免碰撞。"""
         last_err = None
         for attempt in range(self.MAX_WRITE_RETRIES):
-            fname = f"oif_{int(time.time() * 1000)}_{attempt}"
+            fname = f"oif_{self.file_tag}_{int(time.time() * 1000)}_{attempt}"
             final_path = os.path.join(self.incoming_dir, fname + ".txt")
             try:
                 with open(final_path, "w", encoding="ascii", newline="\r\n") as f:
@@ -98,16 +110,17 @@ class NinjaTraderClient:
         return os.path.basename(path), None
 
     def flatten_everything(self):
-        """紧急指令: 平掉该 NT8 客户端下所有账户所有持仓并撤销全部挂单。"""
+        """紧急指令: 平掉该 NT8 客户端下所有账户所有持仓并撤销全部挂单。
+        ⚠️ 多账户并行时严禁调用——会误伤其他进程管理的账户。"""
         path = self._write_oif(["FLATTENEVERYTHING;;;;;;;;;;;;"])
         return os.path.basename(path)
 
 
-def create_client_or_none(account, instrument, incoming_dir=None, logger_print=print):
+def create_client_or_none(account, instrument, incoming_dir=None, file_tag=None, logger_print=print):
     """尝试创建客户端; 缺少配置或 incoming 目录不可用时返回 None(仅记录信号模式)。"""
     try:
-        client = NinjaTraderClient(account, instrument, incoming_dir)
-        logger_print(f"NinjaTrader ATI 已就绪: 账户={client.account}, 合约={client.instrument}")
+        client = NinjaTraderClient(account, instrument, incoming_dir, file_tag=file_tag)
+        logger_print(f"NinjaTrader ATI 已就绪: 账户={client.account}, 合约={client.instrument}, tag={client.file_tag}")
         logger_print(f"OIF 指令目录: {os.path.abspath(client.incoming_dir)}")
         logger_print("⚠️ 请确认 NT8 客户端已登录且 ATI 开关已启用, 否则指令文件不会被执行")
         return client
