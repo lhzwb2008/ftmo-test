@@ -14,7 +14,7 @@ import platform
 
 from trend_er5_gate import history_days_back, apply_er5_gate_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
-from tradovate_client import create_client_or_none
+from ninjatrader_client import create_client_or_none
 
 load_dotenv(override=True)
 
@@ -32,9 +32,14 @@ load_dotenv(override=True)
 # 信号计算品种（行情来自 longport_data_service 缓存, QQQ 与 NQ 高度同步）
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
+# NinjaTrader 8 ATI 账户配置（直接写在本文件里, 一台机器可同时运行多家 prop firm 程序, 各用各的账户）
+NT8_ACCOUNT = "FNFTCHWENBOZHANG87184"  # NT8 Accounts 标签页 Name 列的账户名（非 Display Name）
+NT8_INSTRUMENT = "MNQ 09-26"  # NT8 格式合约名; ⚠️ 每季度换月手动更新（3/6/9/12 月, 如 MNQ 09-26 → MNQ 12-26）
+NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming（同机所有程序共用）
+
 # 期货合约换算: MNQ 每点 $2, MNQ 名义价值 = NQ指数 × $2 ≈ QQQ价格 × NQ_QQQ_RATIO × $2
 MNQ_POINT_VALUE = 2.0
-NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.0'))  # NQ 指数 / QQQ 价格 比例（会随分红缓慢漂移, 定期核对）
+NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ 指数 / QQQ 价格 比例（2026-07-08 校准: 29200/704.4; 会随分红缓慢漂移, 建议每季度换月时一并核对）
 MAX_CONTRACTS = 50  # Flex 合约上限: 50 Micros
 
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/风控金额）
@@ -106,8 +111,8 @@ TRAILING_FUSE_TRIGGERED = False  # 是否触发追踪回撤保险丝（触发后
 DAILY_LOSS_MONITOR_ACTIVE = False  # 风控监控线程是否激活
 FORCE_CLOSE_POSITION = False  # 强制平仓标志（监控线程设置）
 
-# Tradovate 客户端（主程序启动时初始化; None=仅记录信号模式）
-TRADOVATE = None
+# NinjaTrader ATI 客户端（主程序启动时初始化; None=仅记录信号模式）
+NT8_CLIENT = None
 
 # 线程锁，用于保护共享变量
 pnl_lock = threading.Lock()
@@ -300,7 +305,7 @@ def init_sqlite_database():
         abs_db = os.path.abspath(DB_PATH)
         print(f"[{ts}] SQLite 已清空旧信号并重建表（未消费记录已删除）")
         print(f"数据库路径: {abs_db}")
-        print(f"[{ts}] 说明：期货模式下 SQLite 仅作信号留痕, 实际下单通过 Tradovate API, 无需 MT5 EA。")
+        print(f"[{ts}] 说明：期货模式下 SQLite 仅作信号留痕, 实际下单通过 NinjaTrader ATI 指令文件, 无需 MT5 EA。")
         
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
@@ -669,8 +674,8 @@ def calculate_contract_qty(qqq_price):
     return min(qty, MAX_CONTRACTS)
 
 def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False):
-    """下单: 通过 Tradovate API 实际成交; 同时把信号写入 SQLite 留痕。
-    开仓时 quantity 为 MNQ 手数; 平仓时忽略 quantity, 平掉全部净持仓。"""
+    """下单: 写 ATI 指令文件由 NinjaTrader 8 执行; 同时把信号写入 SQLite 留痕。
+    开仓时 quantity 为 MNQ 手数; 平仓时忽略 quantity, 由 NT8 CLOSEPOSITION 平掉全部持仓。"""
     if is_close:
         action = "CLOSE"
     else:
@@ -678,27 +683,33 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
     signal_id = write_signal_to_sqlite(action)
     ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
 
-    if TRADOVATE is None:
+    if NT8_CLIENT is None:
         return f"SIM_{signal_id}" if signal_id else "SIM_ERROR"
 
     try:
         if is_close:
-            order_id, closed_qty = TRADOVATE.close_all()
-            if order_id is None:
-                print(f"[{ts}] Tradovate 无持仓, 平仓指令忽略")
-                return f"NOPOS_{signal_id}"
-            print(f"[{ts}] Tradovate 平仓单已提交: {'Sell' if side == 'Sell' else 'Buy'} {closed_qty} 手, 订单ID={order_id}")
-            return order_id
+            oif_name, _ = NT8_CLIENT.close_all()
+            print(f"[{ts}] NT8 平仓指令已写入: CLOSEPOSITION ({oif_name})")
+            return oif_name
         else:
             if quantity <= 0:
                 print(f"[{ts}] 错误: 开仓手数为 0, 不下单")
                 return "QTY_ERROR"
-            order_id = TRADOVATE.place_market_order(side, quantity)
-            print(f"[{ts}] Tradovate 开仓单已提交: {side} {quantity} 手 MNQ, 订单ID={order_id}")
-            return order_id
+            oif_name = NT8_CLIENT.place_market_order(side, quantity)
+            print(f"[{ts}] NT8 开仓指令已写入: {side} {quantity} 手 {NT8_CLIENT.instrument} ({oif_name})")
+            return oif_name
     except Exception as e:
-        print(f"[{ts}] ❌ Tradovate 下单失败: {str(e)}")
-        return "API_ERROR"
+        print(f"[{ts}] ❌ NT8 指令写入失败: {str(e)}")
+        if is_close:
+            # 平仓失败绝不能不了了之: 用 FLATTENEVERYTHING 兜底(平掉该 NT8 下所有持仓+撤销挂单)
+            try:
+                oif_name = NT8_CLIENT.flatten_everything()
+                print(f"[{ts}] ⚠️ 平仓指令失败, 已改用 FLATTENEVERYTHING 兜底 ({oif_name}), 请到 NT8 核对持仓已清零")
+                return oif_name
+            except Exception as e2:
+                print(f"[{ts}] ❌❌❌ FLATTENEVERYTHING 兜底也失败: {str(e2)}")
+                print(f"[{ts}] ❌❌❌ 严重: 平仓指令未能送达 NT8, 真实持仓可能仍然敞口, 请立即人工到 NT8 平仓!!!")
+        return "ATI_ERROR"
 
 def check_exit_conditions(df, position_quantity, current_stop):
     # 获取当前时间点
@@ -1791,7 +1802,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: {price}, VWAP: {latest_row['VWAP']:.4f}, 上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
                 
-                # 期货模式：计算 MNQ 手数后通过 Tradovate 下单，盈亏仍按全仓模型计算
+                # 期货模式：计算 MNQ 手数后通过 NT8 ATI 下单，盈亏仍按全仓模型计算
                 side = "Buy" if signal > 0 else "Sell"
                 contract_qty = calculate_contract_qty(latest_price)
                 if contract_qty <= 0:
@@ -1888,7 +1899,7 @@ if __name__ == "__main__":
     sys.stderr = sys.stdout  # 错误信息也记录到日志
     
     print("\n" + "=" * 60)
-    print("FundedNext Futures Flex 交易策略启动 (Tradovate 直连, MNQ)")
+    print("FundedNext Futures Flex 交易策略启动 (NinjaTrader ATI, MNQ)")
     print("=" * 60)
     
     print("\n--- 账户资金设置 ---")
@@ -1900,7 +1911,7 @@ if __name__ == "__main__":
     print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
     
     print("\n--- 用户配置参数 ---")
-    print(f"信号品种: {SYMBOL} (行情) → 交易合约: MNQ (Tradovate)")
+    print(f"信号品种: {SYMBOL} (行情) → 交易合约: MNQ (NinjaTrader ATI)")
     print(f"NQ/QQQ 换算比例: {NQ_QQQ_RATIO} (请定期核对, 会随分红缓慢漂移)")
     print(f"账户起始资金: ${ACCOUNT_START_BALANCE:.2f}")
     print(f"账户当前金额(仓位基准): ${INITIAL_CAPITAL:.2f}")
@@ -1943,16 +1954,12 @@ if __name__ == "__main__":
     # 初始化SQLite数据库
     init_sqlite_database()
 
-    # 初始化 Tradovate 客户端（缺配置时进入仅记录信号模式）
-    print("\n--- Tradovate 连接 ---")
-    TRADOVATE = create_client_or_none()
-    if TRADOVATE is not None:
-        try:
-            existing_pos = TRADOVATE.get_net_position()
-            if existing_pos != 0:
-                print(f"⚠️ 警告: Tradovate 账户已有 {existing_pos} 手净持仓, 本程序假设启动时无持仓, 请先手动处理")
-        except Exception as e:
-            print(f"⚠️ 启动时查询持仓失败: {e}")
+    # 初始化 NinjaTrader ATI 客户端（缺配置时进入仅记录信号模式）
+    print("\n--- NinjaTrader ATI 连接 ---")
+    NT8_CLIENT = create_client_or_none(NT8_ACCOUNT, NT8_INSTRUMENT, NT8_INCOMING_DIR)
+    if NT8_CLIENT is not None:
+        print("⚠️ 提醒: ATI 文件接口无法查询持仓, 本程序假设启动时账户无持仓; 若 NT8 中已有持仓请先手动平掉")
+        print("⚠️ 提醒: 每季度合约换月时, 请更新本文件顶部的 NT8_INSTRUMENT (如 MNQ 09-26 → MNQ 12-26)")
 
     run_trading_strategy(
         symbol=SYMBOL,
