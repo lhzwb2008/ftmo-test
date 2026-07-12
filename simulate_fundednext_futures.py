@@ -25,7 +25,8 @@ load_dotenv(override=True)
 #                无日内亏损限制 | Consistency 40%（最佳单日利润 <= 总利润 40%）| 无时间限制
 #   Funded:      最大亏损 2.5%（EOD 追踪）| 无 Consistency | 每 5 天可提款
 #   合约上限: 5 Minis 或 50 Micros（MNQ）
-# 回测结论（真实两年数据）: 不加日内止损、保留策略自带追踪止损, 杠杆 1.5x
+# 回测结论（真实两年数据）: 不加日内止损、保留策略自带追踪止损, 杠杆 1.0x
+# （1.0x 使每一份 Flex 购买费用对应的风险/收益价值最大化）
 # ============================================================================
 
 # 信号计算品种（行情来自 longport_data_service 缓存, QQQ 与 NQ 高度同步）
@@ -39,10 +40,10 @@ MAX_CONTRACTS = 50  # Flex 合约上限: 50 Micros
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/风控金额）
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-LEVERAGE = 1.5  # 杠杆倍数（默认值，启动时按轮次自动设置）
+LEVERAGE = 1.0  # 杠杆倍数（默认值，启动时按轮次自动设置）
 
 PHASE_PROFIT_TARGET_PCT = {"1": 0.05, "funded": -1}  # 挑战期目标 5%；Funded 无目标
-PHASE_LEVERAGE = {"1": 1.5, "funded": 1.5}  # 回测最优: 1.5x, 不加日内止损
+PHASE_LEVERAGE = {"1": 1.0, "funded": 1.0}  # 最优: 1.0x（单位 Flex 费用价值最大）, 不加日内止损
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 MAX_LOSS_PCT = 0.025       # 官方最大亏损 2.5%（EOD 追踪高水位）
 MAX_LOSS_BUFFER = 0.9      # 保险丝缓冲: 到官方线 90%（即 2.25%）即强制平仓, 防滑点击穿
@@ -175,7 +176,7 @@ def prompt_capital_settings():
     
     phase_label = {"1": "挑战阶段(FundedNext Flex)", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
-    print(f"杠杆倍数: {LEVERAGE}x (真实两年回测最优: 1.5x, 不加日内止损)")
+    print(f"杠杆倍数: {LEVERAGE}x (最优: 1.0x 单位 Flex 费用价值最大, 不加日内止损)")
     print(f"ℹ️ Flex 最大亏损 {MAX_LOSS_PCT*100:.1f}%（EOD 追踪高水位）| 无日内亏损限制 | 合约上限 {MAX_CONTRACTS} 张 MNQ")
     if phase == "1":
         print(f"ℹ️ 挑战期 Consistency 规则: 最佳单日利润 ≤ 总利润 {CONSISTENCY_PCT*100:.0f}%（程序自动统计, 达标才触发止盈）")
@@ -657,7 +658,7 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     return df
 
 def calculate_contract_qty(qqq_price):
-    """按 1.5x 杠杆计算 MNQ 手数: floor(当前金额 × 杠杆 / MNQ名义价值), 限制在 [1, MAX_CONTRACTS]"""
+    """按杠杆计算 MNQ 手数: floor(当前金额 × 杠杆 / MNQ名义价值), 限制在 [1, MAX_CONTRACTS]"""
     if qqq_price is None or qqq_price <= 0:
         return 0
     mnq_notional = qqq_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
