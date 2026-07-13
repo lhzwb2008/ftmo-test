@@ -1126,6 +1126,23 @@ def is_trading_day(symbol=None):
 
     return True, False
 
+
+def wait_seconds_until_next_session(now, trading_start_time, calendar_stale=False):
+    """非交易日等待时长：日历过期短间隔重试；否则睡到下一美东自然日的开盘时间。
+
+    避免固定睡 12 小时导致周日晚启动后周一开盘仍在睡眠、错过早盘。
+    """
+    if calendar_stale:
+        return 3600  # 1 小时
+
+    next_day = now.date() + timedelta(days=1)
+    next_check = datetime.combine(
+        next_day,
+        time(trading_start_time[0], trading_start_time[1]),
+        tzinfo=now.tzinfo,
+    )
+    return max((next_check - now).total_seconds(), 60)
+
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
@@ -1329,10 +1346,15 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"  当日盈亏: ${DAILY_PNL:+.2f}")
                     print(f"  累计盈亏: ${TOTAL_PNL:+.2f}")
                     print("=" * 50)
-            retry_hours = 1 if calendar_stale else 12
-            next_check_time = now + timedelta(hours=retry_hours)
-            wait_seconds = (next_check_time - now).total_seconds()
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {retry_hours} 小时后重新检查")
+            wait_seconds = wait_seconds_until_next_session(
+                now, trading_start_time, calendar_stale=calendar_stale
+            )
+            next_check_time = now + timedelta(seconds=wait_seconds)
+            print(
+                f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"{wait_seconds / 3600:.1f} 小时后重新检查"
+                f"（目标 {next_check_time.strftime('%Y-%m-%d %H:%M:%S')}）"
+            )
             time_module.sleep(wait_seconds)
             continue
             
