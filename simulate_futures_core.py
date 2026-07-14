@@ -4,7 +4,6 @@ import time as time_module
 import os
 import sys
 import pytz
-from math import floor
 from decimal import Decimal
 from dotenv import load_dotenv
 import numpy as np
@@ -24,7 +23,8 @@ class AccountRule:
     account_size: int
     profit_target: float
     max_loss: float
-    max_micro_contracts: int
+    max_micro_contracts: int  # 平台允许的 MNQ 上限
+    trade_contracts: int       # 策略固定开仓手数（约合 1~1.5x 名义；不随行情/杠杆重算）
     minimum_trading_days: int = 0
     funded_micro_scaling: tuple = ()
 
@@ -47,9 +47,9 @@ FUNDEDNEXT_FLEX = FuturesProgram(
     model_name="Flex",
     account_prefix="FNFT",
     rules={
-        50_000: AccountRule(50_000, 2_500, 1_500, 30),
-        100_000: AccountRule(100_000, 5_000, 2_500, 50),
-        150_000: AccountRule(150_000, 8_000, 4_000, 80),
+        50_000: AccountRule(50_000, 2_500, 1_500, 30, 1),
+        100_000: AccountRule(100_000, 5_000, 2_500, 50, 2),
+        150_000: AccountRule(150_000, 8_000, 4_000, 80, 3),
     },
 )
 
@@ -59,10 +59,10 @@ TRADEIFY_SELECT_FLEX = FuturesProgram(
     model_name="Select Flex",
     account_prefix="TDFY",
     rules={
-        25_000: AccountRule(25_000, 1_500, 1_000, 10, 3, ((0, 10),)),
-        50_000: AccountRule(50_000, 3_000, 2_000, 40, 3, ((0, 20), (1_500, 30), (2_000, 40))),
-        100_000: AccountRule(100_000, 6_000, 3_000, 80, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80))),
-        150_000: AccountRule(150_000, 9_000, 4_500, 120, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80), (4_500, 120))),
+        25_000: AccountRule(25_000, 1_500, 1_000, 10, 1, 3, ((0, 10),)),
+        50_000: AccountRule(50_000, 3_000, 2_000, 40, 1, 3, ((0, 20), (1_500, 30), (2_000, 40))),
+        100_000: AccountRule(100_000, 6_000, 3_000, 80, 2, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80))),
+        150_000: AccountRule(150_000, 9_000, 4_500, 120, 3, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80), (4_500, 120))),
     },
 )
 
@@ -79,8 +79,8 @@ HISTORICAL_BEST_DAY_PROFIT = 0.0
 #                无日内亏损限制 | Consistency 40%（最佳单日利润 <= 总利润 40%）| 无时间限制
 #   Funded:      最大亏损 2.5%（EOD 追踪）| 无 Consistency | 每 5 天可提款
 #   合约上限: 5 Minis 或 50 Micros（MNQ）
-# 回测结论（真实两年数据）: 不加日内止损、保留策略自带追踪止损, 杠杆 1.0x
-# （1.0x 使每一份 Flex 购买费用对应的风险/收益价值最大化）
+# 回测结论（真实两年数据）: 不加日内止损、保留策略自带追踪止损；
+# 仓位按账户规模固定 MNQ 手数（约合 1~1.5x 名义），不再用 CFD 式连续杠杆折算。
 #
 # 多账户并行: 一进程一账户。启动时交互输入 NT8 账户名与资金;
 # tag 由账户名自动生成, 日志与信号库按 tag 隔离; 行情缓存与 NT8 incoming 共用。
@@ -95,17 +95,14 @@ NT8_INSTRUMENT = "MNQ 09-26"  # ⚠️ 每季度换月手动更新（3/6/9/12 �
 NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming
 INSTANCE_TAG = None  # 由账户名自动生成, 用于日志/DB/OIF 隔离
 
-# 期货合约换算: MNQ 每点 $2, MNQ 名义价值 = NQ指数 × $2 ≈ QQQ价格 × NQ_QQQ_RATIO × $2
+# 期货合约换算（仅用于盈亏估算）: MNQ 每点 $2, 名义 ≈ QQQ × NQ_QQQ_RATIO × $2
 MNQ_POINT_VALUE = 2.0
-NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ 指数 / QQQ 价格 比例（2026-07-08 校准: 29200/704.4; 会随分红缓慢漂移, 建议每季度换月时一并核对）
+NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ 指数 / QQQ 价格（2026-07-08 校准: 29200/704.4）
 MAX_CONTRACTS = ACTIVE_RULE.max_micro_contracts
 
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/风控金额）
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
-INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-LEVERAGE = 1.0  # 杠杆倍数（默认值，启动时按轮次自动设置）
-
-PHASE_LEVERAGE = {"1": 1.0, "funded": 1.0}  # 最优: 1.0x（单位 Flex 费用价值最大）, 不加日内止损
+INITIAL_CAPITAL = None  # 账户当前金额（启动时输入）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 MAX_LOSS_AMOUNT = ACTIVE_RULE.max_loss
 MAX_LOSS_BUFFER = 0.9      # 保险丝缓冲: 到官方线 90%（即 2.25%）即强制平仓, 防滑点击穿
@@ -252,7 +249,7 @@ def prompt_instance_identity():
 def prompt_capital_settings():
     """启动时交互输入考试轮次、账户起始资金与当前金额。"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_LOSS_FUSE_AMOUNT
-    global PROFIT_TARGET_PCT, LEVERAGE, EOD_HIGH_WATER, MAX_CONTRACTS
+    global PROFIT_TARGET_PCT, EOD_HIGH_WATER, MAX_CONTRACTS
     global MAX_LOSS_AMOUNT, ACTIVE_RULE, CURRENT_PHASE, COMPLETED_TRADING_DAYS
     global HISTORICAL_BEST_DAY_PROFIT
 
@@ -331,11 +328,13 @@ def prompt_capital_settings():
     lock_high_water = start_balance + MAX_LOSS_AMOUNT + ACTIVE_PROGRAM.drawdown_lock_buffer
     EOD_HIGH_WATER = min(high_water, lock_high_water)
     PROFIT_TARGET_PCT = ACTIVE_RULE.profit_target / start_balance if phase == "1" else -1
-    LEVERAGE = PHASE_LEVERAGE[phase]
 
     phase_label = {"1": f"挑战阶段({ACTIVE_PROGRAM.model_name})", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
-    print(f"杠杆倍数: {LEVERAGE}x (当前策略固定 1.0x, 不叠加日内止损)")
+    print(
+        f"固定开仓手数: {ACTIVE_RULE.trade_contracts} 张 MNQ"
+        f"（账户规模 ${account_size:,.0f}；平台上限 {current_max_contracts()} 张）"
+    )
     print(
         f"ℹ️ {ACTIVE_PROGRAM.model_name} 最大亏损 ${MAX_LOSS_AMOUNT:.0f}"
         f"（EOD 追踪，锁定底线 ${start_balance + ACTIVE_PROGRAM.drawdown_lock_buffer:.0f}）"
@@ -520,33 +519,22 @@ def get_current_positions():
     # 模拟模式总是返回空持仓，让策略可以正常运行
     return {}
 
-def calculate_pnl(entry_price, exit_price, direction):
+def calculate_pnl(entry_price, exit_price, direction, quantity=None):
     """
-    计算全仓盈亏
-    
-    盈亏 = 初始资金 × 杠杆 × 价格变动百分比 × 方向
-    
-    参数:
-        entry_price: 入场价格
-        exit_price: 出场价格
-        direction: 方向（1=多头，-1=空头）
-    
-    返回:
-        pnl: 盈亏金额
-        pnl_pct: 盈亏百分比（已乘杠杆）
+    按实际 MNQ 敞口计算盈亏。
+
+    盈亏 = 手数 × MNQ名义价值 × 价格变动百分比 × 方向
+    quantity 未传时按账户规则的固定手数估算。
     """
     if entry_price <= 0:
         return 0.0, 0.0
-    
-    # 价格变动百分比
+
     price_change_pct = (exit_price - entry_price) / entry_price
-    
-    # 考虑方向和杠杆的盈亏百分比
-    pnl_pct = price_change_pct * direction * LEVERAGE * 100  # 转为百分比
-    
-    # 实际盈亏金额 = 初始资金 × 杠杆 × 价格变动百分比 × 方向
-    pnl = INITIAL_CAPITAL * LEVERAGE * price_change_pct * direction
-    
+    qty = abs(quantity) if quantity else ACTIVE_RULE.trade_contracts
+    exposure = qty * entry_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
+
+    pnl = exposure * price_change_pct * direction
+    pnl_pct = (pnl / INITIAL_CAPITAL * 100) if INITIAL_CAPITAL else 0.0
     return pnl, pnl_pct
 
 def get_historical_data(symbol, days_back=None):
@@ -839,15 +827,12 @@ def current_max_contracts():
     return limit
 
 
-def calculate_contract_qty(qqq_price):
-    """按杠杆计算 MNQ 手数: floor(当前金额 × 杠杆 / MNQ名义价值), 限制在 [1, MAX_CONTRACTS]"""
-    if qqq_price is None or qqq_price <= 0:
-        return 0
-    mnq_notional = qqq_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
-    qty = floor(INITIAL_CAPITAL * LEVERAGE / mnq_notional)
-    if qty < 1:
-        print(f"警告: 资金不足一张 MNQ (名义价值 ${mnq_notional:.0f}), 不开仓")
-        return 0
+def calculate_contract_qty(qqq_price=None):
+    """按账户规模返回固定 MNQ 手数，不超过平台当前上限。
+
+    50K→1 / 100K→2 / 150K→3（约合 1~1.5x 名义）；不再按杠杆连续折算。
+    """
+    qty = ACTIVE_RULE.trade_contracts
     return min(qty, current_max_contracts())
 
 def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False):
@@ -954,7 +939,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     """
     日内止盈止损监控线程
     每分钟检查一次当前总盈亏（已实现+未实现），一旦超过止盈或止损限制立即设置强制平仓标志
-    注意：盈亏计算包含杠杆
+    注意：盈亏按实际 MNQ 手数名义计算
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
     global DAILY_PNL, PROFIT_TARGET_TRIGGERED, TRAILING_FUSE_TRIGGERED
@@ -970,7 +955,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 追踪保险丝线: ${EOD_HIGH_WATER - MAX_LOSS_FUSE_AMOUNT:.2f} (EOD 高水位 ${EOD_HIGH_WATER:.2f} − ${MAX_LOSS_FUSE_AMOUNT:.2f})")
     print(
         f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
-        f"日内止损: 已禁用 | 当前 MNQ 上限: {current_max_contracts()} | 杠杆倍数: {LEVERAGE}x"
+        f"日内止损: 已禁用 | 固定手数: {ACTIVE_RULE.trade_contracts} 张 MNQ | 平台上限: {current_max_contracts()}"
     )
     
     while DAILY_LOSS_MONITOR_ACTIVE:
@@ -1004,7 +989,7 @@ def daily_loss_monitor_thread(symbol, position_data):
                         
                         if current_price > 0:
                             direction = 1 if position_quantity > 0 else -1
-                            unrealized_pnl, _ = calculate_pnl(entry_price, current_price, direction)
+                            unrealized_pnl, _ = calculate_pnl(entry_price, current_price, direction, position_quantity)
                     except Exception as e:
                         if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 获取价格失败: {str(e)}")
@@ -1226,7 +1211,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 计算盈亏（全仓计算）
             if entry_price and current_price > 0:
                 direction = 1 if position_quantity > 0 else -1
-                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                 with pnl_lock:
                     DAILY_PNL += pnl
                     TOTAL_PNL += pnl
@@ -1299,7 +1284,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 计算盈亏（全仓计算）
                 if entry_price and current_price > 0:
                     direction = 1 if position_quantity > 0 else -1
-                    pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                    pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                     DAILY_PNL += pnl
                     TOTAL_PNL += pnl
                     # 记录平仓交易
@@ -1447,7 +1432,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 初始资金: ${INITIAL_CAPITAL:.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日盈亏: ${DAILY_PNL:+.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 累计盈亏: ${TOTAL_PNL:+.2f}")
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 固定手数: {ACTIVE_RULE.trade_contracts} 张 MNQ")
             if MAX_DAILY_LOSS_AMOUNT > 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内最大亏损限额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
             else:
@@ -1632,7 +1617,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 计算盈亏（全仓计算）
             if entry_price:
                 direction = 1 if position_quantity > 0 else -1
-                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {symbol} 出场价: {current_price}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:+.2f}%)")
                 # 更新收益统计
@@ -1728,7 +1713,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 计算盈亏（全仓计算）
                 if entry_price and current_price > 0:
                     direction = 1 if position_quantity > 0 else -1
-                    pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                    pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                     DAILY_PNL += pnl
                     TOTAL_PNL += pnl
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓盈亏: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
@@ -1918,7 +1903,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     # 计算盈亏（全仓计算）
                     if entry_price:
                         direction = 1 if position_quantity > 0 else -1
-                        pnl, pnl_pct = calculate_pnl(entry_price, exit_price, direction)
+                        pnl, pnl_pct = calculate_pnl(entry_price, exit_price, direction, position_quantity)
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {symbol} 出场价: {exit_price}")
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:+.2f}%)")
                         # 更新收益统计
@@ -2036,7 +2021,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: {price}, VWAP: {latest_row['VWAP']:.4f}, 上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
                 
-                # 期货模式：计算 MNQ 手数后通过 NT8 ATI 下单，盈亏仍按全仓模型计算
+                # 期货模式：按账户规模固定 MNQ 手数，经 NT8 ATI 下单；盈亏按实际手数名义计算
                 side = "Buy" if signal > 0 else "Sell"
                 contract_qty = calculate_contract_qty(latest_price)
                 if contract_qty <= 0:
@@ -2045,11 +2030,16 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 order_id = submit_order(symbol, side, contract_qty, outside_rth=outside_rth_setting)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 信号已发送，ID: {order_id}")
                 
-                # 记录持仓状态用于盈亏计算（1=多头，-1=空头）
-                position_quantity = 1 if signal > 0 else -1
+                # 记录持仓：符号表示方向，绝对值为 MNQ 手数
+                position_quantity = contract_qty if signal > 0 else -contract_qty
                 entry_price = latest_price
+                actual_notional = contract_qty * entry_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓信号: {side} {symbol} 入场价: {entry_price}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位: {contract_qty} 手 MNQ ≈ ${INITIAL_CAPITAL * LEVERAGE:.2f} 名义 (${INITIAL_CAPITAL:.2f} × {LEVERAGE}x, 上限 {current_max_contracts()} 手)")
+                print(
+                    f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位: {contract_qty} 手 MNQ "
+                    f"≈ ${actual_notional:.0f} 名义 "
+                    f"(规模 ${ACTIVE_RULE.account_size:,.0f} 固定手数, 平台上限 {current_max_contracts()} 手)"
+                )
                 
                 # 记录开仓交易
                 DAILY_TRADES.append({
@@ -2169,8 +2159,10 @@ def run_application(program):
     print(f"NQ/QQQ 换算比例: {NQ_QQQ_RATIO} (请定期核对, 会随分红缓慢漂移)")
     print(f"账户起始资金: ${ACCOUNT_START_BALANCE:.2f}")
     print(f"账户当前金额(仓位基准): ${INITIAL_CAPITAL:.2f}")
-    print(f"杠杆倍数: {LEVERAGE}x")
-    print(f"目标名义仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (当前金额 × 杠杆, 折算 MNQ 手数, 当前上限 {current_max_contracts()} 手)")
+    print(
+        f"固定开仓手数: {ACTIVE_RULE.trade_contracts} 张 MNQ "
+        f"(规模 ${ACTIVE_RULE.account_size:,.0f}; 平台上限 {current_max_contracts()} 手)"
+    )
     print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用, 需 consistency 达标'})")
     print(f"追踪回撤保险丝: ${MAX_LOSS_FUSE_AMOUNT:.2f} (官方最大回撤 ${MAX_LOSS_AMOUNT:.2f})")
     print("日内止损: 已禁用（当前模型无 DLL）")
