@@ -2203,8 +2203,8 @@ if __name__ == "__main__":
 
         # 🎯 动态追踪止盈配置
         'enable_trailing_take_profit': True,  # 是否启用动态追踪止盈
-        'trailing_tp_activation_pct': 0.001,  # 激活追踪止盈的最低浮盈百分比（1%），追踪的是qqq
-        'trailing_tp_callback_pct': 0.7,  # 保护的利润比例（70%），即从最大浮盈回撤30%时触发止盈
+        'trailing_tp_activation_pct': 0.006,  # 激活追踪止盈的最低浮盈百分比（0.6%），追踪的是qqq
+        'trailing_tp_callback_pct': 0.65,  # 保护的利润比例（65%），即从最大浮盈回撤35%时触发止盈
         # 开仓趋势门控：None=关闭。单 dict 或 [dict,...]（AND）。特征见 compute_daily_trend_features。
         'entry_trend_filter': {'metric': 'er5', 'min': 0.1}
         # 例：'entry_trend_filter': {'metric': 'weekly_sn', 'min': 0.65}

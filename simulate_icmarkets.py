@@ -58,8 +58,8 @@ USE_VWAP = False
 
 # 🎯 动态追踪止盈配置
 ENABLE_TRAILING_TAKE_PROFIT = True   # 是否启用动态追踪止盈
-TRAILING_TP_ACTIVATION_PCT = 0.01    # 激活追踪止盈的最低浮盈百分比（1%）
-TRAILING_TP_CALLBACK_PCT = 0.7       # 保护的利润比例（70%），即从最大浮盈回撤30%时触发止盈
+TRAILING_TP_ACTIVATION_PCT = 0.006   # 激活追踪止盈的最低浮盈百分比（0.6%），追踪的是qqq
+TRAILING_TP_CALLBACK_PCT = 0.65      # 保护的利润比例（65%），即从最大浮盈回撤35%时触发止盈
 
 # 调试模式配置
 DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
