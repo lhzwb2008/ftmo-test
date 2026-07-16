@@ -147,23 +147,23 @@ def prompt_capital_settings():
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
     LEVERAGE = PHASE_LEVERAGE[phase]
 
-    # Funded 账户：默认 1.5x；可选 0.5x（前 14 天保底 refund）
+    # Funded 账户：手动指定杠杆（回车=默认 PHASE_LEVERAGE['funded']；如 0.5/1/1.5）
     if phase == "funded":
         while True:
             try:
                 lev_str = input(
-                    f"Funded 杠杆选择（回车=默认 {PHASE_LEVERAGE['funded']}x / 输入 0.5=保底refund）: "
+                    f"请输入 Funded 杠杆倍数（回车=默认 {PHASE_LEVERAGE['funded']}x，例如 0.5 / 1 / 1.5）: "
                 ).strip()
                 if lev_str == "":
                     LEVERAGE = PHASE_LEVERAGE["funded"]
                     break
                 lev = float(lev_str)
-                if lev in (0.5, 1.5):
+                if lev > 0:
                     LEVERAGE = lev
                     break
-                print("错误: Funded 杠杆仅支持 0.5 或 1.5，请重新输入")
+                print("错误: 杠杆必须大于 0，请重新输入")
             except ValueError:
-                print("错误: 请输入 0.5，或直接回车使用默认 1.5x")
+                print("错误: 请输入有效数字（如 1），或直接回车使用默认值")
             except EOFError:
                 print("错误: 无法读取输入（非交互环境），程序退出")
                 sys.exit(1)
@@ -171,8 +171,7 @@ def prompt_capital_settings():
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     if phase == "funded":
-        mode_note = "保底refund / 最低风险" if LEVERAGE == 0.5 else "默认"
-        print(f"杠杆倍数: {LEVERAGE}x ({mode_note})")
+        print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
         print(f"⚠️ 提醒: 杠杆不会自动同步到 MT5。Funded 账户请在 EA 输入参数中将 Leverage 手动改为 {LEVERAGE}，否则实盘手数与模拟不一致")
     else:
         print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
