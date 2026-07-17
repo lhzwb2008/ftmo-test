@@ -12,7 +12,7 @@ import threading
 import platform
 from dataclasses import dataclass
 
-from trend_er5_gate import history_days_back, apply_er5_gate_to_signal
+from trend_er5_gate import history_days_back, apply_entry_gates_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
 from ninjatrader_client import create_client_or_none, sanitize_file_tag
 
@@ -2015,7 +2015,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
-            signal = apply_er5_gate_to_signal(signal, df, LOG_VERBOSE, now.strftime('%Y-%m-%d %H:%M:%S'))
+            signal = apply_entry_gates_to_signal(signal, df, LOG_VERBOSE, now.strftime('%Y-%m-%d %H:%M:%S'))
             if signal != 0:
                 # 保留交易信号日志，并添加VWAP和上下界信息
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")
