@@ -73,6 +73,7 @@ def compute_daily_trend_features(minute_df):
     - trend_dist_high20: 前收盘相对 20 日高点的距离 (close/high20-1)
     - trend_dist_low20: 前收盘相对 20 日低点的距离 (close/low20-1)
     - trend_price_rank60: 前收盘在 60 日高低区间中的位置 [0,1]，价格水位
+    - trend_range1: 昨日日内振幅 (High-Low)/Close，shift(1) 对齐开盘前可知
     """
     if 'Volume' in minute_df.columns:
         d = minute_df.groupby('Date', as_index=False).agg(
@@ -130,6 +131,7 @@ def compute_daily_trend_features(minute_df):
 
     rng = (d['High'] - d['Low']) / c.replace(0, np.nan)
     d['trend_range5'] = rng.rolling(5, min_periods=5).mean().shift(1)
+    d['trend_range1'] = rng.shift(1)  # 昨日振幅；开盘前可知，无未来函数
 
     delta = c.diff()
     gain = delta.clip(lower=0)
@@ -162,7 +164,7 @@ def compute_daily_trend_features(minute_df):
 
     return d[[
         'Date', 'weekly_trend_strength', 'trend_er5', 'trend_linreg5_r2', 'trend_dist_ma20',
-        'trend_range5', 'trend_rsi5', 'trend_vol_ratio', 'trend_mom5',
+        'trend_range5', 'trend_range1', 'trend_rsi5', 'trend_vol_ratio', 'trend_mom5',
         'trend_dist_high20', 'trend_dist_low20', 'trend_price_rank60',
     ]]
 
@@ -281,6 +283,8 @@ def _single_entry_trend_pass_series(df, filt):
         'rsi5': 'trend_rsi5',
         'vol_ratio': 'trend_vol_ratio',
         'range5': 'trend_range5',
+        'range1': 'trend_range1',
+        'sigma': 'sigma',
     }.get(metric, metric)
     if col not in df.columns:
         raise ValueError(f"缺少趋势列 {col}，请确认已 merge compute_daily_trend_features")
@@ -1147,7 +1151,7 @@ def run_backtest(config):
         price_df = price_df[price_df['Date'] <= end_date]
 
     price_df = pd.merge(price_df, trend_feat_df, on='Date', how='left')
-    price_df['entry_trend_pass'] = compute_entry_trend_pass_series(price_df, config)
+    # entry_trend_pass 延后到 sigma / 日内特征算完后再写（支持 sigma、minutes_from_open 等门控）
     
     print(f"加载{ticker}数据: {data_path} ({start_date} ~ {end_date})")
     
@@ -1295,6 +1299,9 @@ def run_backtest(config):
     k1_base = config.get('K1', 1)
     k2_base = config.get('K2', 1)
     price_df = apply_k_bounds(price_df, config)
+
+    # 开仓门控：放在 sigma 与边界之后，才能使用 sigma / minutes_from_open 等列
+    price_df['entry_trend_pass'] = compute_entry_trend_pass_series(price_df, config)
     
     # 根据检查间隔生成允许的交易时间
     allowed_times = []
@@ -1318,15 +1325,23 @@ def run_backtest(config):
         allowed_times.append(end_time_str)
         allowed_times.sort()
     
+    use_vwap = config.get('use_vwap', False)
+    enable_ttp = config.get('enable_trailing_take_profit', False)
+    ttp_act = config.get('trailing_tp_activation_pct', 0.005)
+    ttp_cb = config.get('trailing_tp_callback_pct', 0.5)
+    entry_filter = config.get('entry_trend_filter')
+    slip = config.get('slippage_per_share', 0)
     if config.get('enable_k_side_adjustment', False) and config.get('k_side_adjustment'):
         k1_rng = (price_df['K1_eff'].min(), price_df['K1_eff'].max())
         k2_rng = (price_df['K2_eff'].min(), price_df['K2_eff'].max())
-        print(
-            f"使用{check_interval_minutes}分钟检查间隔, K1基准={k1_base}, K2基准={k2_base}, "
-            f"动态K1∈[{k1_rng[0]:.2f},{k1_rng[1]:.2f}], 动态K2∈[{k2_rng[0]:.2f},{k2_rng[1]:.2f}]"
-        )
+        k_info = f"K1={k1_base}∈[{k1_rng[0]:.2f},{k1_rng[1]:.2f}], K2={k2_base}∈[{k2_rng[0]:.2f},{k2_rng[1]:.2f}]"
     else:
-        print(f"使用{check_interval_minutes}分钟检查间隔, K1={k1_base}, K2={k2_base}")
+        k_info = f"K1={k1_base}, K2={k2_base}"
+    ttp_info = f"TTP={ttp_act*100:.2f}%/{ttp_cb*100:.0f}%" if enable_ttp else "TTP=off"
+    print(
+        f"参数: interval={check_interval_minutes}m, {k_info}, leverage={leverage}x, "
+        f"VWAP={use_vwap}, {ttp_info}, filter={entry_filter}, slip={slip}"
+    )
     
     # 初始化回测变量
     capital = initial_capital
@@ -2160,15 +2175,18 @@ if __name__ == "__main__":
     # 创建配置字典
     config = {
         # 'data_path': 'qqq_market_hours_with_indicators.csv',
-        # 'data_path': 'qqq_longport.csv',  # 使用包含Turnover字段的longport数据
-        'data_path': 'qqq_longport_2year.csv',  # 使用包含Turnover字段的longport数据
+        'data_path': 'qqq_longport.csv',  # 使用包含Turnover字段的longport数据
+        # 'data_path': 'qqq_longport_2year.csv',  # 使用包含Turnover字段的longport数据
         'ticker': 'QQQ',
         'initial_capital': 100000,
         'lookback_days':1,
-        'start_date': date(2024, 7, 1),
-        'end_date': date(2026, 6, 30),
         # 'start_date': date(2020, 4, 1),
-        # 'end_date': date(2025, 4, 1),
+        # 'end_date': date(2024, 4, 1),
+        'start_date': date(2026, 1, 1),
+        'end_date': date(2026, 7, 20),
+        # 'start_date': date(2024, 7, 15),
+        # 'end_date': date(2026, 7, 15),
+       
         'check_interval_minutes': 15 ,
         'enable_transaction_fees': True,  # 是否启用手续费计算，False表示不计算手续费
         'transaction_fee_per_share': 0.008166,
@@ -2203,10 +2221,15 @@ if __name__ == "__main__":
 
         # 🎯 动态追踪止盈配置
         'enable_trailing_take_profit': True,  # 是否启用动态追踪止盈
-        'trailing_tp_activation_pct': 0.006,  # 激活追踪止盈的最低浮盈百分比（0.6%），追踪的是qqq
-        'trailing_tp_callback_pct': 0.65,  # 保护的利润比例（65%），即从最大浮盈回撤35%时触发止盈
+        'trailing_tp_activation_pct': 0.006,  # 激活追踪止盈的最低浮盈百分比（1%），追踪的是qqq
+        'trailing_tp_callback_pct': 0.65,  # 保护的利润比例（70%），即从最大浮盈回撤30%时触发止盈
         # 开仓趋势门控：None=关闭。单 dict 或 [dict,...]（AND）。特征见 compute_daily_trend_features。
-        'entry_trend_filter': {'metric': 'er5', 'min': 0.1}
+        # er5 + 昨日振幅上限 + 时段sigma下限；2年/5年双窗口验证
+        'entry_trend_filter': [
+            {'metric': 'er5', 'min': 0.1},
+            {'metric': 'range1', 'max': 0.029},
+            {'metric': 'sigma', 'min': 0.0003},
+        ],
         # 例：'entry_trend_filter': {'metric': 'weekly_sn', 'min': 0.65}
         # 'entry_trend_filter': {'metric': 'linreg5_r2', 'min': 0.46},
     }
