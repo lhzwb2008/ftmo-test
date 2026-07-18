@@ -54,12 +54,12 @@ MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 # 策略参数
 LOOKBACK_DAYS = 1  # 回看天数（用于计算噪声区域）
 K1 = 1  # 上边界sigma乘数（多头基准）
-K2 = 1  # 下边界sigma乘数（空头）
+K2 = 1.04  # 下边界sigma乘数（空头）
 ENABLE_K_SIDE_ADJUSTMENT = True  # 午后收紧多头 K（午前1.0/午后0.9）；False=全天固定 K1
 
 # VWAP开关：False=不使用VWAP作为入场/止损条件，True=使用VWAP
 USE_VWAP = False
-# er5 开仓门控（与 Quantra/backtest 一致）：开关与阈值见 trend_er5_gate.py
+# er5/range1/sigma 开仓门控（与 Quantra/backtest 一致）：开关与阈值见 trend_er5_gate.py
 
 # 🎯 动态追踪止盈配置（单笔浮盈回撤止盈，与 simulate_icmarkets 一致；触发后当日不再开仓）
 ENABLE_TRAILING_TAKE_PROFIT = True   # 是否启用动态追踪止盈
@@ -630,6 +630,7 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
             # 更新df中的边界值
             df.loc[(df["Date"] == target_date) & (df["Time"] == tm), "UpperBound"] = upper_bound
             df.loc[(df["Date"] == target_date) & (df["Time"] == tm), "LowerBound"] = lower_bound
+            df.loc[(df["Date"] == target_date) & (df["Time"] == tm), "sigma"] = sigma
     
     return df
 
@@ -1705,7 +1706,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
-            signal = apply_entry_gates_to_signal(signal, df, LOG_VERBOSE, now.strftime('%Y-%m-%d %H:%M:%S'))
+            signal = apply_entry_gates_to_signal(signal, df, LOG_VERBOSE, now.strftime('%Y-%m-%d %H:%M:%S'), current_sigma=latest_row.get('sigma'))
             if signal != 0:
                 # 保留交易信号日志，并添加VWAP和上下界信息
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")

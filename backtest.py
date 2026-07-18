@@ -1363,10 +1363,10 @@ def run_backtest(config):
     capital_peak = initial_capital  # 资金峰值（包含日内高点）
     precise_max_drawdown = 0  # 精确最大回撤金额
     precise_max_drawdown_pct = 0  # 精确最大回撤百分比
-    precise_mdd_date = None  # 精确最大回撤发生日期
+    precise_mdd_date = None  # 精确最大回撤发生日期（谷底日）
     current_peak_date = None  # 当前历史资金峰值日期
     precise_mdd_peak_date = None  # 最大回撤对应的峰值日期
-    
+    precise_mdd_peak_capital = None  # 触发该次最大回撤时的峰值权益
     # 如果指定了随机生成图表的数量，随机选择交易日
     days_with_trades = []
     if random_plots > 0:
@@ -1519,6 +1519,7 @@ def run_backtest(config):
             precise_max_drawdown_pct = current_precise_drawdown_pct
             precise_mdd_date = trade_date
             precise_mdd_peak_date = current_peak_date
+            precise_mdd_peak_capital = capital_peak
         
         # 打印每天的交易信息
         if trades and print_daily_trades:
@@ -1665,7 +1666,18 @@ def run_backtest(config):
         metrics['max_drawdown_date'] = pd.Timestamp(precise_mdd_date)
         if precise_mdd_peak_date is not None:
             metrics['max_drawdown_start_date'] = pd.Timestamp(precise_mdd_peak_date)
-        metrics['max_drawdown_end_date'] = None
+        # 恢复日：谷底之后，日终权益重新站上触发该次 MDD 时的峰值（勿无条件置 None）
+        peak_cap = precise_mdd_peak_capital
+        if peak_cap is None and precise_max_drawdown_pct > 0:
+            peak_cap = precise_max_drawdown / precise_max_drawdown_pct
+        recovery_end = None
+        if peak_cap is not None and len(daily_df) > 0:
+            trough_ts = pd.Timestamp(precise_mdd_date)
+            after = daily_df.loc[daily_df.index > trough_ts, 'capital']
+            recovered = after[after >= peak_cap]
+            if len(recovered) > 0:
+                recovery_end = recovered.index.min()
+        metrics['max_drawdown_end_date'] = recovery_end
     if metrics['mdd'] > 0:
         metrics['calmar_ratio'] = metrics['irr'] / metrics['mdd']
     else:
@@ -1708,6 +1720,16 @@ def run_backtest(config):
     print(f"{'波动率':<20} | {metrics['volatility']*100:>14.1f}% | {metrics['buy_hold_volatility']*100:>14.1f}%")
     print(f"{'夏普比率':<20} | {metrics['sharpe_ratio']:>14.2f} | {metrics['buy_hold_sharpe']:>14.2f}")
     print(f"{'最大回撤':<20} | {metrics['mdd']*100:>14.1f}% | {metrics['buy_hold_mdd']*100:>14.1f}%")
+    # Calmar = 年化收益率 / |最大回撤|（与上方 mdd 一致，含精确日内回撤修正后）
+    _calmar = metrics.get('calmar_ratio', 0.0)
+    if metrics.get('buy_hold_mdd', 0) and metrics['buy_hold_mdd'] > 0:
+        _bh_calmar = metrics['buy_hold_irr'] / metrics['buy_hold_mdd']
+    else:
+        _bh_calmar = float('inf') if metrics.get('buy_hold_irr', 0) > 0 else 0.0
+    metrics['buy_hold_calmar'] = _bh_calmar
+    _calmar_s = f"{_calmar:.2f}" if _calmar != float('inf') else "inf"
+    _bh_calmar_s = f"{_bh_calmar:.2f}" if _bh_calmar != float('inf') else "inf"
+    print(f"{'Calmar比率':<20} | {_calmar_s:>14} | {_bh_calmar_s:>14}")
     _mdd1d = max_intraday_mdd_pct * 100 if max_intraday_mdd_date is not None else None
     _loss1d = max_intraday_loss_from_start_pct * 100 if max_intraday_loss_from_start_date is not None else None
     if _loss1d is not None:
@@ -1719,17 +1741,22 @@ def run_backtest(config):
     else:
         print(f"{'单日峰谷最大回撤':<20} | {'-':>15} | {'-':>15}")
 
-    # 最大回撤详情
+    # 最大回撤详情：峰值日 → 谷底日 →（若有）恢复日
     if 'max_drawdown_start_date' in metrics and 'max_drawdown_date' in metrics:
         start_date = metrics['max_drawdown_start_date'].strftime('%Y-%m-%d')
         bottom_date = metrics['max_drawdown_date'].strftime('%Y-%m-%d')
-        if metrics['max_drawdown_end_date'] is not None:
+        if metrics.get('max_drawdown_end_date') is not None:
             end_date = metrics['max_drawdown_end_date'].strftime('%Y-%m-%d')
             duration = (metrics['max_drawdown_end_date'] - metrics['max_drawdown_start_date']).days
-            print(f"  回撤: {start_date} → {bottom_date} → 恢复: {end_date} (持续{duration}天)")
+            print(f"  回撤: {start_date}(峰值) → {bottom_date}(谷底) → {end_date}(恢复) (峰值到恢复共{duration}天)")
         else:
-            duration = (metrics['max_drawdown_date'] - metrics['max_drawdown_start_date']).days
-            print(f"  回撤: {start_date} → {bottom_date} (已持续{duration}天, 尚未恢复)")
+            to_trough = (metrics['max_drawdown_date'] - metrics['max_drawdown_start_date']).days
+            last_day = daily_df.index[-1]
+            open_days = (last_day - metrics['max_drawdown_start_date']).days
+            print(
+                f"  回撤: {start_date}(峰值) → {bottom_date}(谷底, 距峰值{to_trough}天); "
+                f"截至回测结束({last_day.strftime('%Y-%m-%d')})尚未回到该峰值 (已{open_days}天)"
+            )
     
     # 交易统计
     print(f"\n交易统计:")
@@ -2201,7 +2228,7 @@ if __name__ == "__main__":
         'print_daily_trades': False,
         'print_trade_details': False,
         'K1': 1,  # 上边界sigma乘数（多头）基准；午后动态见 k_side_adjustment
-        'K2': 1,  # 下边界sigma乘数（空头），本规则不调整空头
+        'K2': 1.04,  # 下边界sigma乘数（空头），本规则不调整空头
         'enable_k_side_adjustment': True,  # 动态 K 总开关；False 时忽略下方 k_side_adjustment，退化为固定 K1/K2
         # 午后收紧多头 K：开盘满 120 分钟后 K1=0.9（更易触发多），此前 K1=1
         'k_side_adjustment': {

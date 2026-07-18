@@ -1,5 +1,5 @@
 """
-与 Quantra/backtest.py 中 trend_er5（Kaufman 5 日效率比）及 entry_trend_filter er5 门控一致。
+与 Quantra/backtest.py 中 trend_er5（Kaufman 5 日效率比）及 entry_trend_filter 门控一致。
 供各 simulate_*.py 共用，避免重复粘贴。
 """
 import numpy as np
@@ -10,6 +10,9 @@ ENTRY_TREND_ER5_MIN = 0.1
 # 昨日振幅上限门控（与 Quantra/backtest.py entry_trend_filter range1 一致）
 ENABLE_RANGE1_FILTER = True
 ENTRY_TREND_RANGE1_MAX = 0.029
+# 时段 sigma 下限门控（与 Quantra/backtest.py entry_trend_filter sigma 一致）
+ENABLE_SIGMA_FILTER = True
+ENTRY_TREND_SIGMA_MIN = 0.0003
 MINUTE_HISTORY_CALENDAR_DAYS_FOR_ER5 = 20
 
 
@@ -67,20 +70,37 @@ def compute_trend_range1_latest(minute_df):
     return float(v) if pd.notna(v) else np.nan
 
 
-def apply_entry_gates_to_signal(signal, minute_df, log_verbose, now_str):
+def apply_entry_gates_to_signal(signal, minute_df, log_verbose, now_str, current_sigma=None):
     """
-    er5 门控 + 昨日振幅上限门控（AND）。与 Quantra/backtest.py 默认
-    entry_trend_filter [er5>=0.1, range1<=0.029] 对齐。特征为 nan 时不拦截。
+    er5 + 昨日振幅上限 + 时段 sigma 下限（AND）。与 Quantra/backtest.py 默认
+    entry_trend_filter [er5>=0.1, range1<=0.029, sigma>=0.0003] 对齐。
+    特征为 nan 时不拦截。
+    current_sigma: 当前检查 K 线的噪声 sigma（由 calculate_noise_area 写入）。
     """
     signal = apply_er5_gate_to_signal(signal, minute_df, log_verbose, now_str)
-    if signal == 0 or not ENABLE_RANGE1_FILTER:
+    if signal == 0:
         return signal
-    r1 = compute_trend_range1_latest(minute_df)
-    if pd.isna(r1) or r1 <= ENTRY_TREND_RANGE1_MAX:
+    if ENABLE_RANGE1_FILTER:
+        r1 = compute_trend_range1_latest(minute_df)
+        if not (pd.isna(r1) or r1 <= ENTRY_TREND_RANGE1_MAX):
+            if log_verbose:
+                print(
+                    f"[{now_str}] 振幅门控: trend_range1={r1:.4f} > {ENTRY_TREND_RANGE1_MAX}，跳过开仓"
+                )
+            return 0
+    if not ENABLE_SIGMA_FILTER:
+        return signal
+    if current_sigma is None:
+        return signal
+    try:
+        sigma_val = float(current_sigma)
+    except (TypeError, ValueError):
+        return signal
+    if pd.isna(sigma_val) or sigma_val >= ENTRY_TREND_SIGMA_MIN:
         return signal
     if log_verbose:
         print(
-            f"[{now_str}] 振幅门控: trend_range1={r1:.4f} > {ENTRY_TREND_RANGE1_MAX}，跳过开仓"
+            f"[{now_str}] Sigma门控: sigma={sigma_val:.6f} < {ENTRY_TREND_SIGMA_MIN}，跳过开仓"
         )
     return 0
 
