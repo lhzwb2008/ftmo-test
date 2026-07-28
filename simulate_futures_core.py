@@ -105,7 +105,6 @@ ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 MAX_LOSS_AMOUNT = ACTIVE_RULE.max_loss
-MAX_LOSS_BUFFER = 0.9      # 保险丝缓冲: 到官方线 90%（即 2.25%）即强制平仓, 防滑点击穿
 CONSISTENCY_PCT = ACTIVE_PROGRAM.consistency_pct
 TP_BUFFER_PCT = 0.005      # 止盈余量比例（按起始资金 0.5% 上调止盈目标, 覆盖手续费/滑点损耗）
 
@@ -113,7 +112,6 @@ TP_BUFFER_PCT = 0.005      # 止盈余量比例（按起始资金 0.5% 上调止
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
 MAX_DAILY_LOSS_AMOUNT = -1  # 日内止损: Flex 无日损限制且回测证明日内止损有害, 固定禁用
 MAX_DAILY_PROFIT_AMOUNT = -1  # 单日利润上限: Flex 无此规则, 固定禁用
-MAX_LOSS_FUSE_AMOUNT = -1  # 追踪回撤保险丝金额（自动计算 = 起始资金 × 2.5% × 90%）
 
 # 交易时间设置（写死; 多开时各进程策略相同, 靠不同 NT8 账户隔离）
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
@@ -162,7 +160,6 @@ EOD_HIGH_WATER = None  # EOD 追踪高水位（每日收盘后用账户净值更
 DAILY_STOP_TRIGGERED = False  # 当日是否触发了日内止损（Flex 禁用, 保留字段兼容主循环）
 DAILY_PROFIT_CAP_TRIGGERED = False  # 单日利润上限（Flex 禁用, 保留字段兼容主循环）
 PROFIT_TARGET_TRIGGERED = False  # 挑战止盈是否触发；触发后永久停止开仓，需重启并切换 funded
-TRAILING_FUSE_TRIGGERED = False  # 是否触发追踪回撤保险丝（触发后永久停止交易, 需人工介入）
 DAILY_LOSS_MONITOR_ACTIVE = False  # 风控监控线程是否激活
 FORCE_CLOSE_POSITION = False  # 强制平仓标志（监控线程设置）
 
@@ -248,7 +245,7 @@ def prompt_instance_identity():
 
 def prompt_capital_settings():
     """启动时交互输入考试轮次、账户起始资金与当前金额。"""
-    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_LOSS_FUSE_AMOUNT
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
     global PROFIT_TARGET_PCT, EOD_HIGH_WATER, MAX_CONTRACTS
     global MAX_LOSS_AMOUNT, ACTIVE_RULE, CURRENT_PHASE, COMPLETED_TRADING_DAYS
     global HISTORICAL_BEST_DAY_PROFIT
@@ -274,30 +271,17 @@ def prompt_capital_settings():
 
             start_balance = float(account_size)
             current_str = input(f"请输入账户当前金额（如 {account_size}）: ").strip()
-            hw_str = input(
-                "请输入账户历史 EOD 最高净值"
-                "（首次运行直接回车=取起始/当前较大者；已锁定回撤可输入当前最高值）: "
-            ).strip()
             current_balance = float(current_str)
-            high_water = float(hw_str) if hw_str else max(start_balance, current_balance)
+            # EOD 高水位默认取起始/当前较大者；进程内跨日会自动上移，重启后不再手输。
+            high_water = max(start_balance, current_balance)
             if current_balance <= 0:
                 print("错误: 金额必须大于 0，请重新输入")
-                continue
-            if high_water < max(start_balance, current_balance) * 0.999:
-                print("错误: 历史最高净值不应低于起始资金/当前金额，请重新输入")
                 continue
 
             existing_profit = max(0.0, current_balance - start_balance)
             if phase == "1":
-                minimum_days = ACTIVE_PROGRAM.rules[account_size].minimum_trading_days
-                if minimum_days > 0:
-                    days_str = input(
-                        f"请输入已完成的挑战交易日数（首次运行填 0；"
-                        f"{ACTIVE_PROGRAM.model_name} 最少 {minimum_days} 天）: "
-                    ).strip()
-                    completed_days = int(days_str or "0")
-                else:
-                    completed_days = 0
+                # 挑战交易日数从 0 起算，进程内跨日自动累加；重启后不再手输。
+                completed_days = 0
                 if existing_profit > 0:
                     best_day_str = input(
                         "请输入历史最佳单日盈利"
@@ -365,13 +349,8 @@ def prompt_capital_settings():
         MAX_PROFIT_AMOUNT = -1
         print("账户止盈: 已禁用（Funded 账户无利润目标）")
 
-    MAX_LOSS_FUSE_AMOUNT = MAX_LOSS_AMOUNT * MAX_LOSS_BUFFER
-    fuse_floor = EOD_HIGH_WATER - MAX_LOSS_FUSE_AMOUNT
-    official_floor = EOD_HIGH_WATER - MAX_LOSS_AMOUNT
-    print(
-        f"追踪回撤保险丝: 净值 ≤ ${fuse_floor:.2f} 即强制全平停机"
-        f" (官方违规线 ${official_floor:.2f}, 预留 ${MAX_LOSS_AMOUNT - MAX_LOSS_FUSE_AMOUNT:.2f})"
-    )
+    # Flex 仅 EOD 回撤、无 DLL：不在 simulate 侧做回撤保险丝，爆仓交给平台。
+    print("ℹ️ 追踪回撤保险丝: 已禁用（EOD 规则交由平台处理）")
     print("ℹ️ 日内止损: 已禁用（当前账户规则无 DLL）")
 
 
@@ -943,7 +922,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     注意：盈亏按实际 MNQ 手数名义计算
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
-    global DAILY_PNL, PROFIT_TARGET_TRIGGERED, TRAILING_FUSE_TRIGGERED
+    global DAILY_PNL, PROFIT_TARGET_TRIGGERED
     
     print(
         f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -953,10 +932,9 @@ def daily_loss_monitor_thread(symbol, position_data):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f} (需同时满足 consistency {CONSISTENCY_PCT*100:.0f}%)")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
-    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 追踪保险丝线: ${EOD_HIGH_WATER - MAX_LOSS_FUSE_AMOUNT:.2f} (EOD 高水位 ${EOD_HIGH_WATER:.2f} − ${MAX_LOSS_FUSE_AMOUNT:.2f})")
     print(
         f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
-        f"日内止损: 已禁用 | 固定手数: {ACTIVE_RULE.trade_contracts} 张 MNQ | 平台上限: {current_max_contracts()}"
+        f"追踪回撤保险丝: 已禁用 | 日内止损: 已禁用 | 固定手数: {ACTIVE_RULE.trade_contracts} 张 MNQ | 平台上限: {current_max_contracts()}"
     )
     
     while DAILY_LOSS_MONITOR_ACTIVE:
@@ -969,8 +947,8 @@ def daily_loss_monitor_thread(symbol, position_data):
             
             # 使用锁保护共享变量
             with pnl_lock:
-                # 如果已经触发保险丝或止盈，停止监控
-                if TRAILING_FUSE_TRIGGERED or PROFIT_TARGET_TRIGGERED:
+                # 如果已经触发止盈，停止监控
+                if PROFIT_TARGET_TRIGGERED:
                     break
                 
                 # 获取持仓信息
@@ -998,22 +976,6 @@ def daily_loss_monitor_thread(symbol, position_data):
                 with pnl_lock:
                     current_total_pnl = TOTAL_PNL + unrealized_pnl
                     current_daily_pnl = DAILY_PNL + unrealized_pnl
-                
-                # ===== 追踪回撤保险丝（最高优先级）=====
-                # 当前净值从启动时真实余额继续累计；违规线按所选平台/规模的固定美元回撤计算。
-                current_equity = INITIAL_CAPITAL + current_total_pnl
-                fuse_floor = EOD_HIGH_WATER - MAX_LOSS_FUSE_AMOUNT
-                if MAX_LOSS_FUSE_AMOUNT > 0 and current_equity <= fuse_floor:
-                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 触发追踪回撤保险丝 !!!!!")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当前净值: ${current_equity:.2f} <= 保险丝线: ${fuse_floor:.2f}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] EOD 高水位: ${EOD_HIGH_WATER:.2f}, 官方违规线: ${EOD_HIGH_WATER - MAX_LOSS_AMOUNT:.2f}")
-                    
-                    with pnl_lock:
-                        FORCE_CLOSE_POSITION = True
-                        TRAILING_FUSE_TRIGGERED = True
-                    
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] ⛔ 已设置强制平仓标志, 程序将永久停止开仓, 请人工评估账户状态")
-                    break
                 
                 # ===== 止盈检查（需同时满足 consistency 40% 规则）=====
                 if MAX_PROFIT_AMOUNT > 0 and current_total_pnl >= MAX_PROFIT_AMOUNT:
@@ -1059,7 +1021,6 @@ def daily_loss_monitor_thread(symbol, position_data):
                     profit_remain = MAX_PROFIT_AMOUNT - current_total_pnl
                     status_parts.append(f"距止盈: ${profit_remain:.2f}")
                 
-                status_parts.append(f"距保险丝: ${current_equity - fuse_floor:.2f}")
                 status_parts.append(f"持仓: {position_quantity}")
                 
                 if LOG_VERBOSE:
@@ -1134,7 +1095,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
     global TOTAL_PNL, DAILY_PNL, LAST_STATS_DATE, DAILY_TRADES, DAILY_STOP_TRIGGERED, PROFIT_TARGET_TRIGGERED
     global MAX_DAILY_LOSS_AMOUNT, DAILY_LOSS_MONITOR_ACTIVE, FORCE_CLOSE_POSITION, DAILY_PROFIT_CAP_TRIGGERED
-    global TRAILING_FUSE_TRIGGERED, DAILY_PNL_HISTORY, EOD_HIGH_WATER, COMPLETED_TRADING_DAYS
+    global DAILY_PNL_HISTORY, EOD_HIGH_WATER, COMPLETED_TRADING_DAYS
     
     now_et = get_us_eastern_time()
     print(f"启动交易策略 - 交易品种: {symbol}")
@@ -1219,8 +1180,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 记录平仓交易（根据是止盈还是止损区分）
                 if PROFIT_TARGET_TRIGGERED:
                     action_type = "平仓(止盈)"
-                elif TRAILING_FUSE_TRIGGERED:
-                    action_type = "平仓(回撤保险丝)"
                 else:
                     action_type = "平仓(止损)"
                 DAILY_TRADES.append({
@@ -1349,7 +1308,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             positions_opened_today = 0
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
             DAILY_PROFIT_CAP_TRIGGERED = False  # 保留字段, Flex 不使用
-            # ⚠️ 保险丝/挑战止盈均不重置：前者需人工介入，后者需切换到 funded 后重启。
+            # ⚠️ 挑战止盈不重置：需切换到 funded 后重启。
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
             trailing_tp_day_stop = False  # 🎯 重置追踪止盈当日停止开仓标志
             
@@ -1371,7 +1330,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(
                         f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
                         f"EOD 高水位更新: ${EOD_HIGH_WATER:.2f}, "
-                        f"新保险丝线: ${EOD_HIGH_WATER - MAX_LOSS_FUSE_AMOUNT:.2f}, "
                         f"交易日: {COMPLETED_TRADING_DAYS}"
                     )
             
@@ -1427,7 +1385,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         current_hour, current_minute = now.hour, now.minute
         is_after_930 = (current_hour > 9) or (current_hour == 9 and current_minute >= 30)
         # 已触发止盈/止损或已收盘时不再重启监控线程，避免每分钟重复打印启动/停止日志
-        monitor_needed = is_after_930 and current_hour < 16 and not (PROFIT_TARGET_TRIGGERED or TRAILING_FUSE_TRIGGERED)
+        monitor_needed = is_after_930 and current_hour < 16 and not PROFIT_TARGET_TRIGGERED
         if monitor_needed and (monitor_thread is None or not monitor_thread.is_alive()):
             print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] === 初始化日内止损监控 ===")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 初始资金: ${INITIAL_CAPITAL:.2f}")
@@ -1951,11 +1909,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
                 continue
             
-            # ⛔ 追踪回撤保险丝已触发: 永久停止开仓（需人工评估后重启程序）
-            if TRAILING_FUSE_TRIGGERED:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] ⛔ 追踪回撤保险丝已触发，程序不再开仓，请人工评估账户状态")
-                continue
-            
             # 🎯 追踪止盈当日已触发，不再开仓
             if trailing_tp_day_stop:
                 if LOG_VERBOSE:
@@ -2165,7 +2118,7 @@ def run_application(program):
         f"(规模 ${ACTIVE_RULE.account_size:,.0f}; 平台上限 {current_max_contracts()} 手)"
     )
     print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用, 需 consistency 达标'})")
-    print(f"追踪回撤保险丝: ${MAX_LOSS_FUSE_AMOUNT:.2f} (官方最大回撤 ${MAX_LOSS_AMOUNT:.2f})")
+    print(f"官方最大回撤: ${MAX_LOSS_AMOUNT:.2f}（EOD，交由平台处理；simulate 不做回撤保险丝）")
     print("日内止损: 已禁用（当前模型无 DLL）")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
