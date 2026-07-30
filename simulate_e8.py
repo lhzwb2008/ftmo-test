@@ -177,9 +177,9 @@ def prompt_capital_settings():
         MAX_PROFIT_AMOUNT = -1
         print("账户止盈: 已禁用（Funded 账户无利润目标，仅保留日内止损）")
     
-    # 日内止损金额 = min(起始资金, 当前金额) × 比例（取较小者更保守）
-    MAX_DAILY_LOSS_AMOUNT = min(start_balance, current_balance) * DAILY_LOSS_PCT
-    print(f"日内止损金额: ${MAX_DAILY_LOSS_AMOUNT:.2f} (= min(起始资金, 当前金额) × {DAILY_LOSS_PCT*100:.2f}%)")
+    # 日内止损已迁移至 MT5 EA 端（真实权益逐tick监控 + broker服务器端SL），Python 端不再计算限额
+    MAX_DAILY_LOSS_AMOUNT = -1
+    print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
     
     # 单日利润停止开仓金额 = 起始资金 × 比例（E8 Pro 单日利润上限 2%，超出部分不计入目标，达到 1.8% 即停）
     MAX_DAILY_PROFIT_AMOUNT = start_balance * DAILY_PROFIT_CAP_PCT
@@ -307,6 +307,22 @@ def write_signal_to_sqlite(action):
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入信号失败: {str(e)}")
         return None
+
+def check_ea_daily_halt():
+    """读取 EA 写回的 ea_daily_status 表，返回 EA 端是否已触发当日日内止损。
+
+    日内止损判定已完全迁移到 MT5 EA 端（真实权益逐tick监控 + broker服务器端SL）。
+    Python 端只镜像该标志：平掉模拟仓位并当日禁止新开仓，保证两边账本长期一致。
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT halted FROM ea_daily_status WHERE id = 1").fetchone()
+        conn.close()
+    except Exception:
+        return False  # 表不存在（EA 未启动或未升级）时视为未触发
+    if not row:
+        return False
+    return bool(row[0])
 
 def get_us_eastern_time():
     if DEBUG_MODE and 'DEBUG_TIME' in globals() and DEBUG_TIME:
@@ -727,10 +743,7 @@ def daily_loss_monitor_thread(symbol, position_data):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
-    if MAX_DAILY_LOSS_AMOUNT > 0:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 最大允许亏损额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
-    else:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 已禁用")
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 由 MT5 EA 端执行（本线程仅镜像 EA 停止标志）")
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
     
     while DAILY_LOSS_MONITOR_ACTIVE:
@@ -800,12 +813,11 @@ def daily_loss_monitor_thread(symbol, position_data):
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置平仓标志，今日不再开仓（明日自动恢复）")
                     break
                 
-                # 检查是否触发日内止损（基于当日盈亏，每日重置，且MAX_DAILY_LOSS_AMOUNT > 0时才启用）
-                if MAX_DAILY_LOSS_AMOUNT > 0 and current_daily_pnl < 0 and abs(current_daily_pnl) >= MAX_DAILY_LOSS_AMOUNT:
-                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 检测到日内亏损超限 !!!!!")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当日亏损: ${current_daily_pnl:.2f}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 日内最大允许亏损: ${-MAX_DAILY_LOSS_AMOUNT:.2f}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 超出金额: ${abs(current_daily_pnl) - MAX_DAILY_LOSS_AMOUNT:.2f}")
+                # 日内止损由 MT5 EA 端权威执行（真实权益触线即全平）；此处仅镜像 EA 写回的
+                # halted 标志：把模拟仓位按当前价平掉并当日禁止新开仓，保证两边账本一致
+                if check_ea_daily_halt():
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已触发日内止损 !!!!!")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 同步平掉模拟仓位并停止今日交易（当日盈亏参考: ${current_daily_pnl:.2f}）")
                     
                     with pnl_lock:
                         FORCE_CLOSE_POSITION = True
@@ -1153,10 +1165,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日盈亏: ${DAILY_PNL:+.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 累计盈亏: ${TOTAL_PNL:+.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
-            if MAX_DAILY_LOSS_AMOUNT > 0:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内最大亏损限额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
-            else:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 已禁用")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 由 MT5 EA 端执行（真实权益监控）")
             print("=" * 60 + "\n")
             
             # 启动监控线程
@@ -1670,6 +1679,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
                 continue
             
+            # 开仓前实时确认 EA 端日内止损状态，避免监控线程轮询间隙内误开仓造成两边不一致
+            if check_ea_daily_halt():
+                DAILY_STOP_TRIGGERED = True
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已触发日内止损，今日不再开仓")
+                continue
+            
             # E8 Pro: 当日利润已达上限，今日不再开仓
             if DAILY_PROFIT_CAP_TRIGGERED:
                 if LOG_VERBOSE:
@@ -1853,7 +1868,7 @@ if __name__ == "__main__":
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
-    print(f"日内止损: ${MAX_DAILY_LOSS_AMOUNT:.2f} ({'已禁用' if MAX_DAILY_LOSS_AMOUNT <= 0 else '已启用'})")
+    print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL）")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")

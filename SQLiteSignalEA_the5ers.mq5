@@ -21,10 +21,22 @@ input double   Leverage = 2;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 
+//--- 日内亏损风控参数（EA端基于真实权益逐tick监控，Python端不再负责日内止损）
+input double   AccountInitialBalance = 100000.0;       // 账户初始资金（官方日亏限额 = 初始资金 × DailyLossPercent%）
+input double   DailyLossPercent = 5.0;                 // 官方日内最大亏损比例(%)（The5ers High Stakes 官方 5；0=禁用）
+input double   DailyLossBufferPercent = 5.0;           // 触发缓冲(%，占日亏限额比例)（覆盖滑点/跳空，重大数据日建议调大）
+input int      DailyResetServerHour = 0;               // 日亏锚点重置时间（服务器小时，0=服务器午夜，需与考试商日重置一致）
+
 //--- 全局变量
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+
+//--- 日内亏损风控状态（通过 GlobalVariables 持久化，EA 重启不丢失）
+double   daily_anchor = 0.0;          // 日初锚点权益 = max(balance, equity)，比各家官方锚点定义都保守
+bool     daily_halted = false;        // 当日是否已触发日内止损（触发后当日禁止新开仓）
+datetime daily_period_start = 0;      // 当前风控日起点（服务器时间）
+datetime last_status_write = 0;       // 上次写 ea_daily_status 状态表的时间
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -44,6 +56,17 @@ int OnInit()
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
+    
+    // 初始化日内亏损风控（恢复或重置当日锚点/halted 状态）
+    if(DailyLossPercent > 0)
+    {
+        DailyRiskLoadOrReset();
+        Print("🛡️ 日内止损(EA端): 限额=$", DoubleToString(DailyLossLimitUSD(), 2),
+              " (初始资金 $", DoubleToString(AccountInitialBalance, 2), " × ", DailyLossPercent, "%)",
+              " 缓冲=", DailyLossBufferPercent, "% 触发线权益=$", DoubleToString(DailyTriggerFloor(), 2));
+    }
+    else
+        Print("🛡️ 日内止损(EA端): 已禁用");
     
     return(INIT_SUCCEEDED);
 }
@@ -67,6 +90,9 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    // 日内亏损检查逐tick执行（不受节流影响）：真实权益对比触发线，触线立即全平
+    DailyRiskCheck();
+    
     datetime current_time = TimeCurrent();
     if(current_time - last_check_time < CheckIntervalSeconds)
         return;
@@ -193,6 +219,14 @@ void ProcessSignal(long signal_id, string action)
 {
     bool result = false;
     double lots = 0;
+    
+    // 日内止损已触发：当日禁止一切新开仓，只消费掉开仓信号
+    if(daily_halted && (action == "BUY" || action == "SELL"))
+    {
+        Print("🚫 日内止损已触发，今日不再开仓，忽略信号: ", action);
+        MarkSignalConsumed(signal_id);
+        return;
+    }
     
     // 检查当前持仓状态
     int position_type = GetPositionType(); // 0=无持仓, 1=多仓, -1=空仓
@@ -513,4 +547,212 @@ double CalculateLotSize()
     }
     
     return lots;
+}
+
+//+------------------------------------------------------------------+
+//| ============ 日内亏损风控模块（EA端权威执行） ============         |
+//| 1) 逐tick用真实权益对比触发线，触线立即市价全平并停止当日交易       |
+//| 2) 给持仓维护一张 broker 服务器端保护性 SL 单（价格 = 权益恰好      |
+//|    触及触发线的换算价）。SL 挂在服务器上，即使 EA/终端/VPS 全部     |
+//|    失联，broker 服务器也会自动执行                                 |
+//| 3) 状态写回 ea_daily_status 表，Python 模拟端镜像记账              |
+//+------------------------------------------------------------------+
+
+string DailyGVName(string suffix)
+{
+    return "DLS_" + IntegerToString(MagicNumber) + "_" + suffix;
+}
+
+double DailyLossLimitUSD()
+{
+    return AccountInitialBalance * DailyLossPercent / 100.0;
+}
+
+double DailyTriggerFloor()
+{
+    return daily_anchor - DailyLossLimitUSD() * (1.0 - DailyLossBufferPercent / 100.0);
+}
+
+//+------------------------------------------------------------------+
+//| 当前风控日起点（服务器时间，按 DailyResetServerHour 切日）          |
+//+------------------------------------------------------------------+
+datetime CurrentDailyPeriodStart()
+{
+    datetime now = TimeCurrent();
+    MqlDateTime dt;
+    TimeToStruct(now, dt);
+    dt.hour = DailyResetServerHour;
+    dt.min = 0;
+    dt.sec = 0;
+    datetime start = StructToTime(dt);
+    if(now < start)
+        start -= 86400;
+    return start;
+}
+
+//+------------------------------------------------------------------+
+//| EA 启动时恢复当日风控状态（GlobalVariables 持久化，重启不丢失）     |
+//+------------------------------------------------------------------+
+void DailyRiskLoadOrReset()
+{
+    datetime period = CurrentDailyPeriodStart();
+    if(GlobalVariableCheck(DailyGVName("day")) && (datetime)GlobalVariableGet(DailyGVName("day")) == period)
+    {
+        daily_anchor = GlobalVariableGet(DailyGVName("anchor"));
+        daily_halted = GlobalVariableGet(DailyGVName("halted")) > 0.5;
+        daily_period_start = period;
+        Print("♻️ 已恢复当日风控状态: 锚点=$", DoubleToString(daily_anchor, 2),
+              " 当日已停止=", daily_halted ? "是" : "否");
+        WriteDailyStatus(daily_halted ? "halted" : "restored");
+        return;
+    }
+    DailyRiskNewDay(period);
+}
+
+//+------------------------------------------------------------------+
+//| 新风控日：重置锚点与 halted 标志                                   |
+//+------------------------------------------------------------------+
+void DailyRiskNewDay(datetime period)
+{
+    daily_period_start = period;
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+    daily_anchor = MathMax(balance, equity);   // 取较大者，比各家官方锚点定义都保守
+    daily_halted = false;
+    GlobalVariableSet(DailyGVName("day"), (double)period);
+    GlobalVariableSet(DailyGVName("anchor"), daily_anchor);
+    GlobalVariableSet(DailyGVName("halted"), 0.0);
+    Print("🌅 新风控日: 锚点=$", DoubleToString(daily_anchor, 2),
+          " 日亏限额=$", DoubleToString(DailyLossLimitUSD(), 2),
+          " 触发线权益=$", DoubleToString(DailyTriggerFloor(), 2));
+    WriteDailyStatus("new_day");
+}
+
+//+------------------------------------------------------------------+
+//| 每tick调用：切日检测 + 权益触线检查 + 维护保护性SL + 定期写状态     |
+//+------------------------------------------------------------------+
+void DailyRiskCheck()
+{
+    if(DailyLossPercent <= 0)
+        return;
+    
+    datetime period = CurrentDailyPeriodStart();
+    if(period != daily_period_start)
+        DailyRiskNewDay(period);
+    
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    double floor_eq = DailyTriggerFloor();
+    
+    if(!daily_halted && equity <= floor_eq)
+    {
+        Print("🛑 !!!!! 权益触及日内亏损触发线，立即全平并停止当日交易 !!!!!");
+        Print("🛑 当前权益: $", DoubleToString(equity, 2),
+              " 触发线: $", DoubleToString(floor_eq, 2),
+              " 锚点: $", DoubleToString(daily_anchor, 2),
+              " 官方限额: $", DoubleToString(DailyLossLimitUSD(), 2));
+        CloseAllPositions();
+        daily_halted = true;
+        GlobalVariableSet(DailyGVName("halted"), 1.0);
+        WriteDailyStatus("daily_loss_halt");
+        return;
+    }
+    
+    if(!daily_halted)
+        UpdateDailyFloorSL(floor_eq);
+    
+    // 定期写心跳状态，Python 端据此镜像 halted 标志同步记账
+    if(TimeCurrent() - last_status_write >= 30)
+        WriteDailyStatus(daily_halted ? "halted" : "ok");
+}
+
+//+------------------------------------------------------------------+
+//| 维护 broker 服务器端保护性 SL：价格 = 权益恰好触及触发线的换算价，  |
+//| 只收紧不放松。EA/终端/VPS 全挂时由 broker 服务器自动执行           |
+//+------------------------------------------------------------------+
+void UpdateDailyFloorSL(double floor_eq)
+{
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tick_value <= 0 || tick_size <= 0)
+        return;
+    double loss_per_unit = tick_value / tick_size;   // 1.0手每1个价格单位的盈亏金额
+    
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!PositionSelectByTicket(ticket))
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+            continue;
+        
+        double lots = PositionGetDouble(POSITION_VOLUME);
+        if(lots <= 0)
+            continue;
+        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        double cur_sl = PositionGetDouble(POSITION_SL);
+        double tp = PositionGetDouble(POSITION_TP);
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        
+        // 允许的最大浮亏 = 触发线权益 − 当前余额（负数表示尚有浮亏空间）
+        double allowed_floating = floor_eq - balance;
+        double offset = allowed_floating / (loss_per_unit * lots);
+        double sl = (type == POSITION_TYPE_BUY) ? open_price + offset : open_price - offset;
+        sl = NormalizeDouble(sl, digits);
+        
+        // SL 距现价太近时跳过（由逐tick权益检查兜底），避免服务器拒绝无效修改
+        double market = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                                    : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        if(type == POSITION_TYPE_BUY && sl > market - min_stop)
+            continue;
+        if(type == POSITION_TYPE_SELL && sl < market + min_stop)
+            continue;
+        
+        // 只收紧不放松（余额增加时保持原SL更保守；余额减少时自动收紧）
+        bool need_update = false;
+        if(cur_sl <= 0)
+            need_update = true;
+        else if(type == POSITION_TYPE_BUY && sl > cur_sl + tick_size / 2)
+            need_update = true;
+        else if(type == POSITION_TYPE_SELL && sl < cur_sl - tick_size / 2)
+            need_update = true;
+        if(!need_update)
+            continue;
+        
+        if(trade.PositionModify(ticket, sl, tp))
+            Print("🛡️ 已更新日亏保护SL(挂在broker服务器): ", DoubleToString(sl, digits),
+                  " (对应触发线权益 $", DoubleToString(floor_eq, 2), ")");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 把当日风控状态写回信号数据库，Python 端读取后镜像记账               |
+//+------------------------------------------------------------------+
+void WriteDailyStatus(string reason)
+{
+    if(db_handle == INVALID_HANDLE)
+        return;
+    last_status_write = TimeCurrent();
+    
+    string create_sql = "CREATE TABLE IF NOT EXISTS ea_daily_status ("
+                        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                        "server_day TEXT, halted INTEGER, reason TEXT, "
+                        "anchor REAL, equity REAL, loss_floor REAL, updated_at TEXT)";
+    DatabaseExecute(db_handle, create_sql);
+    
+    string sql = StringFormat(
+        "INSERT INTO ea_daily_status (id, server_day, halted, reason, anchor, equity, loss_floor, updated_at) "
+        "VALUES (1, '%s', %d, '%s', %.2f, %.2f, %.2f, '%s') "
+        "ON CONFLICT(id) DO UPDATE SET server_day=excluded.server_day, halted=excluded.halted, "
+        "reason=excluded.reason, anchor=excluded.anchor, equity=excluded.equity, "
+        "loss_floor=excluded.loss_floor, updated_at=excluded.updated_at",
+        TimeToString(daily_period_start, TIME_DATE), daily_halted ? 1 : 0, reason,
+        daily_anchor, AccountInfoDouble(ACCOUNT_EQUITY), DailyTriggerFloor(),
+        TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS));
+    
+    if(!DatabaseExecute(db_handle, sql))
+        Print("⚠️ 写入 ea_daily_status 失败: ", GetLastError());
 }
