@@ -22,7 +22,6 @@ input double   RiskPercent = 100.0;                    // 使用余额百分比(
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 input double   InitialBalance = 6000.0;                // 账户初始资金（FundedNext风控按初始资金计算）
 input double   HardSLRiskPercent = 2.5;                // 单笔硬止损(%)（Funded 账户必填，官方上限3%留0.5%；Challenge 请设 0 禁用）
-input bool     DryRun = true;                         // 演练模式：只打日志不下单（上线前务必先测）
 
 //--- 日内亏损风控参数（EA端基于真实权益逐tick监控，Python端不再负责日内止损；限额基于 InitialBalance）
 input double   DailyLossPercent = 5.0;                 // 官方日内最大亏损比例(%)（FundedNext 官方 5；0=禁用）
@@ -72,8 +71,6 @@ int OnInit()
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
-    if(DryRun)
-        Print("🧪 演练模式已开启：将计算手数/止损并写日志，但不会向服务器发送任何订单");
     
     // 初始化日内亏损风控（恢复或重置当日锚点/halted 状态）
     if(DailyLossPercent > 0)
@@ -227,9 +224,6 @@ double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type)
 //+------------------------------------------------------------------+
 void UpdateProtectiveSL()
 {
-    if(DryRun)
-        return;
-    
     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
     double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
@@ -442,8 +436,8 @@ void ProcessSignal(long signal_id, string action)
         else if(position_type == -1)
         {
             // 有空仓，先平仓
-            Print(DryRun ? "🧪 [演练] 检测到买入信号，将平掉现有空仓" : "🔄 检测到买入信号，先平掉现有空仓");
-            if(!DryRun) CloseAllPositions();
+            Print("🔄 检测到买入信号，先平掉现有空仓");
+            CloseAllPositions();
             MarkSignalConsumed(signal_id);
             return;
         }
@@ -461,17 +455,7 @@ void ProcessSignal(long signal_id, string action)
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             // 开仓即挂保护性SL = min(硬止损, 日亏线)，取更紧者
             double sl = CalcProtectiveSL(lots, ask, POSITION_TYPE_BUY);
-            if(DryRun)
-            {
-                Print("🧪 [演练] BUY 手数=", DoubleToString(lots, 2), " 价格=", DoubleToString(ask, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
-                      " SL=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
-                      " (硬止损风险 ", HardSLRiskPercent, "% / 日亏保护取更紧)");
-                result = true;
-            }
-            else
-            {
-                result = trade.Buy(lots, _Symbol, ask, sl, 0, "QQQ Signal Buy");
-            }
+            result = trade.Buy(lots, _Symbol, ask, sl, 0, "QQQ Signal Buy");
         }
     }
     else if(action == "SELL")
@@ -486,8 +470,8 @@ void ProcessSignal(long signal_id, string action)
         else if(position_type == 1)
         {
             // 有多仓，先平仓
-            Print(DryRun ? "🧪 [演练] 检测到卖出信号，将平掉现有多仓" : "🔄 检测到卖出信号，先平掉现有多仓");
-            if(!DryRun) CloseAllPositions();
+            Print("🔄 检测到卖出信号，先平掉现有多仓");
+            CloseAllPositions();
             MarkSignalConsumed(signal_id);
             return;
         }
@@ -505,17 +489,7 @@ void ProcessSignal(long signal_id, string action)
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
             // 开仓即挂保护性SL = min(硬止损, 日亏线)，取更紧者
             double sl = CalcProtectiveSL(lots, bid, POSITION_TYPE_SELL);
-            if(DryRun)
-            {
-                Print("🧪 [演练] SELL 手数=", DoubleToString(lots, 2), " 价格=", DoubleToString(bid, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
-                      " SL=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
-                      " (硬止损风险 ", HardSLRiskPercent, "% / 日亏保护取更紧)");
-                result = true;
-            }
-            else
-            {
-                result = trade.Sell(lots, _Symbol, bid, sl, 0, "QQQ Signal Sell");
-            }
+            result = trade.Sell(lots, _Symbol, bid, sl, 0, "QQQ Signal Sell");
         }
     }
     else if(action == "CLOSE")
@@ -523,16 +497,8 @@ void ProcessSignal(long signal_id, string action)
         // 平仓所有持仓
         if(position_type != 0)
         {
-            if(DryRun)
-            {
-                Print("🧪 [演练] CLOSE 将平掉所有持仓");
-                result = true;
-            }
-            else
-            {
-                CloseAllPositions();
-                result = true;
-            }
+            CloseAllPositions();
+            result = true;
         }
         else
         {
@@ -787,7 +753,7 @@ double CalculateLotSize()
 //|    触及触发线的换算价）。SL 挂在服务器上，即使 EA/终端/VPS 全部     |
 //|    失联，broker 服务器也会自动执行                                 |
 //| 3) 状态写回 ea_daily_status 表，Python 模拟端镜像记账              |
-//| 注意：本文件限额基于 InitialBalance；DryRun 模式只打日志不下单      |
+//| 注意：本文件限额基于 InitialBalance                                  |
 //+------------------------------------------------------------------+
 
 string DailyGVName(string suffix)
@@ -882,10 +848,7 @@ void DailyRiskCheck()
               " 触发线: $", DoubleToString(floor_eq, 2),
               " 锚点: $", DoubleToString(daily_anchor, 2),
               " 官方限额: $", DoubleToString(DailyLossLimitUSD(), 2));
-        if(DryRun)
-            Print("🧪 [演练] 将全平所有持仓并停止当日交易（演练模式不实际下单）");
-        else
-            CloseAllPositions();
+        CloseAllPositions();
         daily_halted = true;
         GlobalVariableSet(DailyGVName("halted"), 1.0);
         WriteDailyStatus("daily_loss_halt");
