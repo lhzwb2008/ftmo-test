@@ -95,6 +95,8 @@ DAILY_STOP_TRIGGERED = False  # 当日是否触发了日内止损
 PROFIT_TARGET_TRIGGERED = False  # 是否触发了止盈
 DAILY_LOSS_MONITOR_ACTIVE = False  # 日内止损监控是否激活
 FORCE_CLOSE_POSITION = False  # 强制平仓标志（监控线程设置）
+EA_MIRROR_CLOSE = False  # EA 端硬止损/服务器SL打掉持仓后，需镜像平掉模拟仓（不禁当日再开）
+EA_MIRROR_CLOSE_REASON = ""
 
 # 线程锁，用于保护共享变量
 pnl_lock = threading.Lock()
@@ -373,6 +375,33 @@ def check_ea_daily_halt():
     if not row:
         return False
     return bool(row[0])
+
+
+# EA 外部平仓（硬止损/服务器SL）同步序号；仅在发现更大的 close_seq 时触发镜像平仓
+_LAST_EA_CLOSE_SEQ = 0
+
+
+def check_ea_external_close():
+    """读取 EA 写回的 ea_position.close_seq。
+
+    FundedNext Funded 账户的硬止损挂在 broker 服务器：触及时 MT5 持仓被直接打掉，
+    不会经过 Python 信号。EA 检测到仓位消失后递增 close_seq；此处发现新序号则返回 True，
+    调用方应镜像平掉模拟仓（但不禁止当日再开仓，硬止损≠日亏 halt）。
+    """
+    global _LAST_EA_CLOSE_SEQ
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT close_seq, reason FROM ea_position WHERE id = 1").fetchone()
+        conn.close()
+    except Exception:
+        return False, ""
+    if not row:
+        return False, ""
+    close_seq, reason = int(row[0] or 0), (row[1] or "")
+    if close_seq > _LAST_EA_CLOSE_SEQ:
+        _LAST_EA_CLOSE_SEQ = close_seq
+        return True, reason
+    return False, ""
 
 def get_us_eastern_time():
     if DEBUG_MODE and 'DEBUG_TIME' in globals() and DEBUG_TIME:
@@ -787,6 +816,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
     global DAILY_PNL, PROFIT_TARGET_TRIGGERED
+    global EA_MIRROR_CLOSE, EA_MIRROR_CLOSE_REASON
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已启动 ===")
     if MAX_PROFIT_AMOUNT > 0:
@@ -862,21 +892,31 @@ def daily_loss_monitor_thread(symbol, position_data):
                     
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置强制平仓标志")
                     break
-                else:
-                    status_parts = [f"当日盈亏: ${current_daily_pnl:+.2f}", f"累计盈亏: ${current_total_pnl:+.2f}"]
-                    
-                    if MAX_PROFIT_AMOUNT > 0:
-                        profit_remain = MAX_PROFIT_AMOUNT - current_total_pnl
-                        status_parts.append(f"距止盈: ${profit_remain:.2f}")
-                    
-                    if MAX_DAILY_LOSS_AMOUNT > 0:
-                        loss_remain = MAX_DAILY_LOSS_AMOUNT + current_daily_pnl
-                        status_parts.append(f"距日内止损: ${loss_remain:.2f}")
-                    
-                    status_parts.append(f"持仓: {position_quantity}")
-                    
-                    if LOG_VERBOSE:
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] " + " | ".join(status_parts))
+                
+                # FundedNext：硬止损/服务器SL打掉实盘仓 → 通知主循环镜像平仓（不 halt 当日）
+                if position_quantity != 0:
+                    ea_ext_closed, ea_ext_reason = check_ea_external_close()
+                    if ea_ext_closed:
+                        EA_MIRROR_CLOSE = True
+                        EA_MIRROR_CLOSE_REASON = ea_ext_reason or "external_close"
+                        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 持仓已被外部平掉，请求镜像同步 !!!!!")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 原因: {EA_MIRROR_CLOSE_REASON}")
+                        # 不 break：监控线程可继续跑（硬止损后当日仍可再开仓）
+                
+                status_parts = [f"当日盈亏: ${current_daily_pnl:+.2f}", f"累计盈亏: ${current_total_pnl:+.2f}"]
+                
+                if MAX_PROFIT_AMOUNT > 0:
+                    profit_remain = MAX_PROFIT_AMOUNT - current_total_pnl
+                    status_parts.append(f"距止盈: ${profit_remain:.2f}")
+                
+                if MAX_DAILY_LOSS_AMOUNT > 0:
+                    loss_remain = MAX_DAILY_LOSS_AMOUNT + current_daily_pnl
+                    status_parts.append(f"距日内止损: ${loss_remain:.2f}")
+                
+                status_parts.append(f"持仓: {position_quantity}")
+                
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] " + " | ".join(status_parts))
             
             # 等待60秒后再次检查
             time_module.sleep(60)
@@ -930,6 +970,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
     global TOTAL_PNL, DAILY_PNL, LAST_STATS_DATE, DAILY_TRADES, DAILY_STOP_TRIGGERED, PROFIT_TARGET_TRIGGERED
     global MAX_DAILY_LOSS_AMOUNT, DAILY_LOSS_MONITOR_ACTIVE, FORCE_CLOSE_POSITION
+    global EA_MIRROR_CLOSE, EA_MIRROR_CLOSE_REASON
     
     now_et = get_us_eastern_time()
     print(f"启动交易策略 - 交易品种: {symbol}")
@@ -990,6 +1031,43 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         with pnl_lock:
             position_data['quantity'] = position_quantity
             position_data['entry_price'] = entry_price
+        
+        # FundedNext：EA 端硬止损/服务器SL打掉实盘仓后，镜像平掉模拟仓（不禁当日再开）
+        if position_quantity != 0 and EA_MIRROR_CLOSE:
+            reason = EA_MIRROR_CLOSE_REASON or "external_close"
+            EA_MIRROR_CLOSE = False
+            EA_MIRROR_CLOSE_REASON = ""
+            print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! EA 端持仓已被外部平掉，镜像同步模拟仓 !!!!!")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 原因: {reason}（硬止损/日亏SL/手动等）")
+            quote = get_quote(symbol)
+            current_price = float(quote.get("last_done", 0))
+            side = "Sell" if position_quantity > 0 else "Buy"
+            # 写 CLOSE 仅作记账对齐；EA 已无仓会忽略，不会反向开仓
+            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 镜像平仓信号已发送，ID: {close_order_id}")
+            if entry_price and current_price > 0:
+                direction = 1 if position_quantity > 0 else -1
+                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                with pnl_lock:
+                    DAILY_PNL += pnl
+                    TOTAL_PNL += pnl
+                DAILY_TRADES.append({
+                    "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                    "action": "平仓(EA硬止损/服务器SL)",
+                    "side": side,
+                    "entry_price": entry_price,
+                    "exit_price": current_price,
+                    "pnl": pnl
+                })
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 镜像平仓完成: 价格=${current_price:.2f}, 盈亏=${pnl:+.2f} ({pnl_pct:+.2f}%)")
+            position_quantity = 0
+            entry_price = None
+            current_stop = None
+            max_profit_price = None
+            trailing_tp_activated = False
+            with pnl_lock:
+                position_data['quantity'] = 0
+                position_data['entry_price'] = None
         
         # 检查监控线程是否设置了强制平仓标志
         if FORCE_CLOSE_POSITION and position_quantity != 0:
@@ -1867,7 +1945,14 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {sleep_seconds:.1f} 秒到下一个精确检查时间 {next_check_time.strftime('%H:%M:%S')}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间精度检查: 秒={now.second}, 微秒={now.microsecond}")
-            time_module.sleep(sleep_seconds)
+            # 分段 sleep：监控线程发现日亏 halt / 硬止损外部平仓时可提前醒来处理
+            remaining = sleep_seconds
+            while remaining > 0:
+                if FORCE_CLOSE_POSITION or EA_MIRROR_CLOSE:
+                    break
+                chunk = min(5.0, remaining)
+                time_module.sleep(chunk)
+                remaining -= chunk
 
 if __name__ == "__main__":
     # 启用日志记录（同时输出到控制台和文件）

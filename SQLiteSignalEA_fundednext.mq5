@@ -21,7 +21,7 @@ input double   Leverage = 2;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 input double   InitialBalance = 6000.0;                // 账户初始资金（FundedNext风控按初始资金计算）
-input double   HardSLRiskPercent = 2.5;                // 硬止损风险比例(%)（FundedNext上限3%，留0.5%余量）
+input double   HardSLRiskPercent = 2.5;                // 单笔硬止损(%)（Funded 账户必填，官方上限3%留0.5%；Challenge 请设 0 禁用）
 input bool     DryRun = true;                         // 演练模式：只打日志不下单（上线前务必先测）
 
 //--- 日内亏损风控参数（EA端基于真实权益逐tick监控，Python端不再负责日内止损；限额基于 InitialBalance）
@@ -39,6 +39,20 @@ double   daily_anchor = 0.0;          // 日初锚点权益 = max(balance, equit
 bool     daily_halted = false;        // 当日是否已触发日内止损（触发后当日禁止新开仓）
 datetime daily_period_start = 0;      // 当前风控日起点（服务器时间）
 datetime last_status_write = 0;       // 上次写 ea_daily_status 状态表的时间
+
+//--- 持仓同步（硬止损/服务器SL打掉后写回 DB，供 simulate 镜像平仓）
+ulong    last_tracked_ticket = 0;     // 上一tick跟踪的持仓票号
+int      ea_close_seq = 0;            // 外部平仓序号（递增），simulate 据此发现硬止损平仓
+
+//--- 前向声明（MQL5 要求先声明后使用）
+string DailyGVName(string suffix);
+double DailyLossLimitUSD();
+double DailyTriggerFloor();
+void   WriteDailyStatus(string reason);
+void   WritePositionStatus(int side, double volume, double open_price, double sl, string reason);
+void   UpdateProtectiveSL();
+void   SyncPositionState();
+double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -58,7 +72,6 @@ int OnInit()
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
-    Print("🛡️ 硬止损: 初始资金 $", DoubleToString(InitialBalance, 2), " × ", HardSLRiskPercent, "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2));
     if(DryRun)
         Print("🧪 演练模式已开启：将计算手数/止损并写日志，但不会向服务器发送任何订单");
     
@@ -73,8 +86,20 @@ int OnInit()
     else
         Print("🛡️ 日内止损(EA端): 已禁用");
     
-    // 启动时立即检查已有持仓是否缺SL（FundedNext要求所有持仓必须有SL）
+    if(HardSLRiskPercent > 0)
+        Print("🛡️ 单笔硬止损: 初始资金 $", DoubleToString(InitialBalance, 2), " × ", HardSLRiskPercent,
+              "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2),
+              " （与日亏线SL取更紧者；Challenge 请将 HardSLRiskPercent 设为 0）");
+    else
+        Print("🛡️ 单笔硬止损: 已禁用（Challenge 模式）");
+    
+    // 恢复外部平仓序号，避免 EA 重启后 simulate 漏同步
+    if(GlobalVariableCheck(DailyGVName("close_seq")))
+        ea_close_seq = (int)GlobalVariableGet(DailyGVName("close_seq"));
+    
+    // 启动时立即检查已有持仓保护性SL（硬止损∩日亏线取更紧）
     EnsureStopLosses();
+    SyncPositionState();
     
     return(INIT_SUCCEEDED);
 }
@@ -100,24 +125,28 @@ void OnTick()
 {
     // 日内亏损检查逐tick执行（不受节流影响）：真实权益对比触发线，触线立即全平
     DailyRiskCheck();
+    // 检测硬止损/服务器SL等外部平仓，并写回 ea_position 供 simulate 镜像
+    SyncPositionState();
     
     datetime current_time = TimeCurrent();
     if(current_time - last_check_time < CheckIntervalSeconds)
         return;
         
     last_check_time = current_time;
-    EnsureStopLosses();
+    // 统一维护保护性SL：min(单笔硬止损, 日亏触发线SL)，取更紧者
+    UpdateProtectiveSL();
     CheckDatabaseSignals();
 }
 
 //+------------------------------------------------------------------+
 //| 计算硬止损距离（价格单位）                                         |
-//| FundedNext要求每笔单必须挂SL，且累计风险≤初始资金3%                 |
+//| Funded 账户：每笔单必须挂SL，且累计风险≤初始资金3%                   |
+//| Challenge：将 HardSLRiskPercent 设为 0 即可禁用                     |
 //| 风险金额 = 初始资金 × HardSLRiskPercent%，换算成价格距离            |
 //+------------------------------------------------------------------+
 double CalcHardSLDistance(double lots)
 {
-    if(lots <= 0) return 0;
+    if(lots <= 0 || HardSLRiskPercent <= 0) return 0;
     
     double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -137,10 +166,75 @@ double CalcHardSLDistance(double lots)
 }
 
 //+------------------------------------------------------------------+
-//| 检查所有持仓，没有SL的立即补挂（FundedNext要求开仓3分钟内必须有SL）  |
+//| 单笔硬止损价格（0=未启用）                                         |
 //+------------------------------------------------------------------+
-void EnsureStopLosses()
+double CalcHardSLPrice(double lots, double open_price, ENUM_POSITION_TYPE type)
 {
+    double distance = CalcHardSLDistance(lots);
+    if(distance <= 0) return 0;
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double sl = (type == POSITION_TYPE_BUY) ? open_price - distance : open_price + distance;
+    return NormalizeDouble(sl, digits);
+}
+
+//+------------------------------------------------------------------+
+//| 日亏触发线对应的保护性SL价格（0=未启用/无法计算）                   |
+//+------------------------------------------------------------------+
+double CalcDailyFloorSLPrice(double lots, double open_price, ENUM_POSITION_TYPE type)
+{
+    if(DailyLossPercent <= 0 || daily_halted || lots <= 0 || daily_anchor <= 0)
+        return 0;
+    
+    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tick_value <= 0 || tick_size <= 0) return 0;
+    
+    double loss_per_unit = tick_value / tick_size;
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double floor_eq = DailyTriggerFloor();
+    double allowed_floating = floor_eq - balance;
+    double offset = allowed_floating / (loss_per_unit * lots);
+    
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double sl = (type == POSITION_TYPE_BUY) ? open_price + offset : open_price - offset;
+    return NormalizeDouble(sl, digits);
+}
+
+//+------------------------------------------------------------------+
+//| 取更紧的SL：多单取较高价，空单取较低价；0 表示该侧未启用            |
+//+------------------------------------------------------------------+
+double TighterSL(ENUM_POSITION_TYPE type, double sl_a, double sl_b)
+{
+    if(sl_a <= 0) return sl_b;
+    if(sl_b <= 0) return sl_a;
+    if(type == POSITION_TYPE_BUY)
+        return MathMax(sl_a, sl_b);
+    return MathMin(sl_a, sl_b);
+}
+
+//+------------------------------------------------------------------+
+//| 计算最终保护性SL = min(硬止损, 日亏线SL) 的更紧者                   |
+//+------------------------------------------------------------------+
+double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type)
+{
+    double hard_sl  = CalcHardSLPrice(lots, open_price, type);
+    double daily_sl = CalcDailyFloorSLPrice(lots, open_price, type);
+    return TighterSL(type, hard_sl, daily_sl);
+}
+
+//+------------------------------------------------------------------+
+//| 统一维护持仓保护性SL：显式取 min(硬止损, 日亏触发线)，只收紧不放松  |
+//+------------------------------------------------------------------+
+void UpdateProtectiveSL()
+{
+    if(DryRun)
+        return;
+    
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(tick_size <= 0) tick_size = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong ticket = PositionGetTicket(i);
@@ -148,35 +242,62 @@ void EnsureStopLosses()
             continue;
         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
             continue;
-        if(PositionGetDouble(POSITION_SL) > 0)
-            continue;
         
         double lots = PositionGetDouble(POSITION_VOLUME);
+        if(lots <= 0) continue;
         double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        double cur_sl = PositionGetDouble(POSITION_SL);
         double tp = PositionGetDouble(POSITION_TP);
-        double distance = CalcHardSLDistance(lots);
-        if(distance <= 0)
-        {
-            Print("❌ 无法计算硬止损距离，持仓 ", ticket, " 仍无SL！");
-            continue;
-        }
-        
-        int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-        double sl = (type == POSITION_TYPE_BUY) ? open_price - distance : open_price + distance;
-        sl = NormalizeDouble(sl, digits);
         
-        if(DryRun)
-        {
-            Print("🧪 [演练] 将为持仓 ", ticket, " 补挂硬止损: ", DoubleToString(sl, digits), " (风险 ", HardSLRiskPercent, "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2), ")");
+        double hard_sl  = CalcHardSLPrice(lots, open_price, type);
+        double daily_sl = CalcDailyFloorSLPrice(lots, open_price, type);
+        double target_sl = TighterSL(type, hard_sl, daily_sl);
+        if(target_sl <= 0)
             continue;
-        }
         
-        if(trade.PositionModify(ticket, sl, tp))
-            Print("🛡️ 已为持仓 ", ticket, " 补挂硬止损: ", DoubleToString(sl, digits), " (风险 ", HardSLRiskPercent, "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2), ")");
+        // SL 距现价太近时跳过（权益触线检查仍会兜底），避免服务器拒绝
+        double market = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                                    : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        if(type == POSITION_TYPE_BUY && target_sl > market - min_stop)
+            continue;
+        if(type == POSITION_TYPE_SELL && target_sl < market + min_stop)
+            continue;
+        
+        // 只收紧不放松
+        bool need_update = false;
+        if(cur_sl <= 0)
+            need_update = true;
+        else if(type == POSITION_TYPE_BUY && target_sl > cur_sl + tick_size / 2)
+            need_update = true;
+        else if(type == POSITION_TYPE_SELL && target_sl < cur_sl - tick_size / 2)
+            need_update = true;
+        if(!need_update)
+            continue;
+        
+        string src = "";
+        if(hard_sl > 0 && daily_sl > 0)
+            src = (MathAbs(target_sl - hard_sl) <= tick_size) ? "硬止损" : "日亏线";
+        else if(hard_sl > 0)
+            src = "硬止损";
         else
-            Print("❌ 补挂止损失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode());
+            src = "日亏线";
+        
+        if(trade.PositionModify(ticket, target_sl, tp))
+            Print("🛡️ 已更新保护性SL(", src, "取更紧): ", DoubleToString(target_sl, digits),
+                  " 硬止损=", DoubleToString(hard_sl, digits),
+                  " 日亏线SL=", DoubleToString(daily_sl, digits));
+        else
+            Print("❌ 更新保护性SL失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode());
     }
+}
+
+//+------------------------------------------------------------------+
+//| 兼容旧调用名：统一走 UpdateProtectiveSL                            |
+//+------------------------------------------------------------------+
+void EnsureStopLosses()
+{
+    UpdateProtectiveSL();
 }
 
 //+------------------------------------------------------------------+
@@ -338,13 +459,13 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            double sl_distance = CalcHardSLDistance(lots);
-            double sl = (sl_distance > 0) ? NormalizeDouble(ask - sl_distance, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) : 0;
+            // 开仓即挂保护性SL = min(硬止损, 日亏线)，取更紧者
+            double sl = CalcProtectiveSL(lots, ask, POSITION_TYPE_BUY);
             if(DryRun)
             {
                 Print("🧪 [演练] BUY 手数=", DoubleToString(lots, 2), " 价格=", DoubleToString(ask, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
                       " SL=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
-                      " 止损距离=", DoubleToString(sl_distance, 2), " 风险=$", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2));
+                      " (硬止损风险 ", HardSLRiskPercent, "% / 日亏保护取更紧)");
                 result = true;
             }
             else
@@ -382,13 +503,13 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            double sl_distance = CalcHardSLDistance(lots);
-            double sl = (sl_distance > 0) ? NormalizeDouble(bid + sl_distance, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) : 0;
+            // 开仓即挂保护性SL = min(硬止损, 日亏线)，取更紧者
+            double sl = CalcProtectiveSL(lots, bid, POSITION_TYPE_SELL);
             if(DryRun)
             {
                 Print("🧪 [演练] SELL 手数=", DoubleToString(lots, 2), " 价格=", DoubleToString(bid, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
                       " SL=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
-                      " 止损距离=", DoubleToString(sl_distance, 2), " 风险=$", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2));
+                      " (硬止损风险 ", HardSLRiskPercent, "% / 日亏保护取更紧)");
                 result = true;
             }
             else
@@ -772,7 +893,7 @@ void DailyRiskCheck()
     }
     
     if(!daily_halted)
-        UpdateDailyFloorSL(floor_eq);
+        UpdateProtectiveSL();
     
     // 定期写心跳状态，Python 端据此镜像 halted 标志同步记账
     if(TimeCurrent() - last_status_write >= 30)
@@ -780,70 +901,96 @@ void DailyRiskCheck()
 }
 
 //+------------------------------------------------------------------+
-//| 维护 broker 服务器端保护性 SL：价格 = 权益恰好触及触发线的换算价，  |
-//| 只收紧不放松（与 EnsureStopLosses 的固定硬止损自动取更紧者）。      |
-//| EA/终端/VPS 全挂时由 broker 服务器自动执行                          |
+//| 检测持仓消失（硬止损/日亏SL/手动平仓），递增 close_seq 写回 DB      |
 //+------------------------------------------------------------------+
-void UpdateDailyFloorSL(double floor_eq)
+void SyncPositionState()
 {
-    if(DryRun)
-        return;   // 演练模式不修改订单（EnsureStopLosses 已打印演练日志）
-    
-    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    if(tick_value <= 0 || tick_size <= 0)
-        return;
-    double loss_per_unit = tick_value / tick_size;   // 1.0手每1个价格单位的盈亏金额
-    
-    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    ulong ticket = 0;
+    int side = 0;
+    double volume = 0, open_price = 0, sl = 0;
     
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
-        ulong ticket = PositionGetTicket(i);
-        if(!PositionSelectByTicket(ticket))
+        ulong t = PositionGetTicket(i);
+        if(!PositionSelectByTicket(t))
             continue;
         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
             continue;
-        
-        double lots = PositionGetDouble(POSITION_VOLUME);
-        if(lots <= 0)
-            continue;
-        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-        double cur_sl = PositionGetDouble(POSITION_SL);
-        double tp = PositionGetDouble(POSITION_TP);
+        ticket = t;
         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-        
-        // 允许的最大浮亏 = 触发线权益 − 当前余额（负数表示尚有浮亏空间）
-        double allowed_floating = floor_eq - balance;
-        double offset = allowed_floating / (loss_per_unit * lots);
-        double sl = (type == POSITION_TYPE_BUY) ? open_price + offset : open_price - offset;
-        sl = NormalizeDouble(sl, digits);
-        
-        // SL 距现价太近时跳过（由逐tick权益检查兜底），避免服务器拒绝无效修改
-        double market = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
-                                                    : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        if(type == POSITION_TYPE_BUY && sl > market - min_stop)
-            continue;
-        if(type == POSITION_TYPE_SELL && sl < market + min_stop)
-            continue;
-        
-        // 只收紧不放松（余额增加时保持原SL更保守；余额减少时自动收紧）
-        bool need_update = false;
-        if(cur_sl <= 0)
-            need_update = true;
-        else if(type == POSITION_TYPE_BUY && sl > cur_sl + tick_size / 2)
-            need_update = true;
-        else if(type == POSITION_TYPE_SELL && sl < cur_sl - tick_size / 2)
-            need_update = true;
-        if(!need_update)
-            continue;
-        
-        if(trade.PositionModify(ticket, sl, tp))
-            Print("🛡️ 已更新日亏保护SL(挂在broker服务器): ", DoubleToString(sl, digits),
-                  " (对应触发线权益 $", DoubleToString(floor_eq, 2), ")");
+        side = (type == POSITION_TYPE_BUY) ? 1 : -1;
+        volume = PositionGetDouble(POSITION_VOLUME);
+        open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        sl = PositionGetDouble(POSITION_SL);
+        break;
     }
+    
+    // 上一tick还有仓、这一tick没了 → 服务器端SL/手动/日亏市价平仓等外部平仓
+    if(last_tracked_ticket != 0 && ticket == 0)
+    {
+        ea_close_seq++;
+        GlobalVariableSet(DailyGVName("close_seq"), (double)ea_close_seq);
+        Print("📣 检测到持仓被外部平掉(硬止损/日亏SL/手动等)，close_seq=", ea_close_seq,
+              " 原票号=", last_tracked_ticket, " —— 已写回 ea_position 供 simulate 镜像");
+        WritePositionStatus(0, 0, 0, 0, "external_close");
+    }
+    else if(ticket != 0)
+    {
+        // 持仓中定期刷新状态（节流：与 last_status_write 共用 30s，或票号变化立即写）
+        static ulong last_written_ticket = 0;
+        if(ticket != last_written_ticket || TimeCurrent() - last_status_write >= 30)
+        {
+            WritePositionStatus(side, volume, open_price, sl, "open");
+            last_written_ticket = ticket;
+        }
+    }
+    else if(last_tracked_ticket == 0 && ticket == 0)
+    {
+        // 空仓心跳（低频）
+        static datetime last_flat_write = 0;
+        if(TimeCurrent() - last_flat_write >= 60)
+        {
+            WritePositionStatus(0, 0, 0, 0, "flat");
+            last_flat_write = TimeCurrent();
+        }
+    }
+    
+    last_tracked_ticket = ticket;
+}
+
+//+------------------------------------------------------------------+
+//| 写持仓同步表（simulate 用 close_seq 发现硬止损等外部平仓）           |
+//+------------------------------------------------------------------+
+void WritePositionStatus(int side, double volume, double open_price, double sl, string reason)
+{
+    if(db_handle == INVALID_HANDLE)
+        return;
+    
+    string create_sql = "CREATE TABLE IF NOT EXISTS ea_position ("
+                        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                        "side INTEGER, volume REAL, open_price REAL, sl REAL, "
+                        "close_seq INTEGER, reason TEXT, updated_at TEXT)";
+    DatabaseExecute(db_handle, create_sql);
+    
+    string sql = StringFormat(
+        "INSERT INTO ea_position (id, side, volume, open_price, sl, close_seq, reason, updated_at) "
+        "VALUES (1, %d, %.4f, %.5f, %.5f, %d, '%s', '%s') "
+        "ON CONFLICT(id) DO UPDATE SET side=excluded.side, volume=excluded.volume, "
+        "open_price=excluded.open_price, sl=excluded.sl, close_seq=excluded.close_seq, "
+        "reason=excluded.reason, updated_at=excluded.updated_at",
+        side, volume, open_price, sl, ea_close_seq, reason,
+        TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS));
+    
+    if(!DatabaseExecute(db_handle, sql))
+        Print("⚠️ 写入 ea_position 失败: ", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| （已合并进 UpdateProtectiveSL，保留空壳避免旧引用编译失败）         |
+//+------------------------------------------------------------------+
+void UpdateDailyFloorSL(double floor_eq)
+{
+    UpdateProtectiveSL();
 }
 
 //+------------------------------------------------------------------+
