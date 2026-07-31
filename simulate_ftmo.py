@@ -1199,12 +1199,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if trigger_h < 16:  # 假设市场在16:00关闭
                 trigger_times.append((trigger_h, trigger_m))
         
-        # 判断当前是否是触发时间点（允许前后30秒的误差）
+        # 判断当前是否是触发时间点（只允许触发点之后45秒内，避免K线未收盘时被提前检查并被去重拦掉正式检查导致漏信号）
         is_trigger_time = False
         for trigger_h, trigger_m in trigger_times:
-            trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=1, microsecond=0)
-            time_diff = abs((now - trigger_time).total_seconds())
-            if time_diff <= 30:  # 30秒误差范围内都认为是触发时间
+            trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=0, microsecond=0)
+            time_diff = (now - trigger_time).total_seconds()
+            if 0 <= time_diff <= 45:  # 只在触发点之后45秒内认为是触发时间（此时K线已收盘，数据完整）
                 is_trigger_time = True
                 break
         
@@ -1213,9 +1213,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             closest_trigger_idx = None
             min_diff = float('inf')
             for i, (trigger_h, trigger_m) in enumerate(trigger_times):
-                trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=1, microsecond=0)
-                time_diff = abs((now - trigger_time).total_seconds())
-                if time_diff < min_diff:
+                trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=0, microsecond=0)
+                time_diff = (now - trigger_time).total_seconds()
+                if 0 <= time_diff <= 45 and time_diff < min_diff:
                     min_diff = time_diff
                     closest_trigger_idx = i
             

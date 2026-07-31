@@ -42,6 +42,7 @@ datetime last_status_write = 0;       // 上次写 ea_daily_status 状态表的�
 //--- 持仓同步（硬止损/服务器SL打掉后写回 DB，供 simulate 镜像平仓）
 ulong    last_tracked_ticket = 0;     // 上一tick跟踪的持仓票号
 int      ea_close_seq = 0;            // 外部平仓序号（递增），simulate 据此发现硬止损平仓
+bool     internal_close_pending = false; // EA 自己执行了平仓（CLOSE信号/反手/日亏全平），下次持仓消失不算外部平仓
 
 //--- 前向声明（MQL5 要求先声明后使用）
 string DailyGVName(string suffix);
@@ -571,7 +572,10 @@ void CloseAllPositions()
         {
             if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
             {
-                trade.PositionClose(ticket);
+                // 标记为 EA 自身平仓：SyncPositionState 据此跳过 close_seq 递增，
+                // 避免 simulate 把 EA 响应 CLOSE 信号的正常平仓误判成硬止损外部平仓
+                if(trade.PositionClose(ticket))
+                    internal_close_pending = true;
             }
         }
     }
@@ -888,14 +892,25 @@ void SyncPositionState()
         break;
     }
     
-    // 上一tick还有仓、这一tick没了 → 服务器端SL/手动/日亏市价平仓等外部平仓
+    // 上一tick还有仓、这一tick没了 → 区分 EA 自身平仓与外部平仓
     if(last_tracked_ticket != 0 && ticket == 0)
     {
-        ea_close_seq++;
-        GlobalVariableSet(DailyGVName("close_seq"), (double)ea_close_seq);
-        Print("📣 检测到持仓被外部平掉(硬止损/日亏SL/手动等)，close_seq=", ea_close_seq,
-              " 原票号=", last_tracked_ticket, " —— 已写回 ea_position 供 simulate 镜像");
-        WritePositionStatus(0, 0, 0, 0, "external_close");
+        if(internal_close_pending)
+        {
+            // EA 自己平的（CLOSE信号/反手/日亏全平）：simulate 已通过信号/halted 状态同步，
+            // 不递增 close_seq，否则会被误判为硬止损并触发镜像平仓反馈回路
+            internal_close_pending = false;
+            Print("ℹ️ 持仓消失为 EA 自身平仓，不计入外部平仓序号（close_seq=", ea_close_seq, "）");
+            WritePositionStatus(0, 0, 0, 0, "internal_close");
+        }
+        else
+        {
+            ea_close_seq++;
+            GlobalVariableSet(DailyGVName("close_seq"), (double)ea_close_seq);
+            Print("📣 检测到持仓被外部平掉(硬止损/日亏SL/手动等)，close_seq=", ea_close_seq,
+                  " 原票号=", last_tracked_ticket, " —— 已写回 ea_position 供 simulate 镜像");
+            WritePositionStatus(0, 0, 0, 0, "external_close");
+        }
     }
     else if(ticket != 0)
     {

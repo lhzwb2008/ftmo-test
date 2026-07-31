@@ -381,27 +381,47 @@ def check_ea_daily_halt():
 _LAST_EA_CLOSE_SEQ = 0
 
 
+def _read_ea_position_row():
+    """读取 ea_position 表的当前状态行，失败返回 None。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT close_seq, reason, side, volume FROM ea_position WHERE id = 1").fetchone()
+        conn.close()
+    except Exception:
+        return None
+    return row
+
+
+def init_ea_close_seq():
+    """启动时把序号基线对齐到 EA 当前值，避免历史遗留的 close_seq 被误判为新的外部平仓。"""
+    global _LAST_EA_CLOSE_SEQ
+    row = _read_ea_position_row()
+    if row:
+        _LAST_EA_CLOSE_SEQ = int(row[0] or 0)
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] EA 外部平仓序号基线已同步: close_seq={_LAST_EA_CLOSE_SEQ}")
+
+
 def check_ea_external_close():
     """读取 EA 写回的 ea_position.close_seq。
 
     FundedNext Funded 账户的硬止损挂在 broker 服务器：触及时 MT5 持仓被直接打掉，
     不会经过 Python 信号。EA 检测到仓位消失后递增 close_seq；此处发现新序号则返回 True，
     调用方应镜像平掉模拟仓（但不禁止当日再开仓，硬止损≠日亏 halt）。
+
+    注意：本函数无论调用方是否持仓都必须周期性调用，以及时消费序号增量；
+    EA 端自身平仓（响应 CLOSE 信号等）不会递增 close_seq。
+    返回 (是否有新外部平仓, 原因, EA 当前是否仍持仓)。
     """
     global _LAST_EA_CLOSE_SEQ
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("SELECT close_seq, reason FROM ea_position WHERE id = 1").fetchone()
-        conn.close()
-    except Exception:
-        return False, ""
+    row = _read_ea_position_row()
     if not row:
-        return False, ""
+        return False, "", False
     close_seq, reason = int(row[0] or 0), (row[1] or "")
+    ea_has_position = bool(row[2]) and float(row[3] or 0) > 0
     if close_seq > _LAST_EA_CLOSE_SEQ:
         _LAST_EA_CLOSE_SEQ = close_seq
-        return True, reason
-    return False, ""
+        return True, reason, ea_has_position
+    return False, "", ea_has_position
 
 def get_us_eastern_time():
     if DEBUG_MODE and 'DEBUG_TIME' in globals() and DEBUG_TIME:
@@ -894,14 +914,19 @@ def daily_loss_monitor_thread(symbol, position_data):
                     break
                 
                 # FundedNext：硬止损/服务器SL打掉实盘仓 → 通知主循环镜像平仓（不 halt 当日）
-                if position_quantity != 0:
-                    ea_ext_closed, ea_ext_reason = check_ea_external_close()
-                    if ea_ext_closed:
+                # 注意：无论是否持仓都要调用，及时消费序号增量，避免遗留序号被算到下一笔新仓头上
+                ea_ext_closed, ea_ext_reason, ea_has_position = check_ea_external_close()
+                if ea_ext_closed:
+                    if position_quantity != 0 and not ea_has_position:
                         EA_MIRROR_CLOSE = True
                         EA_MIRROR_CLOSE_REASON = ea_ext_reason or "external_close"
                         print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 持仓已被外部平掉，请求镜像同步 !!!!!")
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 原因: {EA_MIRROR_CLOSE_REASON}")
                         # 不 break：监控线程可继续跑（硬止损后当日仍可再开仓）
+                    else:
+                        # 模拟端空仓（序号迟到）或 EA 端已有新仓（信息过期），只消费序号不镜像
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 检测到 EA 外部平仓序号增量，但当前状态无需镜像"
+                              f"（模拟持仓: {position_quantity}, EA持仓: {ea_has_position}, 原因: {ea_ext_reason}）")
                 
                 status_parts = [f"当日盈亏: ${current_daily_pnl:+.2f}", f"累计盈亏: ${current_total_pnl:+.2f}"]
                 
@@ -988,6 +1013,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     #     print("Error: Could not get account balance or balance is zero")
     #     sys.exit(1)
     
+    # 把外部平仓序号基线对齐到 EA 当前值，避免历史遗留 close_seq 触发误镜像
+    init_ea_close_seq()
+
     # 初始化持仓状态
     position_quantity = 0
     entry_price = None
@@ -1042,7 +1070,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             quote = get_quote(symbol)
             current_price = float(quote.get("last_done", 0))
             side = "Sell" if position_quantity > 0 else "Buy"
-            # 写 CLOSE 仅作记账对齐；EA 已无仓会忽略，不会反向开仓
+            # 写 CLOSE 仅作记账对齐；监控线程已确认 EA 端空仓（ea_position.side=0），EA 收到后会忽略
             close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 镜像平仓信号已发送，ID: {close_order_id}")
             if entry_price and current_price > 0:
@@ -1317,12 +1345,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if trigger_h < 16:  # 假设市场在16:00关闭
                 trigger_times.append((trigger_h, trigger_m))
         
-        # 判断当前是否是触发时间点（允许前后30秒的误差）
+        # 判断当前是否是触发时间点（只允许触发点之后45秒内，避免K线未收盘时被提前检查并被去重拦掉正式检查导致漏信号）
         is_trigger_time = False
         for trigger_h, trigger_m in trigger_times:
-            trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=1, microsecond=0)
-            time_diff = abs((now - trigger_time).total_seconds())
-            if time_diff <= 30:  # 30秒误差范围内都认为是触发时间
+            trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=0, microsecond=0)
+            time_diff = (now - trigger_time).total_seconds()
+            if 0 <= time_diff <= 45:  # 只在触发点之后45秒内认为是触发时间（此时K线已收盘，数据完整）
                 is_trigger_time = True
                 break
         
@@ -1331,9 +1359,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             closest_trigger_idx = None
             min_diff = float('inf')
             for i, (trigger_h, trigger_m) in enumerate(trigger_times):
-                trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=1, microsecond=0)
-                time_diff = abs((now - trigger_time).total_seconds())
-                if time_diff < min_diff:
+                trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=0, microsecond=0)
+                time_diff = (now - trigger_time).total_seconds()
+                if 0 <= time_diff <= 45 and time_diff < min_diff:
                     min_diff = time_diff
                     closest_trigger_idx = i
             
