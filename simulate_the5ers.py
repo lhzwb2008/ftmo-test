@@ -1176,7 +1176,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if trigger_h < 16:  # 假设市场在16:00关闭
                 trigger_times.append((trigger_h, trigger_m))
         
-        # 判断当前是否是触发时间点（只允许触发点之后45秒内，避免K线未收盘时被提前检查并被去重拦掉正式检查导致漏信号）
+        # 判断当前是否是触发时间点（允许前后30秒的误差）
         is_trigger_time = False
         for trigger_h, trigger_m in trigger_times:
             trigger_time = now.replace(hour=trigger_h, minute=trigger_m, second=1, microsecond=0)
