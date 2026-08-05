@@ -26,6 +26,7 @@ input double   AccountInitialBalance = 200000.0;       // 账户初始资金（�
 input double   DailyLossPercent = 5.0;                 // 官方日内最大亏损比例(%)（Goat Standard 官方 5 / GOAT&PRO 模型请改 4；0=禁用）
 input double   DailyLossBufferPercent = 5.0;           // 触发缓冲(%，占日亏限额比例)（覆盖滑点/跳空，重大数据日建议调大）
 input int      DailyResetServerHour = 0;               // 日亏锚点重置时间（服务器小时，0=服务器午夜，需与考试商日重置一致）
+input bool     ForceResetDailyRisk = false;            // 强制重置日内锚点（出金/换账户后勾选一次，加载后请取消勾选）
 
 //--- 全局变量
 CTrade trade;
@@ -621,6 +622,12 @@ datetime CurrentDailyPeriodStart()
 void DailyRiskLoadOrReset()
 {
     datetime period = CurrentDailyPeriodStart();
+    if(ForceResetDailyRisk)
+    {
+        Print("⚠️ ForceResetDailyRisk=true，强制按当前权益重算日内锚点（完成后请取消勾选该参数再重新加载EA）");
+        DailyRiskNewDay(period);
+        return;
+    }
     if(GlobalVariableCheck(DailyGVName("day")) && (datetime)GlobalVariableGet(DailyGVName("day")) == period)
     {
         daily_anchor = GlobalVariableGet(DailyGVName("anchor"));

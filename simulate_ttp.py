@@ -1839,6 +1839,7 @@ if __name__ == "__main__":
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
     print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL）")
+    print("⚠️ 出金/重置账户后：请在 MT5 EA 勾选 ForceResetDailyRisk 加载一次以重算日内锚点，完成后取消勾选再正常运行")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")
