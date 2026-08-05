@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta, date
 import random
 import os
 from plot_trading_day import plot_trading_day
+from equity_report import render_equity_report
 
 def calculate_vwap(turnovers, volumes, prices):
     """
@@ -348,11 +349,13 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
     # 滑点配置 - 简化为直接的买卖价差
     slippage_per_share = config.get('slippage_per_share', 0.02)  # 每股滑点，买入时多付，卖出时少收
     
-    # 🛡️ 日内止损配置（与 ftmo-test 各 simulate_*.py 的 daily_loss_monitor_thread 一致）
-    # - 条件：max_daily_loss_amount > 0 且 当日总盈亏(已实现+未实现) <= -max_daily_loss_amount
-    # - 未实现盈亏按本根 K 最不利价标记：多头用 Low、空头用 High（与日内回撤统计一致，避免仅用 Close 漏检 K 内极端波动）
+    # 🛡️ 日内止损配置（与 the5ers / simulate 的 daily_loss_monitor 对齐）
+    # - from_day_start: 当日已实现+未实现亏损相对日初资金 ≥ 限额（旧口径）
+    # - peak_to_trough: 当日权益峰→谷回撤金额 ≥ 限额（卡住报告里的「单日峰谷回撤」）
+    # - both: 任一触发即强平（更严，推荐与 prop 双口径一致）
     enable_intraday_stop_loss = config.get('enable_intraday_stop_loss', False)
     intraday_stop_loss_pct = config.get('intraday_stop_loss_pct', 0.04)  # 未指定 max_daily_loss_amount 时：pct * 当日起始资金
+    intraday_stop_loss_mode = str(config.get('intraday_stop_loss_mode', 'both')).lower()
     max_daily_loss_amount_cfg = config.get('max_daily_loss_amount')  # None 则按 pct 推导；<=0 与 simulate 一样视为不启用金额阈值
     initial_capital = config.get('initial_capital', 100000)  # 初始资金，用于计算日内损失
     
@@ -412,21 +415,58 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
             return float(high_px)
         return float(close_px)
 
+    def _mark_price_for_equity(target_equity):
+        """
+        反推使「日初+已实现+未实现 ≈ target_equity」的标记价（忽略手续费，供限额触及时定价）。
+        无仓或仓位为 0 时返回 nan。
+        """
+        if position == 0 or position_size <= 0 or np.isnan(entry_price):
+            return np.nan
+        target_unrealized = float(target_equity) - float(day_start_capital) - float(current_day_pnl)
+        if position == 1:
+            return float(entry_price) + target_unrealized / float(position_size)
+        return float(entry_price) - target_unrealized / float(position_size)
+
     def _after_trade_close_add_realized(pnl):
-        """平仓后累加已实现；仅已实现即可判断是否已越过日内亏损线（持仓已平）。"""
+        """平仓后累加已实现；按配置检查日初亏损 / 峰谷回撤是否触限。"""
         nonlocal current_day_pnl, intraday_stop_triggered
+        nonlocal intraday_capital_peak, intraday_capital_high, intraday_capital_low, intraday_max_drawdown
         current_day_pnl += pnl
+        equity = float(day_start_capital) + float(current_day_pnl)
+        if equity > intraday_capital_peak:
+            intraday_capital_peak = equity
+        if equity > intraday_capital_high:
+            intraday_capital_high = equity
+        if equity < intraday_capital_low:
+            intraday_capital_low = equity
+        dd = intraday_capital_peak - equity
+        if dd > intraday_max_drawdown:
+            intraday_max_drawdown = dd
+
         m = _resolve_max_daily_loss_amount()
         if (
             enable_intraday_stop_loss
             and not intraday_stop_triggered
             and m > 0
-            and current_day_pnl < 0
-            and abs(current_day_pnl) >= m
         ):
-            intraday_stop_triggered = True
-            if print_details:
-                print(f"🛡️ 日内止损（已实现累计）: 当日盈亏=${current_day_pnl:.2f}, 限额=${m:.2f}")
+            breach_start = (
+                _check_day_start
+                and current_day_pnl < 0
+                and abs(current_day_pnl) >= m
+            )
+            breach_peak = _check_peak_trough and dd >= m
+            if breach_start or breach_peak:
+                intraday_stop_triggered = True
+                if print_details:
+                    why = []
+                    if breach_peak:
+                        why.append('峰谷')
+                    if breach_start:
+                        why.append('日初')
+                    print(
+                        f"🛡️ 日内止损（已实现/{'+'.join(why)}）: "
+                        f"当日盈亏=${current_day_pnl:.2f}, 峰谷=${dd:.2f}, 限额=${m:.2f}"
+                    )
     
     position = 0  # 0: 无仓位, 1: 多头, -1: 空头
     entry_price = np.nan
@@ -451,6 +491,17 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
     _daily_stop_active = (
         enable_intraday_stop_loss and _max_daily_loss_amt > 0
     )
+    _stop_mode = intraday_stop_loss_mode
+    if _stop_mode in ('day_start', 'from_day_start', 'start'):
+        _check_day_start = True
+        _check_peak_trough = False
+    elif _stop_mode in ('peak_to_trough', 'peak', 'mdd'):
+        _check_day_start = False
+        _check_peak_trough = True
+    else:
+        # both / 未知 → 双口径
+        _check_day_start = True
+        _check_peak_trough = True
 
     # 📊 日内资金回撤追踪
     intraday_capital_peak = day_start_capital  # 日内资金峰值
@@ -463,6 +514,52 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
     
     end_time_str = f"{trading_end_time[0]:02d}:{trading_end_time[1]:02d}"
     
+    def _execute_intraday_stop(row, exit_mark, reason_tag, detail_msg):
+        """强平并标记当日停开。返回 True 表示已处理（调用方应 continue）。"""
+        nonlocal position, current_day_pnl, intraday_stop_triggered
+        nonlocal trailing_stop, max_profit_price, trailing_tp_activated, dynamic_take_profit_level
+        nonlocal trade_entry_time
+
+        if position != 0:
+            exit_time = row['DateTime']
+            exit_price = apply_slippage(exit_mark, is_buy=(position == -1), is_entry=False)
+            if enable_transaction_fees:
+                transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)
+            else:
+                transaction_fees = 0
+            if position == 1:
+                pnl = position_size * (exit_price - entry_price) - transaction_fees
+            else:
+                pnl = position_size * (entry_price - exit_price) - transaction_fees
+            if print_details:
+                print(detail_msg)
+            trades.append({
+                'entry_time': trade_entry_time,
+                'exit_time': exit_time,
+                'side': 'Long' if position == 1 else 'Short',
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'pnl': pnl,
+                'exit_reason': reason_tag,
+                'position_size': position_size,
+                'transaction_fees': transaction_fees,
+                'vwap_influenced': False,
+                'stop_level': _max_daily_loss_amt,
+                'upper_bound': upper if position == 1 else np.nan,
+                'lower_bound': lower_bound if position == -1 else np.nan,
+                'vwap_value': np.nan
+            })
+            current_day_pnl += pnl
+            position = 0
+            trailing_stop = np.nan
+            max_profit_price = np.nan
+            trailing_tp_activated = False
+            dynamic_take_profit_level = np.nan
+        elif print_details:
+            print(detail_msg)
+        intraday_stop_triggered = True
+        return True
+
     for idx, row in day_df.iterrows():
         current_time = row['Time']
         price = row['Close']
@@ -473,93 +570,79 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
         lower_bound = row['LowerBound']
         sigma = row.get('sigma', 0)
         
-        # 📊 计算当前K线的账户资金（用于日内回撤计算）
+        # 📊 计算当前K线的账户资金（用于日内回撤计算 / 峰谷止损）
         # 如果已触发止损，不再更新回撤统计
+        stop_now = False
+        stop_exit_mark = None
+        stop_reason = None
+        stop_detail = None
         if not intraday_stop_triggered:
             # 使用K线的High和Low来计算最好和最坏情况
             if position == 1:  # 多头持仓
-                # 多头：高点是最好情况，低点是最坏情况
                 best_unrealized = position_size * (high - entry_price)
                 worst_unrealized = position_size * (low - entry_price)
             elif position == -1:  # 空头持仓
-                # 空头：低点是最好情况，高点是最坏情况
                 best_unrealized = position_size * (entry_price - low)
                 worst_unrealized = position_size * (entry_price - high)
             else:  # 无持仓
                 best_unrealized = 0
                 worst_unrealized = 0
             
-            # 计算当前K线的资金极值
             current_best_capital = day_start_capital + current_day_pnl + best_unrealized
             current_worst_capital = day_start_capital + current_day_pnl + worst_unrealized
             
-            # 更新资金峰值（使用最好情况）
+            # 先抬升峰值，再量峰谷（同根 K 内保守假设：先冲高再回落）
             if current_best_capital > intraday_capital_peak:
                 intraday_capital_peak = current_best_capital
-            
-            # 计算当前回撤（使用最坏情况与峰值的差距）
+
+            # 🛡️ 双口径止损判定；触及时将谷底钳制在限额上，避免同根 K 的 High/Low 把统计抬过阈值
+            if _daily_stop_active:
+                floor_from_peak = intraday_capital_peak - _max_daily_loss_amt
+                floor_from_start = day_start_capital - _max_daily_loss_amt
+                breached_peak = _check_peak_trough and current_worst_capital <= floor_from_peak
+                breached_start = _check_day_start and current_worst_capital <= floor_from_start
+                if breached_peak or breached_start:
+                    if breached_peak and breached_start:
+                        equity_floor = max(floor_from_peak, floor_from_start)
+                        reason_tag = 'Intraday Stop Loss'
+                        why = '峰谷+日初'
+                    elif breached_peak:
+                        equity_floor = floor_from_peak
+                        reason_tag = 'Intraday Peak Drawdown Stop'
+                        why = '峰谷回撤'
+                    else:
+                        equity_floor = floor_from_start
+                        reason_tag = 'Intraday Stop Loss'
+                        why = '日初亏损'
+                    # 统计与出场均按触限权益，而不是继续吃满 bar 极端价
+                    current_worst_capital = max(current_worst_capital, equity_floor)
+                    mark = _mark_price_for_equity(equity_floor)
+                    if np.isnan(mark):
+                        mark = _worst_mark_price(high, low, price)
+                    else:
+                        # 标记价夹在本根 K 的 High/Low 内，避免算出 bar 外价格
+                        mark = float(min(max(mark, float(low)), float(high)))
+                    stop_now = True
+                    stop_exit_mark = mark
+                    stop_reason = reason_tag
+                    stop_detail = (
+                        f"🛡️ 日内止损强平（{why}）! 时间: {current_time}, "
+                        f"限额=${_max_daily_loss_amt:.2f}, 峰值=${intraday_capital_peak:.2f}, "
+                        f"触限权益=${equity_floor:.2f}"
+                    )
+
             current_drawdown = intraday_capital_peak - current_worst_capital
             if current_drawdown > intraday_max_drawdown:
                 intraday_max_drawdown = current_drawdown
-            
-            # 追踪日内资金的绝对最高和最低点
+
             if current_best_capital > intraday_capital_high:
                 intraday_capital_high = current_best_capital
             if current_worst_capital < intraday_capital_low:
                 intraday_capital_low = current_worst_capital
-        
-        # 🛡️ 日内止损（当日已实现+未实现 vs 固定美元；未实现按 K 内最不利价评估）
-        if _daily_stop_active and not intraday_stop_triggered:
-            worst_mark = _worst_mark_price(high, low, price)
-            total_daily = _current_daily_pnl_total(worst_mark)
-            if total_daily <= -_max_daily_loss_amt:
-                if position != 0:
-                    exit_time = row['DateTime']
-                    exit_price = apply_slippage(worst_mark, is_buy=(position == -1), is_entry=False)
-                    if enable_transaction_fees:
-                        transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)
-                    else:
-                        transaction_fees = 0
-                    if position == 1:
-                        pnl = position_size * (exit_price - entry_price) - transaction_fees
-                    else:
-                        pnl = position_size * (entry_price - exit_price) - transaction_fees
-                    if print_details:
-                        print(
-                            f"🛡️ 日内止损强平！时间: {current_time}, 当日总盈亏=${total_daily:.2f}, "
-                            f"限额=${_max_daily_loss_amt:.2f}"
-                        )
-                    trades.append({
-                        'entry_time': trade_entry_time,
-                        'exit_time': exit_time,
-                        'side': 'Long' if position == 1 else 'Short',
-                        'entry_price': entry_price,
-                        'exit_price': exit_price,
-                        'pnl': pnl,
-                        'exit_reason': 'Intraday Stop Loss',
-                        'position_size': position_size,
-                        'transaction_fees': transaction_fees,
-                        'vwap_influenced': False,
-                        'stop_level': _max_daily_loss_amt,
-                        'upper_bound': upper if position == 1 else np.nan,
-                        'lower_bound': lower_bound if position == -1 else np.nan,
-                        'vwap_value': np.nan
-                    })
-                    current_day_pnl += pnl
-                    intraday_stop_triggered = True
-                    position = 0
-                    trailing_stop = np.nan
-                    max_profit_price = np.nan
-                    trailing_tp_activated = False
-                    dynamic_take_profit_level = np.nan
-                    continue
-                intraday_stop_triggered = True
-                if print_details:
-                    print(
-                        f"🛡️ 日内止损触发（无持仓）！时间: {current_time}, "
-                        f"当日盈亏=${total_daily:.2f}, 限额=${_max_daily_loss_amt:.2f}"
-                    )
-                continue
+
+        if stop_now:
+            _execute_intraday_stop(row, stop_exit_mark, stop_reason, stop_detail)
+            continue
 
         # # 调试特定时间点
         # if debug_time is not None and current_time >= debug_time and not debug_printed:
@@ -1358,6 +1441,8 @@ def run_backtest(config):
     max_intraday_mdd_date = None  # 最大日内峰谷回撤发生的日期
     max_intraday_loss_from_start_pct = 0  # 最大日内亏损（相对日初，FTMO 日损口径）
     max_intraday_loss_from_start_date = None
+    # 每日回撤记录（用于报告列出最差若干天）
+    daily_dd_records = []
 
     # 📊 精确最大回撤追踪（考虑日内波动）
     capital_peak = initial_capital  # 资金峰值（包含日内高点）
@@ -1520,6 +1605,13 @@ def run_backtest(config):
             precise_mdd_date = trade_date
             precise_mdd_peak_date = current_peak_date
             precise_mdd_peak_capital = capital_peak
+
+        daily_dd_records.append({
+            'date': trade_date,
+            'precise_dd_pct': current_precise_drawdown_pct,
+            'intraday_mdd_pct': intraday_mdd_pct,
+            'loss_from_start_pct': intraday_loss_from_start_pct,
+        })
         
         # 打印每天的交易信息
         if trades and print_daily_trades:
@@ -1688,6 +1780,21 @@ def run_backtest(config):
     metrics['max_single_day_loss_from_start_pct'] = max_intraday_loss_from_start_pct
     metrics['max_single_day_loss_from_start_date'] = max_intraday_loss_from_start_date
 
+    def _top_dd_days(key, n=3):
+        ranked = sorted(daily_dd_records, key=lambda r: r[key], reverse=True)
+        out = []
+        for r in ranked:
+            if r[key] <= 0:
+                break
+            out.append({'date': r['date'], 'pct': r[key]})
+            if len(out) >= n:
+                break
+        return out
+
+    metrics['top_precise_drawdown_days'] = _top_dd_days('precise_dd_pct')
+    metrics['top_single_day_intraday_mdd_days'] = _top_dd_days('intraday_mdd_pct')
+    metrics['top_single_day_loss_from_start_days'] = _top_dd_days('loss_from_start_pct')
+
     # 计算总滑点损耗
     slippage_per_share = config.get('slippage_per_share', 0.01)
     if len(trades_df) > 0:
@@ -1733,13 +1840,32 @@ def run_backtest(config):
     _mdd1d = max_intraday_mdd_pct * 100 if max_intraday_mdd_date is not None else None
     _loss1d = max_intraday_loss_from_start_pct * 100 if max_intraday_loss_from_start_date is not None else None
     if _loss1d is not None:
-        print(f"{'单日最大亏损(日初)':<20} | {_loss1d:>14.2f}% | {'-':>15}")
+        _loss_d = pd.Timestamp(max_intraday_loss_from_start_date).strftime('%Y-%m-%d')
+        print(f"{'单日最大亏损(日初)':<20} | {_loss1d:>14.2f}% | {_loss_d:>15}")
     else:
         print(f"{'单日最大亏损(日初)':<20} | {'-':>15} | {'-':>15}")
     if _mdd1d is not None:
-        print(f"{'单日峰谷最大回撤':<20} | {_mdd1d:>14.2f}% | {'-':>15}")
+        _mdd_d = pd.Timestamp(max_intraday_mdd_date).strftime('%Y-%m-%d')
+        print(f"{'单日峰谷最大回撤':<20} | {_mdd1d:>14.2f}% | {_mdd_d:>15}")
     else:
         print(f"{'单日峰谷最大回撤':<20} | {'-':>15} | {'-':>15}")
+
+    def _fmt_top_days(rows):
+        parts = []
+        for i, r in enumerate(rows, 1):
+            d = pd.Timestamp(r['date']).strftime('%Y-%m-%d')
+            parts.append(f"{i}) {d} {r['pct']*100:.2f}%")
+        return " · ".join(parts)
+
+    _top_precise = metrics.get('top_precise_drawdown_days') or []
+    if _top_precise:
+        print(f"  回撤最深三日(相对历史峰值): {_fmt_top_days(_top_precise)}")
+    _top_mdd1d = metrics.get('top_single_day_intraday_mdd_days') or []
+    if _top_mdd1d:
+        print(f"  单日峰谷回撤 Top3: {_fmt_top_days(_top_mdd1d)}")
+    _top_loss1d = metrics.get('top_single_day_loss_from_start_days') or []
+    if _top_loss1d:
+        print(f"  单日最大亏损(日初) Top3: {_fmt_top_days(_top_loss1d)}")
 
     # 最大回撤详情：峰值日 → 谷底日 →（若有）恢复日
     if 'max_drawdown_start_date' in metrics and 'max_drawdown_date' in metrics:
@@ -1770,7 +1896,22 @@ def run_backtest(config):
     print(f"  交易成本: ${total_trading_cost:,.2f} (手续费:${total_transaction_fees:,.2f} 滑点:${total_slippage_cost:,.2f})")
 
     print(f"{'='*50}")
-    
+
+    # 可选：独立权益报告（纯 HTML/SVG，与主回测逻辑隔离）
+    if config.get('show_equity_report', False):
+        try:
+            render_equity_report(
+                daily_df,
+                metrics,
+                config,
+                buy_hold_df=buy_hold_df if not buy_hold_df.empty else None,
+                trades_df=trades_df if len(trades_df) > 0 else None,
+                open_browser=config.get('equity_report_open_browser', True),
+                output_path=config.get('equity_report_path'),
+            )
+        except Exception as e:
+            print(f"警告: 权益报告生成失败: {e}")
+
     return daily_df, monthly, trades_df, metrics 
 
 def calculate_performance_metrics(daily_df, trades_df, initial_capital, risk_free_rate=0.02, trading_days_per_year=252, buy_hold_df=None):
@@ -2208,11 +2349,10 @@ if __name__ == "__main__":
         'initial_capital': 100000,
         'lookback_days':1,
         # 'start_date': date(2020, 4, 1),
-        # 'end_date': date(2024, 4, 1),
-        'start_date': date(2026, 1, 1),
-        'end_date': date(2026, 7, 20),
-        # 'start_date': date(2024, 7, 15),
-        # 'end_date': date(2026, 7, 15),
+        # 'end_date': date(2025, 4, 1),
+        # 近一年回测窗口（数据含更早预热日，供趋势特征）
+        'start_date': date(2025, 8, 5),
+        'end_date': date(2026, 8, 5),
        
         'check_interval_minutes': 15 ,
         'enable_transaction_fees': True,  # 是否启用手续费计算，False表示不计算手续费
@@ -2227,6 +2367,11 @@ if __name__ == "__main__":
         # 'plots_dir': 'trading_plots',
         'print_daily_trades': False,
         'print_trade_details': False,
+        # 按日权益报告：独立 HTML/SVG（非 matplotlib），默认关闭
+        'show_equity_report': False,
+        # 'equity_report_dir': 'reports',
+        # 'equity_report_open_browser': True,
+        # 'equity_report_path': 'reports/equity_report.html',
         'K1': 1,  # 上边界sigma乘数（多头）基准；午后动态见 k_side_adjustment
         'K2': 1.04,  # 下边界sigma乘数（空头），本规则不调整空头
         'enable_k_side_adjustment': True,  # 动态 K 总开关；False 时忽略下方 k_side_adjustment，退化为固定 K1/K2
@@ -2241,8 +2386,10 @@ if __name__ == "__main__":
         },
         'leverage':2,  # 资金杠杆倍数，与simulate一致
         'use_vwap': False,  # VWAP开关，True为使用VWAP，False为不使用
-        'enable_intraday_stop_loss': False,  # 是否启用日内止损（与 simulate 的 MAX_DAILY_LOSS_AMOUNT>0 对应）
-        'intraday_stop_loss_pct': 0.045,  # 仅在未指定 max_daily_loss_amount 时用于换算美元限额
+        'enable_intraday_stop_loss': True,  # 是否启用日内止损（与 simulate 的 MAX_DAILY_LOSS_AMOUNT>0 对应）
+        'intraday_stop_loss_pct': 0.04,  # 仅在未指定 max_daily_loss_amount 时用于换算美元限额
+        # both=日初亏损或峰谷回撤任一触限即强平（推荐）；from_day_start=仅日初；peak_to_trough=仅峰谷
+        'intraday_stop_loss_mode': 'both',
         'enable_per_trade_stop_loss': False,  # 是否启用单笔止损（相对开仓价固定百分比）
         'per_trade_stop_loss_pct': 0.03,  # 单笔止损比例，如 0.03 表示开仓价逆向波动 3% 强平
 
