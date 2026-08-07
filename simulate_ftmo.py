@@ -38,6 +38,11 @@ PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮
 DAILY_LOSS_PCT = 0.045     # 日内止损比例（官方 5%，留 10% 缓冲，各轮次相同）
 TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标，覆盖点差/滑点/检测到成交之间的价格回撤，宁可超出目标也不能差一点没到）
 
+# Funded 权益止盈（与 EA EnableEquityTakeProfit 对应；默认关闭）
+# 启用后按绝对权益目标计算止盈金额；EA 端触线后通过 ea_daily_status.tp_halted 镜像同步
+ENABLE_EQUITY_TAKE_PROFIT = False
+EQUITY_TAKE_PROFIT_TARGET = 100001.0  # 权益止盈目标（与 EA EquityTakeProfitTarget 保持一致）
+
 # 止盈止损设置（金额）——启动时按上述比例自动计算，请勿手动修改
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
 MAX_DAILY_LOSS_AMOUNT = -1  # 日内最大亏损金额（自动计算；负数表示未初始化/禁用）
@@ -187,9 +192,21 @@ def prompt_capital_settings():
         if MAX_PROFIT_AMOUNT <= 0:
             print("警告: 当前金额已达到/超过账户止盈目标，无需继续交易，程序退出")
             sys.exit(0)
+    elif phase == "funded" and ENABLE_EQUITY_TAKE_PROFIT:
+        # Funded 权益止盈：目标权益 − 当前金额（会话内累计盈亏达到该差额即止盈）
+        MAX_PROFIT_AMOUNT = EQUITY_TAKE_PROFIT_TARGET - current_balance
+        print(f"账户止盈: 已启用（Funded 权益目标 ${EQUITY_TAKE_PROFIT_TARGET:.2f}）")
+        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 目标权益 − 当前金额)")
+        print("⚠️ 提醒: 请同步在 EA 中开启 EnableEquityTakeProfit，并将 EquityTakeProfitTarget 设为相同目标")
+        if MAX_PROFIT_AMOUNT <= 0:
+            print("警告: 当前金额已达到/超过权益止盈目标，无需继续交易，程序退出")
+            sys.exit(0)
     else:
         MAX_PROFIT_AMOUNT = -1
-        print("账户止盈: 已禁用（Funded 账户无利润目标，仅保留日内止损）")
+        if phase == "funded":
+            print("账户止盈: 已禁用（Funded 默认无利润目标；可设 ENABLE_EQUITY_TAKE_PROFIT=True 启用权益止盈）")
+        else:
+            print("账户止盈: 已禁用")
     
     # 日内止损已迁移至 MT5 EA 端（真实权益逐tick监控 + broker服务器端SL），Python 端不再计算限额
     MAX_DAILY_LOSS_AMOUNT = -1
@@ -331,6 +348,23 @@ def check_ea_daily_halt():
     except Exception:
         return False  # 表不存在（EA 未启动或未升级）时视为未触发
     if not row:
+        return False
+    return bool(row[0])
+
+
+def check_ea_equity_tp_halt():
+    """读取 EA 写回的 ea_daily_status.tp_halted，返回 EA 端是否已触发权益止盈。
+
+    权益止盈由 MT5 EA 端权威执行（真实权益≥目标即全平）。
+    Python 端镜像该标志：平掉模拟仓位并永久禁止新开仓。
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT tp_halted FROM ea_daily_status WHERE id = 1").fetchone()
+        conn.close()
+    except Exception:
+        return False  # 列/表不存在（旧 EA）时视为未触发
+    if not row or row[0] is None:
         return False
     return bool(row[0])
 
@@ -810,6 +844,18 @@ def daily_loss_monitor_thread(symbol, position_data):
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置止盈平仓标志")
                     break
                 
+                # EA 端权益止盈镜像（真实权益触线后写回 tp_halted）
+                if check_ea_equity_tp_halt():
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已触发权益止盈 !!!!!")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 同步平掉模拟仓位并永久停止开仓")
+                    
+                    with pnl_lock:
+                        FORCE_CLOSE_POSITION = True
+                        PROFIT_TARGET_TRIGGERED = True
+                    
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置止盈平仓标志")
+                    break
+                
                 # 日内止损由 MT5 EA 端权威执行（真实权益触线即全平）；此处仅镜像 EA 写回的
                 # halted 标志：把模拟仓位按当前价平掉并当日禁止新开仓，保证两边账本一致
                 if check_ea_daily_halt():
@@ -1094,7 +1140,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             positions_opened_today = 0
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
-            PROFIT_TARGET_TRIGGERED = False  # 重置止盈标志
+            # Funded 权益止盈是账户级永久停止，跨日不重置；挑战期百分比止盈沿用原跨日重置逻辑
+            if not (ENABLE_EQUITY_TAKE_PROFIT and PROFIT_TARGET_TRIGGERED):
+                PROFIT_TARGET_TRIGGERED = False
             trailing_tp_day_stop = False  # 🎯 重置追踪止盈当日停止开仓标志
             
             # 停止旧的监控线程
@@ -1670,6 +1718,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
                 continue
             
+            # 开仓前实时确认 EA 端权益止盈状态，避免监控线程轮询间隙内误开仓
+            if check_ea_equity_tp_halt():
+                PROFIT_TARGET_TRIGGERED = True
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已触发权益止盈，不再开仓")
+                continue
+            
             # 开仓前实时确认 EA 端日内止损状态，避免监控线程轮询间隙内误开仓造成两边不一致
             if check_ea_daily_halt():
                 DAILY_STOP_TRIGGERED = True
@@ -1853,8 +1907,12 @@ if __name__ == "__main__":
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
+    print(f"Funded 权益止盈: {'已启用' if ENABLE_EQUITY_TAKE_PROFIT else '已禁用'}"
+          + (f"（目标权益 ${EQUITY_TAKE_PROFIT_TARGET:.2f}）" if ENABLE_EQUITY_TAKE_PROFIT else ""))
     print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL）")
     print("⚠️ 出金/重置账户后：请在 MT5 EA 勾选 ForceResetDailyRisk 加载一次以重算日内锚点，完成后取消勾选再正常运行")
+    if ENABLE_EQUITY_TAKE_PROFIT:
+        print("⚠️ 权益止盈触发后如需恢复交易：请在 MT5 EA 勾选 ForceResetEquityTP 加载一次，完成后取消勾选")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")

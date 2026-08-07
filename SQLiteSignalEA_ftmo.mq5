@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 // 添加必要的权限声明
@@ -28,6 +28,11 @@ input double   DailyLossBufferPercent = 5.0;           // 触发缓冲(%，占�
 input int      DailyResetServerHour = 0;               // 日亏锚点重置时间（服务器小时，0=服务器午夜，需与考试商日重置一致）
 input bool     ForceResetDailyRisk = false;            // 强制重置日内锚点（出金/换账户后勾选一次，加载后请取消勾选）
 
+//--- 账户权益止盈（Funded 常用：权益达到目标后全平并停止开仓；默认关闭）
+input bool     EnableEquityTakeProfit = false;         // 启用权益止盈（默认关闭）
+input double   EquityTakeProfitTarget = 100001.0;      // 权益止盈目标（权益≥此值则全平并永久停止开仓）
+input bool     ForceResetEquityTP = false;             // 强制清除权益止盈停止状态（出金/换目标后勾选一次，加载后请取消勾选）
+
 //--- 全局变量
 CTrade trade;
 datetime last_check_time = 0;
@@ -38,6 +43,9 @@ double   daily_anchor = 0.0;          // 日初锚点权益 = max(balance, equit
 bool     daily_halted = false;        // 当日是否已触发日内止损（触发后当日禁止新开仓）
 datetime daily_period_start = 0;      // 当前风控日起点（服务器时间）
 datetime last_status_write = 0;       // 上次写 ea_daily_status 状态表的时间
+
+//--- 权益止盈状态（通过 GlobalVariables 持久化；触发后永久停止开仓，直到 ForceResetEquityTP）
+bool     equity_tp_halted = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -69,6 +77,14 @@ int OnInit()
     else
         Print("🛡️ 日内止损(EA端): 已禁用");
     
+    // 初始化权益止盈（恢复或按 ForceResetEquityTP 清除）
+    EquityTakeProfitLoadOrReset();
+    if(EnableEquityTakeProfit)
+        Print("🎯 权益止盈(EA端): 已启用，目标权益=$", DoubleToString(EquityTakeProfitTarget, 2),
+              " 当前已停止=", equity_tp_halted ? "是" : "否");
+    else
+        Print("🎯 权益止盈(EA端): 已禁用");
+    
     return(INIT_SUCCEEDED);
 }
 
@@ -93,6 +109,8 @@ void OnTick()
 {
     // 日内亏损检查逐tick执行（不受节流影响）：真实权益对比触发线，触线立即全平
     DailyRiskCheck();
+    // 权益止盈同样逐tick：权益达到目标立即全平并永久停止开仓
+    EquityTakeProfitCheck();
     
     datetime current_time = TimeCurrent();
     if(current_time - last_check_time < CheckIntervalSeconds)
@@ -220,6 +238,14 @@ void ProcessSignal(long signal_id, string action)
 {
     bool result = false;
     double lots = 0;
+    
+    // 权益止盈已触发：永久禁止新开仓，只消费掉开仓信号（开关关闭时不拦截）
+    if(EnableEquityTakeProfit && equity_tp_halted && (action == "BUY" || action == "SELL"))
+    {
+        Print("🚫 权益止盈已触发，不再开仓，忽略信号: ", action);
+        MarkSignalConsumed(signal_id);
+        return;
+    }
     
     // 日内止损已触发：当日禁止一切新开仓，只消费掉开仓信号
     if(daily_halted && (action == "BUY" || action == "SELL"))
@@ -737,6 +763,7 @@ void UpdateDailyFloorSL(double floor_eq)
 
 //+------------------------------------------------------------------+
 //| 把当日风控状态写回信号数据库，Python 端读取后镜像记账               |
+//| tp_halted：权益止盈触发后永久为1，与日内 halted（当日）独立          |
 //+------------------------------------------------------------------+
 void WriteDailyStatus(string reason)
 {
@@ -747,19 +774,70 @@ void WriteDailyStatus(string reason)
     string create_sql = "CREATE TABLE IF NOT EXISTS ea_daily_status ("
                         "id INTEGER PRIMARY KEY CHECK (id = 1), "
                         "server_day TEXT, halted INTEGER, reason TEXT, "
-                        "anchor REAL, equity REAL, loss_floor REAL, updated_at TEXT)";
+                        "anchor REAL, equity REAL, loss_floor REAL, updated_at TEXT, "
+                        "tp_halted INTEGER DEFAULT 0)";
     DatabaseExecute(db_handle, create_sql);
+    // 兼容旧库：若无 tp_halted 列则补充（已存在时 SQLite 会报错，忽略即可）
+    DatabaseExecute(db_handle, "ALTER TABLE ea_daily_status ADD COLUMN tp_halted INTEGER DEFAULT 0");
     
     string sql = StringFormat(
-        "INSERT INTO ea_daily_status (id, server_day, halted, reason, anchor, equity, loss_floor, updated_at) "
-        "VALUES (1, '%s', %d, '%s', %.2f, %.2f, %.2f, '%s') "
+        "INSERT INTO ea_daily_status (id, server_day, halted, reason, anchor, equity, loss_floor, updated_at, tp_halted) "
+        "VALUES (1, '%s', %d, '%s', %.2f, %.2f, %.2f, '%s', %d) "
         "ON CONFLICT(id) DO UPDATE SET server_day=excluded.server_day, halted=excluded.halted, "
         "reason=excluded.reason, anchor=excluded.anchor, equity=excluded.equity, "
-        "loss_floor=excluded.loss_floor, updated_at=excluded.updated_at",
+        "loss_floor=excluded.loss_floor, updated_at=excluded.updated_at, tp_halted=excluded.tp_halted",
         TimeToString(daily_period_start, TIME_DATE), daily_halted ? 1 : 0, reason,
-        daily_anchor, AccountInfoDouble(ACCOUNT_EQUITY), DailyTriggerFloor(),
-        TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS));
+        daily_anchor, AccountInfoDouble(ACCOUNT_EQUITY),
+        (DailyLossPercent > 0) ? DailyTriggerFloor() : 0.0,
+        TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS),
+        equity_tp_halted ? 1 : 0);
     
     if(!DatabaseExecute(db_handle, sql))
         Print("⚠️ 写入 ea_daily_status 失败: ", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| ============ 账户权益止盈模块（EA端权威执行） ============         |
+//| Funded 账户常用：权益达到目标后全平并永久停止开仓，直到手动重置     |
+//+------------------------------------------------------------------+
+void EquityTakeProfitLoadOrReset()
+{
+    if(ForceResetEquityTP)
+    {
+        equity_tp_halted = false;
+        if(GlobalVariableCheck(DailyGVName("tp_halted")))
+            GlobalVariableDel(DailyGVName("tp_halted"));
+        Print("⚠️ ForceResetEquityTP=true，已清除权益止盈停止状态（完成后请取消勾选该参数再重新加载EA）");
+        WriteDailyStatus("equity_tp_reset");
+        return;
+    }
+    if(GlobalVariableCheck(DailyGVName("tp_halted")))
+        equity_tp_halted = GlobalVariableGet(DailyGVName("tp_halted")) > 0.5;
+    else
+        equity_tp_halted = false;
+}
+
+void EquityTakeProfitCheck()
+{
+    if(!EnableEquityTakeProfit)
+        return;
+    
+    if(equity_tp_halted)
+    {
+        if(TimeCurrent() - last_status_write >= 30)
+            WriteDailyStatus("equity_tp_halted");
+        return;
+    }
+    
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    if(equity < EquityTakeProfitTarget)
+        return;
+    
+    Print("🎯 !!!!! 权益达到止盈目标，立即全平并永久停止开仓 !!!!!");
+    Print("🎯 当前权益: $", DoubleToString(equity, 2),
+          " 止盈目标: $", DoubleToString(EquityTakeProfitTarget, 2));
+    CloseAllPositions();
+    equity_tp_halted = true;
+    GlobalVariableSet(DailyGVName("tp_halted"), 1.0);
+    WriteDailyStatus("equity_tp_halt");
 }
