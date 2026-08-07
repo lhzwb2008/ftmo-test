@@ -29,7 +29,7 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/止损金额）
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-LEVERAGE = 2  # 杠杆倍数
+LEVERAGE = None  # 杠杆倍数（启动时手动输入）
 
 # 风控比例（IC Markets 为实盘经纪商，非 prop firm 考试，无官方目标/日亏规则；设为负数保持禁用，可按需启用）
 PROFIT_TARGET_PCT = -1   # 账户止盈目标比例（负数=禁用）
@@ -116,8 +116,8 @@ class Logger:
         self.log.close()
 
 def prompt_capital_settings():
-    """启动时交互输入账户起始资金与当前金额，并按比例自动计算账户止盈/日内止损金额（比例为负时禁用）"""
-    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
+    """启动时交互输入账户起始资金、当前金额与杠杆，并按比例自动计算账户止盈/日内止损金额（比例为负时禁用）"""
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT, LEVERAGE
     
     while True:
         try:
@@ -137,7 +137,23 @@ def prompt_capital_settings():
     
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
-    
+
+    while True:
+        try:
+            lev_str = input("请输入杠杆倍数（如 4 / 2 / 1.5）: ").strip()
+            lev = float(lev_str)
+            if lev > 0:
+                LEVERAGE = lev
+                break
+            print("错误: 杠杆必须大于 0，请重新输入")
+        except ValueError:
+            print("错误: 请输入有效数字（如 4）")
+        except EOFError:
+            print("错误: 无法读取输入（非交互环境），程序退出")
+            sys.exit(1)
+
+    print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
+    print(f"⚠️ 提醒: 杠杆不会自动同步到 MT5。请在 EA 输入参数中将 Leverage 手动改为 {LEVERAGE}，否则实盘手数与模拟不一致")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")

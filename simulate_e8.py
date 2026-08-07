@@ -29,13 +29,12 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/止损金额）
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-LEVERAGE = 2  # 杠杆倍数（默认值，启动时按轮次自动设置）
+LEVERAGE = None  # 杠杆倍数（启动时手动输入）
 
 # 风控比例（E8 Pro 官方规则（1-step）:
 #   挑战阶段(1): 目标 8%；每日回撤 2.5%（硬违规）/ 最大回撤 8%（静态，相对初始余额）/ 单日利润上限 2%（超出部分不计入目标）
 #   Funded: 无利润目标；每日回撤/静态回撤/单日利润上限同上（首次提款后静态回撤线锁定在初始余额））
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
-PHASE_LEVERAGE = {"1": 2, "funded": 1.5}  # 各轮次杠杆倍数（静态回撤对策略友好，挑战期可用 2x；Funded 求稳降至 1.5）
 PHASE_DAILY_LOSS_PCT = {"1": 0.0225, "funded": 0.0225}  # 各轮次日内止损比例（官方 2.5% 留 10% 缓冲 → 2.25%）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 DAILY_LOSS_PCT = 0.0225    # 日内止损比例（默认值，启动时按轮次自动设置）
@@ -124,7 +123,7 @@ class Logger:
         self.log.close()
 
 def prompt_capital_settings():
-    """启动时交互输入考试轮次、账户起始资金与当前金额；按轮次自动设置杠杆并计算账户止盈/日内止损金额"""
+    """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈/日内止损金额"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
     global PROFIT_TARGET_PCT, LEVERAGE, DAILY_LOSS_PCT, MAX_DAILY_PROFIT_AMOUNT
     
@@ -151,16 +150,28 @@ def prompt_capital_settings():
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
-    LEVERAGE = PHASE_LEVERAGE[phase]
     DAILY_LOSS_PCT = PHASE_DAILY_LOSS_PCT[phase]
-    
+
+    while True:
+        try:
+            lev_str = input("请输入杠杆倍数（如 4 / 2 / 1.5）: ").strip()
+            lev = float(lev_str)
+            if lev > 0:
+                LEVERAGE = lev
+                break
+            print("错误: 杠杆必须大于 0，请重新输入")
+        except ValueError:
+            print("错误: 请输入有效数字（如 4）")
+        except EOFError:
+            print("错误: 无法读取输入（非交互环境），程序退出")
+            sys.exit(1)
+
     phase_label = {"1": "挑战阶段(E8 Pro 一阶段)", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
-    print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
+    print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
     print(f"日内止损比例: {DAILY_LOSS_PCT*100:.2f}% (官方每日回撤 2.5% 留 10% 缓冲)")
     print("ℹ️ E8 Pro 最大回撤为 8%（静态，相对初始余额，不追踪），首次提款后锁定在初始余额")
-    if phase == "funded":
-        print("⚠️ 提醒: 杠杆不会自动同步到 MT5。Funded 账户请在 EA 输入参数中将 Leverage 手动改为 1.5，否则实盘手数与模拟不一致")
+    print(f"⚠️ 提醒: 杠杆不会自动同步到 MT5。请在 EA 输入参数中将 Leverage 手动改为 {LEVERAGE}，否则实盘手数与模拟不一致")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")

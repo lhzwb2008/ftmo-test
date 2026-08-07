@@ -29,11 +29,10 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/止损金额）
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-LEVERAGE = 2  # 杠杆倍数（默认值，启动时按轮次自动设置）
+LEVERAGE = None  # 杠杆倍数（启动时手动输入）
 
 # 风控比例（FTMO 2-Step 官方规则: Phase1 目标 10% / Phase2 5% / Funded 无目标；最大日亏均 5%）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.10, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
-PHASE_LEVERAGE = {"1": 2, "2": 2, "funded": 1.5}  # 各轮次杠杆倍数
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 DAILY_LOSS_PCT = 0.045     # 日内止损比例（官方 5%，留 10% 缓冲，各轮次相同）
 TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标，覆盖点差/滑点/检测到成交之间的价格回撤，宁可超出目标也不能差一点没到）
@@ -123,7 +122,7 @@ class Logger:
         self.log.close()
 
 def prompt_capital_settings():
-    """启动时交互输入考试轮次、账户起始资金与当前金额；按轮次自动设置杠杆并计算账户止盈/日内止损金额"""
+    """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈/日内止损金额"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
     global PROFIT_TARGET_PCT, LEVERAGE
     
@@ -150,36 +149,25 @@ def prompt_capital_settings():
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
-    LEVERAGE = PHASE_LEVERAGE[phase]
 
-    # Funded 账户：手动指定杠杆（回车=默认 PHASE_LEVERAGE['funded']；如 0.5/1/1.5）
-    if phase == "funded":
-        while True:
-            try:
-                lev_str = input(
-                    f"请输入 Funded 杠杆倍数（回车=默认 {PHASE_LEVERAGE['funded']}x，例如 0.5 / 1 / 1.5）: "
-                ).strip()
-                if lev_str == "":
-                    LEVERAGE = PHASE_LEVERAGE["funded"]
-                    break
-                lev = float(lev_str)
-                if lev > 0:
-                    LEVERAGE = lev
-                    break
-                print("错误: 杠杆必须大于 0，请重新输入")
-            except ValueError:
-                print("错误: 请输入有效数字（如 1），或直接回车使用默认值")
-            except EOFError:
-                print("错误: 无法读取输入（非交互环境），程序退出")
-                sys.exit(1)
-    
+    while True:
+        try:
+            lev_str = input("请输入杠杆倍数（如 4 / 2 / 1.5）: ").strip()
+            lev = float(lev_str)
+            if lev > 0:
+                LEVERAGE = lev
+                break
+            print("错误: 杠杆必须大于 0，请重新输入")
+        except ValueError:
+            print("错误: 请输入有效数字（如 4）")
+        except EOFError:
+            print("错误: 无法读取输入（非交互环境），程序退出")
+            sys.exit(1)
+
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
-    if phase == "funded":
-        print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
-        print(f"⚠️ 提醒: 杠杆不会自动同步到 MT5。Funded 账户请在 EA 输入参数中将 Leverage 手动改为 {LEVERAGE}，否则实盘手数与模拟不一致")
-    else:
-        print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
+    print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
+    print(f"⚠️ 提醒: 杠杆不会自动同步到 MT5。请在 EA 输入参数中将 Leverage 手动改为 {LEVERAGE}，否则实盘手数与模拟不一致")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")

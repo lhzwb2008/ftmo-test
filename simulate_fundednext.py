@@ -29,11 +29,10 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 # 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/止损金额）
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-LEVERAGE = 2  # 杠杆倍数（默认值，启动时按轮次自动设置）
+LEVERAGE = None  # 杠杆倍数（启动时手动输入）
 
 # 风控比例（FundedNext Stellar 2-Step 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏均 5%）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
-PHASE_LEVERAGE = {"1": 2, "2": 2, "funded": 3}  # 各轮次杠杆倍数（FundedNext Funded 专用 3x）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 DAILY_LOSS_PCT = 0.045     # 日内止损比例（官方 5%，留 10% 缓冲，各轮次相同）
 TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标；账户达标会被平台自动关停，止盈只是兜底，宁可超出也不能因检测/成交间价格回撤而差一点没到）
@@ -182,7 +181,7 @@ def prompt_trading_time():
 
 
 def prompt_capital_settings():
-    """启动时交互输入考试轮次、账户起始资金与当前金额；按轮次自动设置杠杆并计算账户止盈/日内止损金额"""
+    """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈/日内止损金额"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
     global PROFIT_TARGET_PCT, LEVERAGE
     
@@ -209,14 +208,27 @@ def prompt_capital_settings():
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
-    LEVERAGE = PHASE_LEVERAGE[phase]
+
+    while True:
+        try:
+            lev_str = input("请输入杠杆倍数（如 4 / 2 / 1.5）: ").strip()
+            lev = float(lev_str)
+            if lev > 0:
+                LEVERAGE = lev
+                break
+            print("错误: 杠杆必须大于 0，请重新输入")
+        except ValueError:
+            print("错误: 请输入有效数字（如 4）")
+        except EOFError:
+            print("错误: 无法读取输入（非交互环境），程序退出")
+            sys.exit(1)
+
     prompt_trading_time()
 
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
-    print(f"杠杆倍数: {LEVERAGE}x (按轮次自动设置)")
-    if phase == "funded":
-        print("⚠️ 提醒: FundedNext Funded 模拟杠杆为 3x，不会自动同步到 MT5。请修改 SQLiteSignalEA_fundednext.mq5 中 Leverage 为 3 并重新编译（或在 EA 输入参数中手动设为 3），否则实盘手数与模拟不一致")
+    print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
+    print(f"⚠️ 提醒: 杠杆不会自动同步到 MT5。请在 EA 输入参数中将 Leverage 手动改为 {LEVERAGE}，否则实盘手数与模拟不一致")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
