@@ -26,7 +26,7 @@ load_dotenv(override=True)
 # 交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
-# 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈/止损金额）
+# 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈金额；日内止损由 MT5 EA 执行）
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
 LEVERAGE = None  # 杠杆倍数（启动时手动输入）
@@ -34,12 +34,10 @@ LEVERAGE = None  # 杠杆倍数（启动时手动输入）
 # 风控比例（Blueberry Funded Prime 2-Step 官方规则: Phase1 目标 8% / Phase2 6% / Funded 无目标；最大日亏均 4%）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.06, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
-DAILY_LOSS_PCT = 0.036     # 日内止损比例（官方 4%，留 10% 缓冲，各轮次相同）
 TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标；账户达标会被平台自动关停，止盈只是兜底，宁可超出也不能因检测/成交间价格回撤而差一点没到）
 
-# 止盈止损设置（金额）——启动时按上述比例自动计算，请勿手动修改
+# 止盈设置（金额）——启动时按上述比例自动计算，请勿手动修改；日内止损由 MT5 EA 执行
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
-MAX_DAILY_LOSS_AMOUNT = -1  # 日内最大亏损金额（自动计算；负数表示未初始化/禁用）
 
 # 交易时间设置
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
@@ -117,8 +115,8 @@ class Logger:
         self.log.close()
 
 def prompt_capital_settings():
-    """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈/日内止损金额"""
-    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
+    """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈金额"""
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
     global PROFIT_TARGET_PCT, LEVERAGE
     
     while True:
@@ -177,10 +175,8 @@ def prompt_capital_settings():
             sys.exit(0)
     else:
         MAX_PROFIT_AMOUNT = -1
-        print("账户止盈: 已禁用（Funded 账户无利润目标，仅保留日内止损）")
+        print("账户止盈: 已禁用（Funded 账户无利润目标，日内止损由 EA 执行）")
     
-    # 日内止损已迁移至 MT5 EA 端（真实权益逐tick监控 + broker服务器端SL），Python 端不再计算限额
-    MAX_DAILY_LOSS_AMOUNT = -1
     print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
 
 # SQLite数据库路径 - 使用MT5通用目录
@@ -817,10 +813,6 @@ def daily_loss_monitor_thread(symbol, position_data):
                         profit_remain = MAX_PROFIT_AMOUNT - current_total_pnl
                         status_parts.append(f"距止盈: ${profit_remain:.2f}")
                     
-                    if MAX_DAILY_LOSS_AMOUNT > 0:
-                        loss_remain = MAX_DAILY_LOSS_AMOUNT + current_daily_pnl
-                        status_parts.append(f"距日内止损: ${loss_remain:.2f}")
-                    
                     status_parts.append(f"持仓: {position_quantity}")
                     
                     if LOG_VERBOSE:
@@ -877,7 +869,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
     global TOTAL_PNL, DAILY_PNL, LAST_STATS_DATE, DAILY_TRADES, DAILY_STOP_TRIGGERED, PROFIT_TARGET_TRIGGERED
-    global MAX_DAILY_LOSS_AMOUNT, DAILY_LOSS_MONITOR_ACTIVE, FORCE_CLOSE_POSITION
+    global DAILY_LOSS_MONITOR_ACTIVE, FORCE_CLOSE_POSITION
     
     now_et = get_us_eastern_time()
     print(f"启动交易策略 - 交易品种: {symbol}")
@@ -1786,7 +1778,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             break
             
         # 同步持仓状态给监控线程：平仓后本轮会进入长时间 sleep，若不立即同步，
-        # 监控线程会读到已平仓的旧持仓并把未实现盈亏重复计入，导致日内止损被误触发
+        # 监控线程会读到已平仓的旧持仓并把未实现盈亏重复计入，导致当日盈亏统计不准
         with pnl_lock:
             position_data['quantity'] = position_quantity
             position_data['entry_price'] = entry_price

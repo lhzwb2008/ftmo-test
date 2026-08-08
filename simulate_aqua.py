@@ -31,7 +31,7 @@ ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
 LEVERAGE = None  # 杠杆倍数（启动时手动输入）
 
-# 风控比例（FundedNext Stellar 2-Step 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏均 5%）
+# 风控比例（AquaFunded 2-Step Standard 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏 5%；最大回撤 8% static）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标；账户达标会被平台自动关停，止盈只是兜底，宁可超出也不能因检测/成交间价格回撤而差一点没到）
@@ -39,7 +39,7 @@ TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调�
 # 止盈设置（金额）——启动时按上述比例自动计算，请勿手动修改；日内止损由 MT5 EA 执行
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
 
-# 交易时间设置（FundedNext 专用：启动时手动选择，与轮次无关；多账户错开开仓时间避免 copy 嫌疑）
+# 交易时间设置（Aqua 专用：启动时手动选择；一次买多个账户时请错开开仓时间）
 TRADING_SESSION_HOURS = 6  # 交易窗口长度（小时），结束时间 = 开始时间 + 此值
 TRADING_TIME_PRESETS = {
     "1": (9, 39, "09:39 (Challenge 常用)"),
@@ -79,7 +79,7 @@ LOG_VERBOSE = False  # 设置为True开启详细日志（主循环/等待/时间
 # ============================================================================
 
 # 日志文件路径
-LOG_FILE = "trading_fundednext.log"
+LOG_FILE = "trading_aqua.log"
 
 # 收益统计变量
 TOTAL_PNL = 0.0  # 总收益（累计）
@@ -149,10 +149,10 @@ def parse_trading_time_input(raw):
 
 
 def prompt_trading_time():
-    """FundedNext 专用：启动时手动选择交易开始时间，与轮次无关，便于多账户错开避免 copy"""
+    """Aqua 专用：启动时手动选择交易开始时间，便于多账户错开"""
     global TRADING_START_TIME, TRADING_END_TIME
 
-    print("\n--- 交易时间设置 (FundedNext: 多账户请手动错开开仓时间，避免 copy 嫌疑) ---")
+    print("\n--- 交易时间设置 (Aqua: 多账户请手动错开开仓时间) ---")
     for key, (h, m, label) in TRADING_TIME_PRESETS.items():
         print(f"  {key} = {label}")
     print("  或直接输入时间 HH:MM / HHMM（如 9:45）")
@@ -242,6 +242,7 @@ def prompt_capital_settings():
     else:
         MAX_PROFIT_AMOUNT = -1
         print("账户止盈: 已禁用（Funded 账户无利润目标，日内止损由 EA 执行）")
+        print("⚠️ Aqua Funded Wave Stop: 请在 EA 将 HardSLRiskPercent 设为 1.8~2.0（Challenge 保持 0）")
     
     print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
 
@@ -255,7 +256,7 @@ def get_common_files_dir():
     return "."
 
 
-DB_PATH = os.path.join(get_common_files_dir(), "trading_signals_fundednext.db")
+DB_PATH = os.path.join(get_common_files_dir(), "trading_signals_aqua.db")
 
 
 def get_market_data_db_path():
@@ -412,7 +413,7 @@ def init_ea_close_seq():
 def check_ea_external_close():
     """读取 EA 写回的 ea_position.close_seq。
 
-    FundedNext Funded 账户的硬止损挂在 broker 服务器：触及时 MT5 持仓被直接打掉，
+    Aqua Funded 账户：Wave Stop≈合计浮亏 2% 强平；EA 用单笔硬止损(~2%)挂在 broker 兜底：触及时 MT5 持仓被打掉，
     不会经过 Python 信号。EA 检测到仓位消失后递增 close_seq；此处发现新序号则返回 True，
     调用方应镜像平掉模拟仓（但不禁止当日再开仓，硬止损≠日亏 halt）。
 
@@ -921,7 +922,7 @@ def daily_loss_monitor_thread(symbol, position_data):
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置强制平仓标志")
                     break
                 
-                # FundedNext：硬止损/服务器SL打掉实盘仓 → 通知主循环镜像平仓（不 halt 当日）
+                # Aqua：硬止损/Wave Stop 强平实盘仓 → 通知主循环镜像平仓（不 halt 当日）
                 # 注意：无论是否持仓都要调用，及时消费序号增量，避免遗留序号被算到下一笔新仓头上
                 ea_ext_closed, ea_ext_reason, ea_has_position = check_ea_external_close()
                 if ea_ext_closed:
@@ -1064,7 +1065,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             position_data['quantity'] = position_quantity
             position_data['entry_price'] = entry_price
         
-        # FundedNext：EA 端硬止损/服务器SL打掉实盘仓后，镜像平掉模拟仓（不禁当日再开）
+        # Aqua：EA 端硬止损打掉实盘仓后，镜像平掉模拟仓（不禁当日再开）
         if position_quantity != 0 and EA_MIRROR_CLOSE:
             reason = EA_MIRROR_CLOSE_REASON or "external_close"
             EA_MIRROR_CLOSE = False
@@ -1992,7 +1993,7 @@ if __name__ == "__main__":
     sys.stderr = sys.stdout  # 错误信息也记录到日志
     
     print("\n" + "=" * 60)
-    print("长桥API交易策略启动 - 模拟模式 (FundedNext)")
+    print("长桥API交易策略启动 - 模拟模式 (AquaFunded 2-Step Standard)")
     print("=" * 60)
     
     print("\n--- 账户资金设置 ---")

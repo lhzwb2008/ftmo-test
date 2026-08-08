@@ -146,6 +146,11 @@ def main():
             'label': 'Goat Funded Trader',
             'path': None
         },
+        {
+            'name': 'trading_signals_aqua.db',
+            'label': 'AquaFunded',
+            'path': None
+        },
     ]
     
     # 获取数据库路径并初始化

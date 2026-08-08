@@ -108,6 +108,7 @@ def main():
         ("trading_signals_ttp.db", "The Trading Pit"),
         ("trading_signals_blueberry.db", "Blueberry Funded"),
         ("trading_signals_goat.db", "Goat Funded Trader"),
+        ("trading_signals_aqua.db", "AquaFunded"),
     ]
     
     # 检查每个数据库
