@@ -26,7 +26,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 ### Running
 
 - **Standalone utility scripts** (`check_db.py`, `test_three_db_signals.py`, `clear_db_data.py`, `delete_db.py`) work without any API credentials.
-- **Trading simulators** (`simulate_ftmo.py`, `simulate_fundednext.py`, `simulate_the5ers.py`, `simulate_icmarkets.py`, `simulate_ttp.py`, `simulate_blueberry.py`, `simulate_goat.py`, `simulate_aqua.py`) require Longport API credentials via a `.env` file or environment variables:
+- **Trading simulators** (`simulate_ftmo.py`, `simulate_fundednext.py`, `simulate_the5ers.py`, `simulate_icmarkets.py`, `simulate_ttp.py`, `simulate_blueberry.py`, `simulate_goat.py`, `simulate_aqua.py`, `simulate_aqua_paylater.py`) require Longport API credentials via a `.env` file or environment variables:
   - `LONGPORT_APP_KEY`
   - `LONGPORT_APP_SECRET`
   - `LONGPORT_ACCESS_TOKEN`
@@ -40,6 +40,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 - SQLite database files (`*.db`) are gitignored.
 - All comments and log messages are in Chinese (Simplified Chinese).
 - On Linux, SQLite DBs are created in the current working directory. On Windows, they go to the MT5 common files directory.
+- **Aqua Standard vs Pay Later**: `simulate_aqua.py` / `SQLiteSignalEA_aqua.mq5` = 2-Step Standard（`trading_signals_aqua_{n}.db`, Magic `20260808+n`）。`simulate_aqua_paylater.py` / `SQLiteSignalEA_aqua_paylater.mq5` = One-Step Pay Later（`trading_signals_aqua_paylater_{n}.db`, Magic `20260818+n`）。两套不可混用；Pay Later 启动时选 `challenge` 或 `funded`，EA 用 `AccountPhase` 对齐。
 - The MQ5 EAs rely on `OnTick()` to poll the database. If a broker (e.g. IC Markets) delivers ticks late at market open, signals may be delayed. A potential fix is adding `OnTimer()` as a fallback.
 - IC Markets EA has a known issue: it frequently stops and restarts (visible in MT5 logs as repeated "EA已停止" → reinitialization cycles). Root cause is under investigation.
 

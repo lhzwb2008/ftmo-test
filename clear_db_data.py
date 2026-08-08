@@ -139,6 +139,10 @@ def main():
         ("trading_signals_aqua_2.db", "AquaFunded #2"),
         ("trading_signals_aqua_3.db", "AquaFunded #3"),
         ("trading_signals_aqua_4.db", "AquaFunded #4"),
+        ("trading_signals_aqua_paylater_1.db", "Aqua PayLater #1"),
+        ("trading_signals_aqua_paylater_2.db", "Aqua PayLater #2"),
+        ("trading_signals_aqua_paylater_3.db", "Aqua PayLater #3"),
+        ("trading_signals_aqua_paylater_4.db", "Aqua PayLater #4"),
     ]
     
     print("ℹ️  此操作将清空所有交易信号数据库中的数据")

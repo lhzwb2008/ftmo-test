@@ -166,6 +166,26 @@ def main():
             'label': 'AquaFunded #4',
             'path': None
         },
+        {
+            'name': 'trading_signals_aqua_paylater_1.db',
+            'label': 'Aqua PayLater #1',
+            'path': None
+        },
+        {
+            'name': 'trading_signals_aqua_paylater_2.db',
+            'label': 'Aqua PayLater #2',
+            'path': None
+        },
+        {
+            'name': 'trading_signals_aqua_paylater_3.db',
+            'label': 'Aqua PayLater #3',
+            'path': None
+        },
+        {
+            'name': 'trading_signals_aqua_paylater_4.db',
+            'label': 'Aqua PayLater #4',
+            'path': None
+        },
     ]
     
     # 获取数据库路径并初始化
