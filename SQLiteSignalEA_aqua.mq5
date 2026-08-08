@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 // 添加必要的权限声明
@@ -14,10 +14,9 @@
 #include <Trade\Trade.mqh>
 #include <Trade\AccountInfo.mqh>
 
-//--- 输入参数
-input string   DBPath = "trading_signals_aqua.db";     // SQLite数据库文件名（AquaFunded）
+//--- 输入参数（多账户只需改 InstanceId=1/2/3/4，DB与Magic自动）
+input int      InstanceId = 1;                         // 实例编号 1/2/3/4（与 Python 启动输入一致）
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
-input int      MagicNumber = 20260808;                 // 魔术数字（Aqua 专用，勿与其他 EA 冲突）
 input double   Leverage = 2;                        // 杠杆倍数
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
@@ -34,6 +33,8 @@ input bool     ForceResetDailyRisk = false;            // 强制重置日内锚�
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+string   g_db_path = "";              // 运行时: trading_signals_aqua_{InstanceId}.db
+int      g_magic = 0;                 // 运行时魔术号
 
 //--- 日内亏损风控状态（通过 GlobalVariables 持久化，EA 重启不丢失）
 double   daily_anchor = 0.0;          // 日初锚点权益 = max(balance, equity)，比各家官方锚点定义都保守
@@ -47,6 +48,7 @@ int      ea_close_seq = 0;            // 外部平仓序号（递增），simula
 bool     internal_close_pending = false; // EA 自己执行了平仓（CLOSE信号/反手/日亏全平），下次持仓消失不算外部平仓
 
 //--- 前向声明（MQL5 要求先声明后使用）
+bool ResolveInstanceSettings();
 string DailyGVName(string suffix);
 double DailyLossLimitUSD();
 double DailyTriggerFloor();
@@ -61,8 +63,11 @@ double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type)
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    if(!ResolveInstanceSettings())
+        return(INIT_PARAMETERS_INCORRECT);
+
     // 设置魔术数字
-    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetExpertMagicNumber(g_magic);
     
     // 打开SQLite数据库
     if(!OpenDatabase())
@@ -72,6 +77,9 @@ int OnInit()
     }
     
     Print("✅ EA初始化成功");
+    Print("🔢 Aqua 实例编号: ", InstanceId);
+    Print("🗄 信号库: ", g_db_path);
+    Print("🪄 Magic: ", g_magic);
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
     
@@ -237,7 +245,7 @@ void UpdateProtectiveSL()
         ulong ticket = PositionGetTicket(i);
         if(!PositionSelectByTicket(ticket))
             continue;
-        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+        if(PositionGetInteger(POSITION_MAGIC) != g_magic)
             continue;
         
         double lots = PositionGetDouble(POSITION_VOLUME);
@@ -298,6 +306,25 @@ void EnsureStopLosses()
 }
 
 //+------------------------------------------------------------------+
+//| 按 InstanceId 解析信号库文件名与 Magic（与 simulate_aqua.py 对齐）   |
+//+------------------------------------------------------------------+
+bool ResolveInstanceSettings()
+{
+    if(InstanceId < 1)
+    {
+        Print("❌ InstanceId 必须是 1/2/3/4…（与 Python 启动编号一致）");
+        return false;
+    }
+
+    // 仅由编号推导，无需再配 DB / Magic
+    g_db_path = "trading_signals_aqua_" + IntegerToString(InstanceId) + ".db";
+    g_magic = 20260808 + InstanceId;
+
+    Print("🔗 实例 #", InstanceId, " → ", g_db_path, " / Magic=", g_magic);
+    return true;
+}
+
+//+------------------------------------------------------------------+
 //| 打开SQLite数据库                                                  |
 //+------------------------------------------------------------------+
 bool OpenDatabase()
@@ -308,12 +335,12 @@ bool OpenDatabase()
     if(UseCommonPath)
     {
         // 使用通用目录 - 所有MT5终端共享
-        full_path = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\" + DBPath;
+        full_path = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\" + g_db_path;
     }
     else
     {
         // 使用当前终端的Files目录
-        full_path = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL5\\Files\\" + DBPath;
+        full_path = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL5\\Files\\" + g_db_path;
     }
     
     // 打印调试信息
@@ -325,11 +352,11 @@ bool OpenDatabase()
     // 方式1: 尝试读写模式
     if(UseCommonPath)
     {
-        db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READWRITE | DATABASE_OPEN_COMMON);
+        db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READWRITE | DATABASE_OPEN_COMMON);
     }
     else
     {
-        db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READWRITE);
+        db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READWRITE);
     }
     
     if(db_handle == INVALID_HANDLE)
@@ -337,11 +364,11 @@ bool OpenDatabase()
         Print("❌ 读写模式失败，尝试只读模式...");
         if(UseCommonPath)
         {
-            db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READONLY | DATABASE_OPEN_COMMON);
+            db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READONLY | DATABASE_OPEN_COMMON);
         }
         else
         {
-            db_handle = DatabaseOpen(DBPath, DATABASE_OPEN_READONLY);
+            db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READONLY);
         }
     }
     
@@ -531,7 +558,7 @@ bool HasPosition()
         ulong ticket = PositionGetTicket(i);
         if(PositionSelectByTicket(ticket))
         {
-            if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            if(PositionGetInteger(POSITION_MAGIC) == g_magic)
                 return true;
         }
     }
@@ -549,7 +576,7 @@ int GetPositionType()
         ulong ticket = PositionGetTicket(i);
         if(PositionSelectByTicket(ticket))
         {
-            if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            if(PositionGetInteger(POSITION_MAGIC) == g_magic)
             {
                 ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
                 if(type == POSITION_TYPE_BUY)
@@ -572,7 +599,7 @@ void CloseAllPositions()
         ulong ticket = PositionGetTicket(i);
         if(PositionSelectByTicket(ticket))
         {
-            if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            if(PositionGetInteger(POSITION_MAGIC) == g_magic)
             {
                 // 标记为 EA 自身平仓：SyncPositionState 据此跳过 close_seq 递增，
                 // 避免 simulate 把 EA 响应 CLOSE 信号的正常平仓误判成硬止损外部平仓
@@ -764,7 +791,7 @@ double CalculateLotSize()
 
 string DailyGVName(string suffix)
 {
-    return "DLS_" + IntegerToString(MagicNumber) + "_" + suffix;
+    return "DLS_" + IntegerToString(g_magic) + "_" + suffix;
 }
 
 double DailyLossLimitUSD()
@@ -889,7 +916,7 @@ void SyncPositionState()
         ulong t = PositionGetTicket(i);
         if(!PositionSelectByTicket(t))
             continue;
-        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+        if(PositionGetInteger(POSITION_MAGIC) != g_magic)
             continue;
         ticket = t;
         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);

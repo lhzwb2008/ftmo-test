@@ -147,8 +147,23 @@ def main():
             'path': None
         },
         {
-            'name': 'trading_signals_aqua.db',
-            'label': 'AquaFunded',
+            'name': 'trading_signals_aqua_1.db',
+            'label': 'AquaFunded #1',
+            'path': None
+        },
+        {
+            'name': 'trading_signals_aqua_2.db',
+            'label': 'AquaFunded #2',
+            'path': None
+        },
+        {
+            'name': 'trading_signals_aqua_3.db',
+            'label': 'AquaFunded #3',
+            'path': None
+        },
+        {
+            'name': 'trading_signals_aqua_4.db',
+            'label': 'AquaFunded #4',
             'path': None
         },
     ]

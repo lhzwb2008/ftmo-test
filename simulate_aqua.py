@@ -78,8 +78,13 @@ LOG_VERBOSE = False  # 设置为True开启详细日志（主循环/等待/时间
 # 程序内部变量 - 请勿手动修改
 # ============================================================================
 
-# 日志文件路径
+# 多账户实例隔离（启动时输入编号；与 MT5 EA 的 InstanceId 必须一致）
+INSTANCE_ID = None  # 1/2/3/4…
+AQUA_MAGIC_BASE = 20260808  # EA Magic = 此值 + INSTANCE_ID（与 mq5 默认一致）
+
+# 日志 / 信号库路径（prompt_instance_id → apply_instance_paths 后赋值）
 LOG_FILE = "trading_aqua.log"
+DB_PATH = None
 
 # 收益统计变量
 TOTAL_PNL = 0.0  # 总收益（累计）
@@ -256,7 +261,35 @@ def get_common_files_dir():
     return "."
 
 
-DB_PATH = os.path.join(get_common_files_dir(), "trading_signals_aqua.db")
+def apply_instance_paths(instance_id):
+    """按实例编号隔离日志与信号库；行情缓存仍共用。"""
+    global INSTANCE_ID, LOG_FILE, DB_PATH
+    INSTANCE_ID = int(instance_id)
+    LOG_FILE = f"trading_aqua_{INSTANCE_ID}.log"
+    DB_PATH = os.path.join(get_common_files_dir(), f"trading_signals_aqua_{INSTANCE_ID}.db")
+    return INSTANCE_ID
+
+
+def prompt_instance_id():
+    """只需输入 1/2/3/4，自动隔离 DB/日志；与 EA InstanceId 对齐。"""
+    env_id = os.environ.get("AQUA_INSTANCE_ID", "").strip()
+    while True:
+        try:
+            raw = env_id if env_id else input("Aqua 编号 (1/2/3/4): ").strip()
+            env_id = ""
+            n = int(raw)
+            if n < 1:
+                print("请输入 >= 1 的整数")
+                continue
+            apply_instance_paths(n)
+            print(f"✓ #{INSTANCE_ID}  →  {os.path.basename(DB_PATH)}  /  {LOG_FILE}")
+            print(f"  MT5 EA 只需把 InstanceId 设为 {INSTANCE_ID}")
+            return INSTANCE_ID
+        except ValueError:
+            print("请输入数字，例如 1")
+        except EOFError:
+            print("非交互环境请设置 AQUA_INSTANCE_ID=1")
+            sys.exit(1)
 
 
 def get_market_data_db_path():
@@ -1988,21 +2021,27 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 remaining -= chunk
 
 if __name__ == "__main__":
-    # 启用日志记录（同时输出到控制台和文件）
-    sys.stdout = Logger(LOG_FILE)
-    sys.stderr = sys.stdout  # 错误信息也记录到日志
-    
     print("\n" + "=" * 60)
     print("长桥API交易策略启动 - 模拟模式 (AquaFunded 2-Step Standard)")
     print("=" * 60)
+
+    print("\n--- 实例隔离（多账户必填）---")
+    prompt_instance_id()
+
+    # 启用日志记录（须在确定 INSTANCE_ID / LOG_FILE 之后）
+    sys.stdout = Logger(LOG_FILE)
+    sys.stderr = sys.stdout  # 错误信息也记录到日志
+    print(f"[实例 {INSTANCE_ID}] 日志已写入 {os.path.abspath(LOG_FILE)}")
     
     print("\n--- 账户资金设置 ---")
     prompt_capital_settings()
     
-    print("版本: 1.0.0")
+    print("版本: 1.1.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
+    print(f"Aqua 实例编号: {INSTANCE_ID}")
+    print(f"信号库: {os.path.abspath(DB_PATH)}")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
-    print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
+    print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}（各实例共用）")
     
     print("\n--- 用户配置参数 ---")
     print(f"交易品种: {SYMBOL}")
