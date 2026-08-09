@@ -30,7 +30,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
   - `LONGPORT_APP_KEY`
   - `LONGPORT_APP_SECRET`
   - `LONGPORT_ACCESS_TOKEN`
-- **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `IBUST100`；需本机已登录 IB Gateway（Paper `4002` / Live `4001`），见脚本头注释与 `.env.example` 中 `IB_*` 变量。不写 SQLite、不跑 MT5。
+- **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `IBUST100`；需本机已登录 IB Gateway。IB 连接参数写死在脚本常量（默认 `127.0.0.1:4001`）；`.env` 仅需 Longport 凭证。不写 SQLite、不跑 MT5。
 - **Data fetcher** (`data_fetch_from_longport.py`) also requires Longport credentials.
 
 ### Key gotchas

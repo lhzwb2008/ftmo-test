@@ -18,6 +18,7 @@ Windows 运行前准备：
   5. pip install -r requirements.txt（含 ib_insync）
   6. python simulate_ibkr.py
 
+.env 仅需 Longport 凭证；IB 连接参数写死在下方常量。
 硬约束：IBUST100 最小 1 手 = 1×指数点位名义（约 $30k）；资金×杠杆不足 1 手则跳过开仓。
 风险：QQQ 信号 vs 纳指 CFD 存在基差；非 LLC/无 CFD 权限时 qualify 会失败。
 """
@@ -53,12 +54,14 @@ load_dotenv(override=True)
 # ============================================================================
 
 # 信号品种（Longport 缓存）与执行合约（IBKR CFD）
-SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
-TRADE_SYMBOL = os.environ.get('IB_TRADE_SYMBOL', 'IBUST100')
-IB_HOST = os.environ.get('IB_HOST', '127.0.0.1')
-IB_PORT = int(os.environ.get('IB_PORT', '4002'))  # Paper=4002, Live=4001
-IB_CLIENT_ID = int(os.environ.get('IB_CLIENT_ID', '1'))
-IB_ACCOUNT = os.environ.get('IB_ACCOUNT', '')  # 空=自动取 managedAccounts[0]
+SYMBOL = 'QQQ.US'
+TRADE_SYMBOL = 'IBUST100'
+# IB Gateway（与 Configure → API → Socket port 保持一致；Paper 常见 4002，Live 常见 4001）
+IB_HOST = '127.0.0.1'
+IB_PORT = 4001
+IB_CLIENT_ID = 1
+IB_ACCOUNT = ''  # 空=自动取 managedAccounts[0]
+IB_LEVERAGE_DEFAULT = 20
 
 # 资金和风控设置（启动时交互输入）
 ACCOUNT_START_BALANCE = None
@@ -152,7 +155,7 @@ def prompt_leverage_settings():
     """仅询问目标杠杆（仓位 = 账户净值 × 杠杆）。金额从 IB 账户读取，不再手输。"""
     global LEVERAGE, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
 
-    default_lev = float(os.environ.get('IB_LEVERAGE', '20') or 20)
+    default_lev = float(IB_LEVERAGE_DEFAULT)
     while True:
         try:
             lev_str = input(f"请输入目标杠杆倍数（回车默认 {default_lev:g}，零售纳指 CFD 常见上限约 20）: ").strip()
