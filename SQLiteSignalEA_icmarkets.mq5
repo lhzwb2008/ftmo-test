@@ -235,7 +235,7 @@ void OnTimer()
 {
     bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
     if(!connected && last_terminal_connected)
-        Print("⚠️ 终端与 IC Markets 断连，OnTick 已停止；定时器仍在轮询 DB");
+        Print("⚠️ 终端与 IC Markets 断连，OnTick 已停止；定时器仍在轮询 DB，但下单需等重连后才会成功");
     else if(connected && !last_terminal_connected)
         Print("✅ 终端已重新连接 IC Markets");
     last_terminal_connected = connected;
@@ -350,6 +350,11 @@ bool OpenDatabase()
 void CheckDatabaseSignals()
 {
     if(db_handle == INVALID_HANDLE)
+        return;
+
+    // 断连期间不处理信号：保留在DB中等重连后执行，避免下单失败被误消费
+    // 若断连时间过长，信号会走过期逻辑（IsSignalExpired）或堆积丢弃逻辑，不会乱补单
+    if(!(bool)TerminalInfoInteger(TERMINAL_CONNECTED))
         return;
     
     // 先统计未消费信号数量
@@ -571,8 +576,20 @@ void ProcessSignal(long signal_id, string action)
     {
         uint retcode = trade.ResultRetcode();
         Print("❌ 执行失败，错误码: ", retcode, " 描述: ", trade.ResultRetcodeDescription());
-        // 无论何种失败，都标记信号为已消费，避免无限重试
-        // 若需重试，应由Python端重新写入新信号
+
+        // 连接类失败（断连/超时/重报价）不消费信号，等重连后由定时器重试
+        // 信号过期由 IsSignalExpired 兜底，不会无限重试过期信号
+        if(retcode == TRADE_RETCODE_CONNECTION ||
+           retcode == TRADE_RETCODE_TIMEOUT ||
+           retcode == TRADE_RETCODE_REQUOTE ||
+           retcode == TRADE_RETCODE_PRICE_OFF ||
+           !(bool)TerminalInfoInteger(TERMINAL_CONNECTED))
+        {
+            Print("🔁 判定为连接/报价类临时失败，信号保留待重试 (ID: ", signal_id, ")");
+            return;
+        }
+
+        // 其他失败（保证金不足、品种不可交易等）标记为已消费，避免无限重试
         MarkSignalConsumed(signal_id);
     }
 }
