@@ -148,66 +148,75 @@ class Logger:
     def close(self):
         self.log.close()
 
-def prompt_capital_settings():
-    """启动时交互输入账户起始资金、当前金额与杠杆，并按比例自动计算账户止盈/日内止损金额（比例为负时禁用）"""
-    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT, LEVERAGE
-    
-    while True:
-        try:
-            start_str = input("请输入账户起始资金（如 100000）: ").strip()
-            current_str = input("请输入账户当前金额（如 100000）: ").strip()
-            start_balance = float(start_str)
-            current_balance = float(current_str)
-            if start_balance <= 0 or current_balance <= 0:
-                print("错误: 金额必须大于 0，请重新输入")
-                continue
-            break
-        except ValueError:
-            print("错误: 输入格式不正确，请输入数字")
-        except EOFError:
-            print("错误: 无法读取输入（非交互环境），程序退出")
-            sys.exit(1)
-    
-    ACCOUNT_START_BALANCE = start_balance
-    INITIAL_CAPITAL = current_balance
+def prompt_leverage_settings():
+    """仅询问目标杠杆（仓位 = 账户净值 × 杠杆）。金额从 IB 账户读取，不再手输。"""
+    global LEVERAGE, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
 
+    default_lev = float(os.environ.get('IB_LEVERAGE', '20') or 20)
     while True:
         try:
-            lev_str = input("请输入杠杆倍数（如 4 / 2 / 1.5）: ").strip()
-            lev = float(lev_str)
+            lev_str = input(f"请输入目标杠杆倍数（回车默认 {default_lev:g}，零售纳指 CFD 常见上限约 20）: ").strip()
+            if not lev_str:
+                lev = default_lev
+            else:
+                lev = float(lev_str)
             if lev > 0:
                 LEVERAGE = lev
                 break
             print("错误: 杠杆必须大于 0，请重新输入")
         except ValueError:
-            print("错误: 请输入有效数字（如 4）")
+            print("错误: 请输入有效数字（如 20）")
         except EOFError:
-            print("错误: 无法读取输入（非交互环境），程序退出")
-            sys.exit(1)
+            print(f"非交互环境，使用默认杠杆 {default_lev:g}x")
+            LEVERAGE = default_lev
+            break
 
-    print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
-    print(f"⚠️ 提醒: 请确认 IB Gateway 保证金/杠杆与输入一致；纳指指数 CFD 零售常见上限约 20×")
-    print(f"账户起始资金: ${start_balance:.2f}")
-    print(f"账户当前金额: ${current_balance:.2f}")
-    print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
-    
+    print(f"杠杆倍数: {LEVERAGE:g}x")
+    print("⚠️ 提醒: 实际保证金以 Gateway 为准；若账户保证金率高于 5%，有效杠杆会低于输入值")
+
+    # 自营默认不做 FTMO 式账户止盈/日亏；仅当配置里打开比例时才启用
     if PROFIT_TARGET_PCT > 0:
-        tp_buffer = start_balance * TP_BUFFER_PCT
-        MAX_PROFIT_AMOUNT = start_balance * PROFIT_TARGET_PCT - (current_balance - start_balance) + tp_buffer
-        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 起始资金 × {PROFIT_TARGET_PCT*100:.1f}% − 已有盈亏 + 余量 ${tp_buffer:.2f})")
-        if MAX_PROFIT_AMOUNT <= 0:
-            print("警告: 当前金额已达到/超过账户止盈目标，无需继续交易，程序退出")
-            sys.exit(0)
+        MAX_PROFIT_AMOUNT = None  # 待拿到账户净值后再算
     else:
         MAX_PROFIT_AMOUNT = -1
         print("账户止盈: 已禁用（PROFIT_TARGET_PCT 为负）")
-    
+
     if DAILY_LOSS_PCT > 0:
-        MAX_DAILY_LOSS_AMOUNT = min(start_balance, current_balance) * DAILY_LOSS_PCT
-        print(f"日内止损金额: ${MAX_DAILY_LOSS_AMOUNT:.2f} (= min(起始资金, 当前金额) × {DAILY_LOSS_PCT*100:.1f}%)")
+        MAX_DAILY_LOSS_AMOUNT = None
     else:
         MAX_DAILY_LOSS_AMOUNT = -1
         print("日内止损: 已禁用（DAILY_LOSS_PCT 为负）")
+
+
+def apply_ib_account_capital():
+    """连接 Gateway 后读取 NetLiquidation，作为满仓名义基准。"""
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
+
+    # accountSummary 异步推送，稍等再读
+    if IB_CONN is not None and IB_CONN.isConnected():
+        try:
+            IB_CONN.reqAccountSummary()
+            IB_CONN.sleep(1.5)
+        except Exception:
+            pass
+
+    balance = get_account_balance()
+    if balance <= 0:
+        print("错误: 无法从 IB 读取 NetLiquidation（净值）。请确认已登录且账户有资金。")
+        sys.exit(1)
+
+    ACCOUNT_START_BALANCE = balance
+    INITIAL_CAPITAL = balance
+    print(f"IB 账户净值(NetLiquidation): ${balance:,.2f} → 仓位基准=满仓")
+    print(f"目标名义: ${balance * LEVERAGE:,.2f} (= 净值 × {LEVERAGE:g}x)")
+
+    if PROFIT_TARGET_PCT > 0:
+        tp_buffer = balance * TP_BUFFER_PCT
+        MAX_PROFIT_AMOUNT = balance * PROFIT_TARGET_PCT + tp_buffer
+        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f}")
+    if DAILY_LOSS_PCT > 0:
+        MAX_DAILY_LOSS_AMOUNT = balance * DAILY_LOSS_PCT
+        print(f"日内止损金额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
 
 
 def get_common_files_dir():
@@ -588,15 +597,35 @@ def get_us_eastern_time():
     return datetime.now(eastern)
 
 def get_account_balance():
-    """从 IB 账户摘要取 NetLiquidation；失败返回 0。"""
+    """从 IB 取 USD NetLiquidation；失败再试 AvailableFunds / TotalCashValue。"""
     if IB_CONN is None or not IB_CONN.isConnected():
         return 0.0
-    try:
-        for item in IB_CONN.accountSummary(IB_ACCOUNT_ID or ''):
-            if item.tag == 'NetLiquidation' and (not item.currency or item.currency == 'USD'):
-                return float(item.value)
-    except Exception:
-        pass
+
+    def _from_summary():
+        try:
+            for item in IB_CONN.accountSummary(IB_ACCOUNT_ID or ''):
+                if item.tag == 'NetLiquidation' and (not item.currency or item.currency == 'USD'):
+                    return float(item.value)
+        except Exception:
+            pass
+        return 0.0
+
+    def _from_values(tag):
+        try:
+            for v in IB_CONN.accountValues(IB_ACCOUNT_ID or ''):
+                if v.tag == tag and (not v.currency or v.currency == 'USD'):
+                    return float(v.value)
+        except Exception:
+            pass
+        return 0.0
+
+    bal = _from_summary()
+    if bal > 0:
+        return bal
+    for tag in ('NetLiquidation', 'EquityWithLoanValue', 'AvailableFunds', 'TotalCashValue'):
+        bal = _from_values(tag)
+        if bal > 0:
+            return bal
     return 0.0
 
 
@@ -2140,24 +2169,29 @@ if __name__ == "__main__":
     print("  · 无 CFD 权限时 qualify 失败即停")
     print("=" * 60)
 
-    print("\n--- 账户资金设置 ---")
-    prompt_capital_settings()
+    print("\n--- 杠杆设置 ---")
+    prompt_leverage_settings()
 
     print("版本: 1.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
     print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
 
+    if not ensure_market_data_service_available():
+        sys.exit(1)
+
+    ib_connect()
+    apply_ib_account_capital()
+
     print("\n--- 用户配置参数 ---")
     print(f"信号品种: {SYMBOL}")
     print(f"执行合约: {TRADE_SYMBOL} (CFD)")
     print(f"IB Gateway: {IB_HOST}:{IB_PORT} clientId={IB_CLIENT_ID}")
-    print(f"账户起始资金: ${ACCOUNT_START_BALANCE:.2f}")
-    print(f"账户当前金额(仓位基准): ${INITIAL_CAPITAL:.2f}")
-    print(f"杠杆倍数: {LEVERAGE}x")
-    print(f"目标名义: ${INITIAL_CAPITAL * LEVERAGE:.2f} (资金 × 杠杆)；手数=floor(名义/指数点位)，最小 1")
-    print(f"可选账户止盈: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
-    print(f"可选日内止损: ${MAX_DAILY_LOSS_AMOUNT:.2f} ({'已禁用' if MAX_DAILY_LOSS_AMOUNT <= 0 else '已启用'})")
+    print(f"账户净值(仓位基准): ${INITIAL_CAPITAL:.2f}")
+    print(f"杠杆倍数: {LEVERAGE:g}x")
+    print(f"目标名义: ${INITIAL_CAPITAL * LEVERAGE:.2f} (净值 × 杠杆)；手数=floor(名义/指数点位)，最小 1")
+    print(f"可选账户止盈: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT is None or MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
+    print(f"可选日内止损: ${MAX_DAILY_LOSS_AMOUNT:.2f} ({'已禁用' if MAX_DAILY_LOSS_AMOUNT is None or MAX_DAILY_LOSS_AMOUNT <= 0 else '已启用'})")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")
@@ -2185,11 +2219,6 @@ if __name__ == "__main__":
     print(f"初始 TOTAL_PNL: ${TOTAL_PNL:.2f}")
     print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     print("=" * 60 + "\n")
-
-    if not ensure_market_data_service_available():
-        sys.exit(1)
-
-    ib_connect()
 
     try:
         run_trading_strategy(
