@@ -1,9 +1,9 @@
 """
-IBKR Gateway 纳指 CFD 交易程序（Windows）
+IBKR Gateway 微纳指期货（MNQ）交易程序（Windows）
 
 架构：
   - 信号：Longport 行情缓存中的 QQQ.US 分钟线（与 FTMO/IC 策略一致）
-  - 执行：ib_insync 直连本机 IB Gateway，默认交易 IBUST100（US Tech 100 Index CFD）
+  - 执行：ib_insync 直连本机 IB Gateway，交易 MNQ（Micro E-mini Nasdaq-100）
   - 无 SQLite / MT5；无 FTMO 日亏/考试规则
 
 Windows 运行前准备：
@@ -13,14 +13,14 @@ Windows 运行前准备：
      - 取消 Read-Only API
      - Socket port：Paper=4002，Live=4001
      - Trusted IPs 加入 127.0.0.1
-  3. 确认账户有 Index CFD / IBUST100 交易权限
+  3. 确认账户有 CME 期货 / MNQ 交易权限（非 Index CFD）
   4. 启动 longport_data_service.py（写入 market_data_cache.db）
   5. pip install -r requirements.txt（含 ib_insync）
   6. python simulate_ibkr.py
 
 .env 仅需 Longport 凭证；IB 连接参数写死在下方常量。
-硬约束：IBUST100 最小 1 手 = 1×指数点位名义（约 $30k）；资金×杠杆不足 1 手则跳过开仓。
-风险：QQQ 信号 vs 纳指 CFD 存在基差；非 LLC/无 CFD 权限时 qualify 会失败。
+仓位：手数 = floor(净值 × 杠杆 / (MNQ点位 × $2))；不足 1 张则跳过开仓。
+风险：QQQ 信号 vs MNQ 存在基差；每季度需换月（更新 MNQ_EXPIRY 或依赖自动选月）。
 """
 
 import pandas as pd
@@ -42,7 +42,7 @@ from trend_er5_gate import history_days_back, apply_entry_gates_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
 
 try:
-    from ib_insync import IB, Contract, MarketOrder
+    from ib_insync import IB, Future, ContFuture, MarketOrder
 except ImportError:
     print("请先安装 ib_insync: pip install ib_insync")
     sys.exit(1)
@@ -53,15 +53,20 @@ load_dotenv(override=True)
 # 用户配置参数 - 请根据需要修改以下参数
 # ============================================================================
 
-# 信号品种（Longport 缓存）与执行合约（IBKR CFD）
+# 信号品种（Longport 缓存）与执行合约（IBKR MNQ 期货）
 SYMBOL = 'QQQ.US'
-TRADE_SYMBOL = 'IBUST100'
+TRADE_SYMBOL = 'MNQ'
+# 合约月 YYYYMM；空字符串=自动选近月（ContFuture / reqContractDetails）
+# ⚠️ 每季度换月手动更新更稳妥（3/6/9/12 月），例如 202609 → 202612
+MNQ_EXPIRY = '202609'
+MNQ_POINT_VALUE = 2.0  # Micro NQ 每点 $2
+NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ≈QQQ×该比值（盈亏估算用）
 # IB Gateway（与 Configure → API → Socket port 保持一致；Paper 常见 4002，Live 常见 4001）
 IB_HOST = '127.0.0.1'
 IB_PORT = 4001
 IB_CLIENT_ID = 1
 IB_ACCOUNT = ''  # 空=自动取 managedAccounts[0]
-IB_LEVERAGE_DEFAULT = 20
+IB_LEVERAGE_DEFAULT = 10  # 目标名义≈净值×杠杆；实际保证金以 Gateway 为准
 
 # 资金和风控设置（启动时交互输入）
 ACCOUNT_START_BALANCE = None
@@ -152,13 +157,13 @@ class Logger:
         self.log.close()
 
 def prompt_leverage_settings():
-    """仅询问目标杠杆（仓位 = 账户净值 × 杠杆）。金额从 IB 账户读取，不再手输。"""
+    """仅询问目标杠杆（目标名义 = 账户净值 × 杠杆）。金额从 IB 账户读取，不再手输。"""
     global LEVERAGE, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
 
     default_lev = float(IB_LEVERAGE_DEFAULT)
     while True:
         try:
-            lev_str = input(f"请输入目标杠杆倍数（回车默认 {default_lev:g}，零售纳指 CFD 常见上限约 20）: ").strip()
+            lev_str = input(f"请输入目标杠杆倍数（回车默认 {default_lev:g}，MNQ 名义≈净值×杠杆）: ").strip()
             if not lev_str:
                 lev = default_lev
             else:
@@ -168,14 +173,14 @@ def prompt_leverage_settings():
                 break
             print("错误: 杠杆必须大于 0，请重新输入")
         except ValueError:
-            print("错误: 请输入有效数字（如 20）")
+            print("错误: 请输入有效数字（如 10）")
         except EOFError:
             print(f"非交互环境，使用默认杠杆 {default_lev:g}x")
             LEVERAGE = default_lev
             break
 
     print(f"杠杆倍数: {LEVERAGE:g}x")
-    print("⚠️ 提醒: 实际保证金以 Gateway 为准；若账户保证金率高于 5%，有效杠杆会低于输入值")
+    print("⚠️ 提醒: MNQ 保证金由 IB 实时计算；日内保证金通常远低于名义，有效杠杆可能高于/低于输入值")
 
     # 自营默认不做 FTMO 式账户止盈/日亏；仅当配置里打开比例时才启用
     if PROFIT_TARGET_PCT > 0:
@@ -296,15 +301,57 @@ def ensure_market_data_service_available():
     return True
 
 # ============================================================================
-# IBKR 执行层
+# IBKR 执行层（MNQ 期货）
 # ============================================================================
 
-def make_ibust100_contract():
-    return Contract(secType='CFD', symbol=TRADE_SYMBOL, exchange='SMART', currency='USD')
+def make_mnq_contract():
+    """构造 MNQ 合约；指定 MNQ_EXPIRY 用 Future，否则用 ContFuture 自动近月。"""
+    if MNQ_EXPIRY:
+        return Future(
+            symbol=TRADE_SYMBOL,
+            lastTradeDateOrContractMonth=MNQ_EXPIRY,
+            exchange='CME',
+            currency='USD',
+        )
+    return ContFuture(symbol=TRADE_SYMBOL, exchange='CME', currency='USD')
+
+
+def resolve_mnq_contract(ib):
+    """qualify MNQ；失败时尝试 GLOBEX / 从 contractDetails 选近月。"""
+    contract = make_mnq_contract()
+    qualified = ib.qualifyContracts(contract)
+    if qualified:
+        return qualified[0]
+
+    # ContFuture / 指定月失败时，拉全部 MNQ 细节选最近未到期合约
+    for exchange in ('CME', 'GLOBEX'):
+        template = Future(symbol=TRADE_SYMBOL, exchange=exchange, currency='USD')
+        try:
+            details = ib.reqContractDetails(template)
+        except Exception as e:
+            print(f"⚠️ reqContractDetails({exchange}) 失败: {e}")
+            continue
+        if not details:
+            continue
+        today = datetime.utcnow().strftime('%Y%m%d')
+        candidates = []
+        for d in details:
+            c = d.contract
+            expiry = (c.lastTradeDateOrContractMonth or '')[:8]
+            if expiry and expiry >= today[:len(expiry)]:
+                candidates.append(c)
+        if not candidates:
+            candidates = [d.contract for d in details]
+        candidates.sort(key=lambda c: c.lastTradeDateOrContractMonth or '')
+        pick = candidates[0]
+        q = ib.qualifyContracts(pick)
+        if q:
+            return q[0]
+    return None
 
 
 def ib_connect():
-    """连接 IB Gateway，qualify IBUST100，打印报价与账户摘要。失败则退出。"""
+    """连接 IB Gateway，qualify MNQ，打印报价与账户摘要。失败则退出。"""
     global IB_CONN, IB_CONTRACT, IB_ACCOUNT_ID
 
     mode = "Paper" if IB_PORT in (4002, 7497) else ("Live" if IB_PORT in (4001, 7496) else f"port={IB_PORT}")
@@ -312,7 +359,7 @@ def ib_connect():
     print("IBKR Gateway 连接检查")
     print("=" * 60)
     print(f"目标: {IB_HOST}:{IB_PORT} ({mode}), clientId={IB_CLIENT_ID}")
-    print("请确认: Gateway 已登录 | Enable Socket API | 关闭 Read-Only | Trusted IP 含 127.0.0.1 | 有 Index CFD 权限")
+    print("请确认: Gateway 已登录 | Enable Socket API | 关闭 Read-Only | Trusted IP 含 127.0.0.1 | 有 CME/MNQ 期货权限")
     print("-" * 60)
 
     ib = IB()
@@ -344,17 +391,20 @@ def ib_connect():
         print(f"⚠️ IB_ACCOUNT={IB_ACCOUNT} 不在账户列表 {accounts}，改用 {IB_ACCOUNT_ID}")
     print(f"交易账户: {IB_ACCOUNT_ID} (可用: {accounts})")
 
-    contract = make_ibust100_contract()
-    qualified = ib.qualifyContracts(contract)
-    if not qualified:
-        print(f"❌ qualifyContracts 失败: {TRADE_SYMBOL} (CFD/SMART/USD)")
-        print("可能原因: 无 Index CFD 权限、非支持实体、合约代码变更。请在 TWS/Gateway 确认可交易 IBUST100。")
+    contract = resolve_mnq_contract(ib)
+    if contract is None:
+        print(f"❌ qualifyContracts 失败: {TRADE_SYMBOL} (FUT/CME/USD)")
+        print("可能原因: 无 CME 期货权限、合约月过期、合约代码变更。请在 TWS/Gateway 确认可交易 MNQ。")
+        if MNQ_EXPIRY:
+            print(f"当前 MNQ_EXPIRY={MNQ_EXPIRY}，可改为空字符串自动选月，或更新为下一季 YYYYMM。")
         ib.disconnect()
         sys.exit(1)
 
-    IB_CONTRACT = qualified[0]
-    print(f"✅ 合约已确认: {IB_CONTRACT.localSymbol or IB_CONTRACT.symbol} "
-          f"conId={IB_CONTRACT.conId} exchange={IB_CONTRACT.exchange}")
+    IB_CONTRACT = contract
+    local = IB_CONTRACT.localSymbol or IB_CONTRACT.symbol
+    expiry = IB_CONTRACT.lastTradeDateOrContractMonth or MNQ_EXPIRY or '?'
+    print(f"✅ 合约已确认: {local} expiry={expiry} conId={IB_CONTRACT.conId} "
+          f"exchange={IB_CONTRACT.exchange} multiplier={IB_CONTRACT.multiplier}")
 
     try:
         ticker = ib.reqMktData(IB_CONTRACT, '', False, False)
@@ -363,18 +413,19 @@ def ib_connect():
         if last != last or last <= 0:  # NaN check
             last = ticker.last or ticker.close or ticker.bid or ticker.ask
         if last and last == last and last > 0:
-            print(f"IBUST100 参考价: {float(last):.2f}")
-            notional_1lot = float(last)
-            print(f"  最小 1 手名义约 ${notional_1lot:,.0f}；5% 保证金约需 ${notional_1lot * 0.05:,.0f}+")
+            mnq_px = float(last)
+            notional_1 = mnq_px * MNQ_POINT_VALUE
+            print(f"MNQ 参考价: {mnq_px:.2f}")
+            print(f"  1 张名义约 ${notional_1:,.0f}（点值 ${MNQ_POINT_VALUE:g}/点）；保证金以 Gateway 为准")
         else:
-            print("⚠️ 暂未拿到 IBUST100 有效报价（可继续；开仓前会再取价）")
+            print("⚠️ 暂未拿到 MNQ 有效报价（可继续；开仓前会再取价）")
         ib.cancelMktData(IB_CONTRACT)
     except Exception as e:
         print(f"⚠️ 获取报价异常: {e}")
 
     try:
         summary = ib.accountSummary(IB_ACCOUNT_ID)
-        interesting = {'NetLiquidation', 'TotalCashValue', 'BuyingPower', 'AvailableFunds', 'GrossPositionValue'}
+        interesting = {'NetLiquidation', 'TotalCashValue', 'BuyingPower', 'AvailableFunds', 'GrossPositionValue', 'InitMarginReq'}
         print(f"账户摘要 ({IB_ACCOUNT_ID}):")
         shown = 0
         for item in summary:
@@ -387,7 +438,7 @@ def ib_connect():
     except Exception as e:
         print(f"⚠️ 读取账户摘要失败: {e}")
 
-    print("佣金口径仅供参考: 约名义 0.01%/边（以账户报表为准）")
+    print("佣金口径仅供参考: IB≈$0.25/张 + CME 等，单边常约 $0.6–1（以账户报表为准）")
     print("=" * 60 + "\n")
 
     IB_CONN = ib
@@ -421,7 +472,7 @@ def ib_ensure_connected():
         return False
 
 
-def get_ibust100_price():
+def get_mnq_price():
     """优先 IB ticker；失败返回 None。"""
     if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
         return None
@@ -435,33 +486,46 @@ def get_ibust100_price():
         if last and last == last and last > 0:
             return float(last)
     except Exception as e:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 获取 IBUST100 价格失败: {e}")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 获取 MNQ 价格失败: {e}")
     return None
 
 
-def calc_ib_order_quantity(index_px=None):
-    """qty = floor(资金 × 杠杆 / 指数点位)；不足 1 手返回 0。"""
+def estimate_mnq_price_from_qqq(qqq_px):
+    """无 MNQ 报价时用 QQQ×比值粗估点位。"""
+    if qqq_px is None or qqq_px <= 0:
+        return None
+    return float(qqq_px) * NQ_QQQ_RATIO
+
+
+def calc_ib_order_quantity(mnq_px=None, qqq_px=None):
+    """qty = floor(资金 × 杠杆 / (MNQ点位 × $2))；不足 1 张返回 0。"""
     if INITIAL_CAPITAL is None or LEVERAGE is None:
         return 0
-    if index_px is None or index_px <= 0:
-        index_px = get_ibust100_price()
-    if index_px is None or index_px <= 0:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 无法计算手数：缺少有效指数价格")
+    if mnq_px is None or mnq_px <= 0:
+        mnq_px = get_mnq_price()
+    if (mnq_px is None or mnq_px <= 0) and qqq_px:
+        mnq_px = estimate_mnq_price_from_qqq(qqq_px)
+        if mnq_px:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
+                  f"无 MNQ 报价，用 QQQ×{NQ_QQQ_RATIO:g} 估点位 ≈ {mnq_px:.2f}")
+    if mnq_px is None or mnq_px <= 0:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 无法计算手数：缺少有效 MNQ 价格")
         return 0
-    qty = int(floor(INITIAL_CAPITAL * LEVERAGE / index_px))
-    notional = qty * index_px
+    notional_1 = mnq_px * MNQ_POINT_VALUE
+    qty = int(floor(INITIAL_CAPITAL * LEVERAGE / notional_1))
+    notional = qty * notional_1
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
-          f"仓位计算: floor(${INITIAL_CAPITAL:.0f}×{LEVERAGE}x / {index_px:.2f}) = {qty} 手 "
+          f"仓位计算: floor(${INITIAL_CAPITAL:.0f}×{LEVERAGE}x / ({mnq_px:.2f}×{MNQ_POINT_VALUE:g})) = {qty} 张 MNQ "
           f"(名义约 ${notional:,.0f})")
     if qty < 1:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
-              f"⚠️ 不足最小 1 手（约需资金 ${index_px / LEVERAGE:,.0f}+ @ {LEVERAGE}x），跳过开仓")
+              f"⚠️ 不足最小 1 张（约需资金 ${notional_1 / LEVERAGE:,.0f}+ @ {LEVERAGE}x），跳过开仓")
         return 0
     return qty
 
 
 def get_ib_position_qty():
-    """返回 IBUST100 净仓位（多头>0，空头<0）。"""
+    """返回 MNQ 净仓位（多头>0，空头<0）。"""
     if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
         return 0
     try:
@@ -472,9 +536,18 @@ def get_ib_position_qty():
             if IB_ACCOUNT_ID and p.account and p.account != IB_ACCOUNT_ID:
                 continue
             c = p.contract
-            if c.conId == IB_CONTRACT.conId or (
-                c.secType == 'CFD' and (c.symbol == TRADE_SYMBOL or c.localSymbol == TRADE_SYMBOL)
-            ):
+            same_con = c.conId and IB_CONTRACT.conId and c.conId == IB_CONTRACT.conId
+            same_mnq = (
+                c.secType == 'FUT'
+                and c.symbol == TRADE_SYMBOL
+                and (
+                    not IB_CONTRACT.localSymbol
+                    or c.localSymbol == IB_CONTRACT.localSymbol
+                    or (c.lastTradeDateOrContractMonth or '')[:6]
+                    == (IB_CONTRACT.lastTradeDateOrContractMonth or '')[:6]
+                )
+            )
+            if same_con or same_mnq:
                 total += float(p.position)
         return int(total) if total == int(total) else total
     except Exception as e:
@@ -513,7 +586,7 @@ def _trade_commission(trade):
 
 def place_ib_market(action, quantity):
     """
-    市价单。action: 'BUY' | 'SELL'；quantity > 0。
+    市价单。action: 'BUY' | 'SELL'；quantity > 0（张）。
     返回 dict: ok, orderId, avg_fill, commission, error
     """
     ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
@@ -527,12 +600,13 @@ def place_ib_market(action, quantity):
     if action not in ('BUY', 'SELL'):
         return {'ok': False, 'error': f'invalid action {action}'}
 
+    local = (IB_CONTRACT.localSymbol or TRADE_SYMBOL) if IB_CONTRACT else TRADE_SYMBOL
     try:
         order = MarketOrder(action, quantity)
         if IB_ACCOUNT_ID:
             order.account = IB_ACCOUNT_ID
         trade = IB_CONN.placeOrder(IB_CONTRACT, order)
-        print(f"[{ts}] 已提交市价单: {action} {quantity} {TRADE_SYMBOL} orderId={trade.order.orderId}")
+        print(f"[{ts}] 已提交市价单: {action} {quantity} {local} orderId={trade.order.orderId}")
 
         # 等待成交（市价通常很快）
         for _ in range(40):
@@ -638,17 +712,26 @@ def get_current_positions():
     return {TRADE_SYMBOL: {"quantity": qty, "cost_price": 0}}
 
 
-def calculate_pnl(entry_price, exit_price, direction):
+def calculate_pnl(entry_price, exit_price, direction, quantity=None):
     """
-    策略层盈亏（QQQ 价格变动 × 资金×杠杆，与 FTMO/IC 一致）。
-    实盘 CFD 成交另记日志；接受 QQQ↔NDX 基差。
+    按实际 MNQ 敞口估算盈亏（信号价用 QQQ）。
+    敞口 ≈ 张数 × QQQ入场价 × NQ_QQQ_RATIO × $2；接受 QQQ↔MNQ 基差。
+    quantity 未传时按目标名义（净值×杠杆）估算。
     """
     if entry_price <= 0:
         return 0.0, 0.0
 
     price_change_pct = (exit_price - entry_price) / entry_price
-    pnl_pct = price_change_pct * direction * LEVERAGE * 100
-    pnl = INITIAL_CAPITAL * LEVERAGE * price_change_pct * direction
+    if quantity is not None and abs(quantity) > 0:
+        qty = abs(quantity)
+        exposure = qty * entry_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
+    elif INITIAL_CAPITAL is not None and LEVERAGE is not None:
+        exposure = INITIAL_CAPITAL * LEVERAGE
+    else:
+        return 0.0, 0.0
+
+    pnl = exposure * price_change_pct * direction
+    pnl_pct = (pnl / INITIAL_CAPITAL * 100) if INITIAL_CAPITAL else 0.0
     return pnl, pnl_pct
 
 def get_historical_data(symbol, days_back=None):
@@ -932,7 +1015,7 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
 def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False):
     """
     直连 IB Gateway 市价开/平仓。
-    - 开仓: side Buy/Sell，quantity 为手数（必须 >= 1）
+    - 开仓: side Buy/Sell，quantity 为 MNQ 张数（必须 >= 1）
     - 平仓: is_close=True，按 positions() 核对后反向市价
     成功返回 orderId 字符串，失败返回 None。
     """
@@ -942,7 +1025,7 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
     else:
         action = "BUY" if side == "Buy" else "SELL"
         if quantity is None or int(quantity) < 1:
-            print(f"[{ts}] 开仓拒绝: quantity={quantity}（最小 1 手）")
+            print(f"[{ts}] 开仓拒绝: quantity={quantity}（最小 1 张 MNQ）")
             return None
         result = place_ib_market(action, int(quantity))
 
@@ -1023,7 +1106,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     """
     日内止盈止损监控线程
     每分钟检查一次当前总盈亏（已实现+未实现），一旦超过止盈或止损限制立即设置强制平仓标志
-    注意：盈亏计算包含杠杆
+    注意：盈亏按 MNQ 张数名义估算（QQQ 涨跌幅 × 敞口）
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
     global DAILY_PNL, PROFIT_TARGET_TRIGGERED
@@ -1070,7 +1153,7 @@ def daily_loss_monitor_thread(symbol, position_data):
                         
                         if current_price > 0:
                             direction = 1 if position_quantity > 0 else -1
-                            unrealized_pnl, _ = calculate_pnl(entry_price, current_price, direction)
+                            unrealized_pnl, _ = calculate_pnl(entry_price, current_price, direction, position_quantity)
                     except Exception as e:
                         if LOG_VERBOSE:
                             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 获取价格失败: {str(e)}")
@@ -1256,7 +1339,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 计算盈亏（全仓计算）
             if entry_price and current_price > 0:
                 direction = 1 if position_quantity > 0 else -1
-                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                 with pnl_lock:
                     DAILY_PNL += pnl
                     TOTAL_PNL += pnl
@@ -1327,7 +1410,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 计算盈亏（全仓计算）
                 if entry_price and current_price > 0:
                     direction = 1 if position_quantity > 0 else -1
-                    pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                    pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                     DAILY_PNL += pnl
                     TOTAL_PNL += pnl
                     # 记录平仓交易
@@ -1635,7 +1718,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 计算盈亏（全仓计算）
             if entry_price:
                 direction = 1 if position_quantity > 0 else -1
-                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {TRADE_SYMBOL} 出场价: {current_price}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:+.2f}%)")
                 # 更新收益统计
@@ -1734,7 +1817,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     # 计算盈亏（全仓计算）
                     if entry_price and current_price > 0:
                         direction = 1 if position_quantity > 0 else -1
-                        pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction)
+                        pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
                         DAILY_PNL += pnl
                         TOTAL_PNL += pnl
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓盈亏: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
@@ -1931,7 +2014,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     # 计算盈亏（全仓计算）
                     if entry_price:
                         direction = 1 if position_quantity > 0 else -1
-                        pnl, pnl_pct = calculate_pnl(entry_price, exit_price, direction)
+                        pnl, pnl_pct = calculate_pnl(entry_price, exit_price, direction, position_quantity)
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {TRADE_SYMBOL} 出场价: {exit_price}")
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:+.2f}%)")
                         # 更新收益统计
@@ -2058,14 +2141,14 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         entry_price = latest_price
                     continue
 
-                qty = calc_ib_order_quantity()
+                qty = calc_ib_order_quantity(qqq_px=latest_price)
                 if qty < 1:
                     continue
 
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 信号价(QQQ): {price}, VWAP: {latest_row['VWAP']:.4f}, "
                       f"上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 执行: {TRADE_SYMBOL} × {qty} 手")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 执行: {TRADE_SYMBOL} × {qty} 张")
 
                 side = "Buy" if signal > 0 else "Sell"
                 order_id = submit_order(symbol, side, qty, outside_rth=outside_rth_setting)
@@ -2076,10 +2159,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 _LAST_OPEN_SIGNAL_KEY = signal_key
                 position_quantity = qty if signal > 0 else -qty
                 entry_price = latest_price
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {TRADE_SYMBOL} qty={qty} "
+                actual_notional = qty * entry_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {TRADE_SYMBOL} qty={qty} 张 "
                       f"信号入场价(QQQ): {entry_price} orderId={order_id}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 目标名义: ${INITIAL_CAPITAL:.2f} × {LEVERAGE}x = "
-                      f"${INITIAL_CAPITAL * LEVERAGE:.2f}")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位: {qty} 张 MNQ ≈ ${actual_notional:,.0f} 名义 "
+                      f"(目标 ${INITIAL_CAPITAL * LEVERAGE:,.0f} = 净值×{LEVERAGE:g}x)")
 
                 DAILY_TRADES.append({
                     "time": now.strftime('%Y-%m-%d %H:%M:%S'),
@@ -2161,21 +2245,21 @@ if __name__ == "__main__":
     sys.stderr = sys.stdout
 
     print("\n" + "=" * 60)
-    print("IBKR Gateway 纳指 CFD 交易程序")
+    print("IBKR Gateway 微纳指期货（MNQ）交易程序")
     print("=" * 60)
-    print("信号: Longport QQQ 分钟线 | 执行: ib_insync → IBUST100")
+    print("信号: Longport QQQ 分钟线 | 执行: ib_insync → MNQ")
     print("无 SQLite/MT5 | 无 FTMO 日亏/考试规则")
     print("-" * 60)
     print("风险提示:")
-    print("  · QQQ 信号 vs 纳指 CFD 存在基差，实盘 PnL ≠ QQQ 回测")
-    print("  · 最小 1 手资金门槛高；小资金会长期「有信号但不下单」")
-    print("  · 无 CFD 权限时 qualify 失败即停")
+    print("  · QQQ 信号 vs MNQ 存在基差，实盘 PnL ≠ QQQ 回测")
+    print("  · 每季度换月：请更新 MNQ_EXPIRY（或设为空自动选近月）")
+    print("  · 无 CME/MNQ 期货权限时 qualify 失败即停")
     print("=" * 60)
 
     print("\n--- 杠杆设置 ---")
     prompt_leverage_settings()
 
-    print("版本: 1.0.0")
+    print("版本: 2.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
     print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
@@ -2188,11 +2272,14 @@ if __name__ == "__main__":
 
     print("\n--- 用户配置参数 ---")
     print(f"信号品种: {SYMBOL}")
-    print(f"执行合约: {TRADE_SYMBOL} (CFD)")
+    expiry_disp = (IB_CONTRACT.lastTradeDateOrContractMonth if IB_CONTRACT else None) or MNQ_EXPIRY or '自动近月'
+    local_disp = (IB_CONTRACT.localSymbol if IB_CONTRACT else None) or TRADE_SYMBOL
+    print(f"执行合约: {local_disp} (FUT/CME) expiry={expiry_disp}")
     print(f"IB Gateway: {IB_HOST}:{IB_PORT} clientId={IB_CLIENT_ID}")
     print(f"账户净值(仓位基准): ${INITIAL_CAPITAL:.2f}")
     print(f"杠杆倍数: {LEVERAGE:g}x")
-    print(f"目标名义: ${INITIAL_CAPITAL * LEVERAGE:.2f} (净值 × 杠杆)；手数=floor(名义/指数点位)，最小 1")
+    print(f"目标名义: ${INITIAL_CAPITAL * LEVERAGE:.2f} (净值 × 杠杆)；"
+          f"张数=floor(名义/(MNQ点位×${MNQ_POINT_VALUE:g}))，最小 1")
     print(f"可选账户止盈: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT is None or MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
     print(f"可选日内止损: ${MAX_DAILY_LOSS_AMOUNT:.2f} ({'已禁用' if MAX_DAILY_LOSS_AMOUNT is None or MAX_DAILY_LOSS_AMOUNT <= 0 else '已启用'})")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
