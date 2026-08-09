@@ -63,7 +63,7 @@ MNQ_POINT_VALUE = 2.0  # Micro NQ 每点 $2
 NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ≈QQQ×该比值（盈亏估算用）
 # IB Gateway（与 Configure → API → Socket port 保持一致；Paper 常见 4002，Live 常见 4001）
 IB_HOST = '127.0.0.1'
-IB_PORT = 4001
+IB_PORT = 4002
 IB_CLIENT_ID = 1
 IB_ACCOUNT = ''  # 空=自动取 managedAccounts[0]
 # 满仓时预留一点保证金缓冲，避免 whatIf 与实盘差额导致拒单（0.95=用 95% 可用资金）
