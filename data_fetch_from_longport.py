@@ -17,8 +17,8 @@ TZ_ET = ZoneInfo('US/Eastern')
 # ———— 用户参数：美东起止日期（inclusive） ————
 # 注意：history_candlesticks_by_date 接口接受 date 类型
 # 近一年行情 + 约 3 个月趋势特征预热（er5 / rank60 等）
-start_date = date(2025, 5, 1)
-end_date   = date(2026, 8, 4)  # 美东最近完整交易日；跑脚本前可按需改
+start_date = date(2024, 8, 1)
+end_date   = date(2026, 8, 10)  # 美东最近完整交易日；跑脚本前可按需改
 
 all_candles = []
 

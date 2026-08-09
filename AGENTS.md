@@ -13,7 +13,7 @@ This is a Python-based algorithmic trading system for QQQ (US ETF). It uses a tw
 
 Install with: `pip install -r requirements.txt`
 
-Required packages: `pandas`, `numpy`, `pytz`, `python-dotenv`, `longport`
+Required packages: `pandas`, `numpy`, `pytz`, `python-dotenv`, `longport`, `ib_insync`（仅 `simulate_ibkr.py`）
 
 ### Linting
 
@@ -30,6 +30,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
   - `LONGPORT_APP_KEY`
   - `LONGPORT_APP_SECRET`
   - `LONGPORT_ACCESS_TOKEN`
+- **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `IBUST100`；需本机已登录 IB Gateway（Paper `4002` / Live `4001`），见脚本头注释与 `.env.example` 中 `IB_*` 变量。不写 SQLite、不跑 MT5。
 - **Data fetcher** (`data_fetch_from_longport.py`) also requires Longport credentials.
 
 ### Key gotchas

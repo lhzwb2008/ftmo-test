@@ -341,6 +341,8 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
     # 从配置中提取参数
     transaction_fee_per_share = config.get('transaction_fee_per_share', 0.01)
     enable_transaction_fees = config.get('enable_transaction_fees', True)  # 新增手续费开关
+    # 单笔往返最低手续费（长桥美股常见 $2.16；IC Markets 美股CFD 可设为 0.04）
+    min_round_trip_fee = config.get('min_round_trip_fee', 2.16)
     trading_end_time = config.get('trading_end_time', (15, 50))
     max_positions_per_day = config.get('max_positions_per_day', float('inf'))
     print_details = config.get('print_trade_details', False)
@@ -524,7 +526,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
             exit_time = row['DateTime']
             exit_price = apply_slippage(exit_mark, is_buy=(position == -1), is_entry=False)
             if enable_transaction_fees:
-                transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)
+                transaction_fees = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)
             else:
                 transaction_fees = 0
             if position == 1:
@@ -838,7 +840,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
                     exit_price = apply_slippage(exit_raw_price, is_buy=False, is_entry=False)  # 多头平仓是卖出
                     # 计算交易费用（开仓和平仓）
                     if enable_transaction_fees:
-                        transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)  # 买入和卖出费用，最低2.16
+                        transaction_fees = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)  # 买入和卖出费用，最低2.16
                     else:
                         transaction_fees = 0  # 关闭手续费
                     pnl = position_size * (exit_price - entry_price) - transaction_fees
@@ -952,7 +954,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
                     exit_price = apply_slippage(exit_raw_price, is_buy=True, is_entry=False)  # 空头平仓是买入
                     # 计算交易费用（开仓和平仓）
                     if enable_transaction_fees:
-                        transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)  # 买入和卖出费用，最低2.16
+                        transaction_fees = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)  # 买入和卖出费用，最低2.16
                     else:
                         transaction_fees = 0  # 关闭手续费
                     pnl = position_size * (entry_price - exit_price) - transaction_fees
@@ -1007,7 +1009,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
             
             # 计算交易费用（开仓和平仓）
             if enable_transaction_fees:
-                transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)  # 买入和卖出费用，最低2.16
+                transaction_fees = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)  # 买入和卖出费用，最低2.16
             else:
                 transaction_fees = 0  # 关闭手续费
             pnl = position_size * (close_price - entry_price) - transaction_fees
@@ -1046,7 +1048,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
             
             # 计算交易费用（开仓和平仓）
             if enable_transaction_fees:
-                transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)  # 买入和卖出费用，最低2.16
+                transaction_fees = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)  # 买入和卖出费用，最低2.16
             else:
                 transaction_fees = 0  # 关闭手续费
             pnl = position_size * (entry_price - close_price) - transaction_fees
@@ -1093,7 +1095,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
             exit_price = apply_slippage(last_price, is_buy=False, is_entry=False)  # 多头平仓是卖出
             # 计算交易费用（开仓和平仓）
             if enable_transaction_fees:
-                transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)  # 买入和卖出费用，最低2.16
+                transaction_fees = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)  # 买入和卖出费用，最低2.16
             else:
                 transaction_fees = 0  # 关闭手续费
             pnl = position_size * (exit_price - entry_price) - transaction_fees
@@ -1131,7 +1133,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
             exit_price = apply_slippage(last_price, is_buy=True, is_entry=False)  # 空头平仓是买入
             # 计算交易费用（开仓和平仓）
             if enable_transaction_fees:
-                transaction_fees = max(position_size * transaction_fee_per_share * 2, 2.16)  # 买入和卖出费用，最低2.16
+                transaction_fees = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)  # 买入和卖出费用，最低2.16
             else:
                 transaction_fees = 0  # 关闭手续费
             pnl = position_size * (entry_price - exit_price) - transaction_fees
@@ -1200,6 +1202,7 @@ def run_backtest(config):
     check_interval_minutes = config.get('check_interval_minutes', 30)
     transaction_fee_per_share = config.get('transaction_fee_per_share', 0.01)
     enable_transaction_fees = config.get('enable_transaction_fees', True)  # 新增手续费开关
+    min_round_trip_fee = config.get('min_round_trip_fee', 2.16)
     trading_start_time = config.get('trading_start_time', (10, 00))
     trading_end_time = config.get('trading_end_time', (15, 40))
     max_positions_per_day = config.get('max_positions_per_day', float('inf'))
@@ -1663,7 +1666,7 @@ def run_backtest(config):
             if 'transaction_fees' not in trade:
                 # 如果交易数据中没有交易费用，则计算
                 if enable_transaction_fees:
-                    trade['transaction_fees'] = max(position_size * transaction_fee_per_share * 2, 2.16)  # 买入和卖出费用，最低2.16
+                    trade['transaction_fees'] = max(position_size * transaction_fee_per_share * 2, min_round_trip_fee)  # 买入和卖出费用，最低2.16
                 else:
                     trade['transaction_fees'] = 0  # 关闭手续费
             day_transaction_fees += trade['transaction_fees']
@@ -2356,10 +2359,17 @@ if __name__ == "__main__":
        
         'check_interval_minutes': 15 ,
         'enable_transaction_fees': True,  # 是否启用手续费计算，False表示不计算手续费
-        'transaction_fee_per_share': 0.008166,
-        # 'transaction_fee_per_share': 0,
-        'slippage_per_share': 0.01,  # 滑点设置，每股滑点金额，买入时多付，卖出时少收
-                                     # 例如：0.02表示买入每股多付2美分，卖出每股少收2美分
+        # —— 券商交易成本（单边 $/股；往返 = 股数 × (fee + slippage) × 2）——
+        # Longport：平台约 $0.005 + 交收约 $0.003 → 有效单边约 $0.008166
+        'transaction_fee_per_share': 0.008166,  # Longport
+        # 'transaction_fee_per_share': 0.005,  # IBKR Pro Fixed
+        # 'transaction_fee_per_share': 0.0035,  # IBKR Pro Tiered（≤30万股/月）
+        # IC Markets：若交易 USTEC/US100 指数 CFD，全仓 2x 往返成本约 $12.7（接近本默认 $13.2），
+        #   可直接沿用 0.008166 + slippage 0.01；勿用美股个股 CFD 的 $0.02/股/边。
+        # 'transaction_fee_per_share': 0.02,  # IC Markets QQQ.NAS 个股 CFD（仅在真交易股票 CFD 时）
+        # 'min_round_trip_fee': 0.04,       # 个股 CFD 最低约 $0.02/边 ×2
+        'min_round_trip_fee': 2.16,  # Longport 美股常见最低往返；指数 CFD/大仓位通常碰不到
+        'slippage_per_share': 0.01,  # QQQ 滑点/点差近似 $/股（买入多付、卖出少收）
         'trading_start_time': (9, 40),
         'trading_end_time': (15, 40),
         'max_positions_per_day': 10,
