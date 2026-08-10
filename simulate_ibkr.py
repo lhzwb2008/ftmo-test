@@ -13,13 +13,16 @@ Windows 运行前准备：
      - 取消 Read-Only API
      - Socket port：Paper=4002，Live=4001
      - Trusted IPs 加入 127.0.0.1
-  3. 确认账户有 CME 期货 / MNQ 交易权限（非 Index CFD）
-  4. 启动 longport_data_service.py（写入 market_data_cache.db）
-  5. pip install -r requirements.txt（含 ib_insync）
-  6. python simulate_ibkr.py
+  3. Configure → Lock and Exit：选「自动重启」(Auto Restart)，勿用「自动退出」
+     （IB 强制每日重置；自动退出会导致 API 端口关闭，策略进程旧版会直接退出）
+  4. 确认账户有 CME 期货 / MNQ 交易权限（非 Index CFD）
+  5. 启动 longport_data_service.py（写入 market_data_cache.db）
+  6. pip install -r requirements.txt（含 ib_insync）
+  7. python simulate_ibkr.py
 
 .env 仅需 Longport 凭证；IB 连接参数写死在下方常量。
 仓位：每次开仓按 IB 可用保证金尽量满仓（whatIf 估单张保证金 → floor(可用×缓冲/单张保证金)）。
+断线：运行中自动心跳探活 + 无限重连（Gateway Auto Restart 窗口内会短暂拒连，脚本会等待恢复）。
 风险：QQQ 信号 vs MNQ 存在基差；每季度需换月（更新 MNQ_EXPIRY 或依赖自动选月）；满仓保证金风险极高。
 """
 
@@ -66,6 +69,12 @@ IB_HOST = '127.0.0.1'
 IB_PORT = 4002
 IB_CLIENT_ID = 1
 IB_ACCOUNT = ''  # 空=自动取 managedAccounts[0]
+# Gateway 每日强制 Auto Logoff/Auto Restart；断线后自动重试，避免进程退出
+IB_RECONNECT_INTERVAL_SEC = 30       # 重连间隔（秒）
+IB_RECONNECT_MAX_ATTEMPTS = 0        # 运行中重连次数；0=无限重试直到连上
+IB_HEARTBEAT_INTERVAL_SEC = 300      # 心跳探活间隔（秒）
+IB_KEEPALIVE_SLEEP_CHUNK_SEC = 300   # 长等待分段 sleep，以便心跳/重连
+_IB_LAST_HEARTBEAT_TS = 0.0
 # 满仓时预留一点保证金缓冲，避免 whatIf 与实盘差额导致拒单（0.95=用 95% 可用资金）
 MARGIN_USAGE_PCT = 0.95
 # 可选硬顶；<=0 表示不限制（能买多少买多少）
@@ -333,29 +342,43 @@ def resolve_mnq_contract(ib):
     return None
 
 
-def ib_connect():
-    """连接 IB Gateway，qualify MNQ，打印报价与账户摘要。失败则退出。"""
-    global IB_CONN, IB_CONTRACT, IB_ACCOUNT_ID
+def _ib_try_connect(verbose=True):
+    """
+    尝试连接 IB Gateway 一次并 qualify MNQ。
+    成功则设置全局 IB_CONN/IB_CONTRACT/IB_ACCOUNT_ID 并返回 True；失败返回 False（不 sys.exit）。
+    """
+    global IB_CONN, IB_CONTRACT, IB_ACCOUNT_ID, _IB_LAST_HEARTBEAT_TS
 
     mode = "Paper" if IB_PORT in (4002, 7497) else ("Live" if IB_PORT in (4001, 7496) else f"port={IB_PORT}")
-    print("\n" + "=" * 60)
-    print("IBKR Gateway 连接检查")
-    print("=" * 60)
-    print(f"目标: {IB_HOST}:{IB_PORT} ({mode}), clientId={IB_CLIENT_ID}")
-    print("请确认: Gateway 已登录 | Enable Socket API | 关闭 Read-Only | Trusted IP 含 127.0.0.1 | 有 CME/MNQ 期货权限")
-    print("-" * 60)
+    if verbose:
+        print("\n" + "=" * 60)
+        print("IBKR Gateway 连接检查")
+        print("=" * 60)
+        print(f"目标: {IB_HOST}:{IB_PORT} ({mode}), clientId={IB_CLIENT_ID}")
+        print("请确认: Gateway 已登录 | Enable Socket API | 关闭 Read-Only | Trusted IP 含 127.0.0.1 | 有 CME/MNQ 期货权限")
+        print("建议: Lock and Exit 选「自动重启」而非「自动退出」，避免每日登出后 API 端口关闭")
+        print("-" * 60)
 
     ib = IB()
     try:
         ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, readonly=False, timeout=15)
     except Exception as e:
         print(f"❌ 连接 IB Gateway 失败: {e}")
-        print("提示: Paper 默认端口 4002；Live 为 4001。确认未勾选 Read-Only API。")
-        sys.exit(1)
+        if verbose:
+            print("提示: Paper 默认端口 4002；Live 为 4001。确认未勾选 Read-Only API。")
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return False
 
     if not ib.isConnected():
         print("❌ 未连接到 IB Gateway")
-        sys.exit(1)
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return False
 
     print("✅ 已连接 IB Gateway")
     try:
@@ -363,11 +386,23 @@ def ib_connect():
     except Exception:
         pass
 
-    accounts = ib.managedAccounts()
+    try:
+        accounts = ib.managedAccounts()
+    except Exception as e:
+        print(f"❌ 读取 managedAccounts 失败: {e}")
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return False
+
     if not accounts:
         print("❌ managedAccounts 为空，请检查登录状态")
-        ib.disconnect()
-        sys.exit(1)
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return False
 
     IB_ACCOUNT_ID = IB_ACCOUNT if IB_ACCOUNT in accounts else accounts[0]
     if IB_ACCOUNT and IB_ACCOUNT not in accounts:
@@ -380,8 +415,11 @@ def ib_connect():
         print("可能原因: 无 CME 期货权限、合约月过期、合约代码变更。请在 TWS/Gateway 确认可交易 MNQ。")
         if MNQ_EXPIRY:
             print(f"当前 MNQ_EXPIRY={MNQ_EXPIRY}，可改为空字符串自动选月，或更新为下一季 YYYYMM。")
-        ib.disconnect()
-        sys.exit(1)
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return False
 
     IB_CONTRACT = contract
     local = IB_CONTRACT.localSymbol or IB_CONTRACT.symbol
@@ -389,43 +427,54 @@ def ib_connect():
     print(f"✅ 合约已确认: {local} expiry={expiry} conId={IB_CONTRACT.conId} "
           f"exchange={IB_CONTRACT.exchange} multiplier={IB_CONTRACT.multiplier}")
 
-    try:
-        ticker = ib.reqMktData(IB_CONTRACT, '', False, False)
-        ib.sleep(2)
-        last = ticker.marketPrice()
-        if last != last or last <= 0:  # NaN check
-            last = ticker.last or ticker.close or ticker.bid or ticker.ask
-        if last and last == last and last > 0:
-            mnq_px = float(last)
-            notional_1 = mnq_px * MNQ_POINT_VALUE
-            print(f"MNQ 参考价: {mnq_px:.2f}")
-            print(f"  1 张名义约 ${notional_1:,.0f}（点值 ${MNQ_POINT_VALUE:g}/点）；保证金以 Gateway 为准")
-        else:
-            print("⚠️ 暂未拿到 MNQ 有效报价（可继续；开仓前会再取价）")
-        ib.cancelMktData(IB_CONTRACT)
-    except Exception as e:
-        print(f"⚠️ 获取报价异常: {e}")
+    if verbose:
+        try:
+            ticker = ib.reqMktData(IB_CONTRACT, '', False, False)
+            ib.sleep(2)
+            last = ticker.marketPrice()
+            if last != last or last <= 0:  # NaN check
+                last = ticker.last or ticker.close or ticker.bid or ticker.ask
+            if last and last == last and last > 0:
+                mnq_px = float(last)
+                notional_1 = mnq_px * MNQ_POINT_VALUE
+                print(f"MNQ 参考价: {mnq_px:.2f}")
+                print(f"  1 张名义约 ${notional_1:,.0f}（点值 ${MNQ_POINT_VALUE:g}/点）；保证金以 Gateway 为准")
+            else:
+                print("⚠️ 暂未拿到 MNQ 有效报价（可继续；开仓前会再取价）")
+            ib.cancelMktData(IB_CONTRACT)
+        except Exception as e:
+            print(f"⚠️ 获取报价异常: {e}")
 
-    try:
-        summary = ib.accountSummary(IB_ACCOUNT_ID)
-        interesting = {'NetLiquidation', 'TotalCashValue', 'BuyingPower', 'AvailableFunds', 'GrossPositionValue', 'InitMarginReq'}
-        print(f"账户摘要 ({IB_ACCOUNT_ID}):")
-        shown = 0
-        for item in summary:
-            if item.tag in interesting and (not item.currency or item.currency == 'USD'):
-                print(f"  {item.tag}: {item.value} {item.currency}")
-                shown += 1
-        if shown == 0:
-            for item in summary[:8]:
-                print(f"  {item.tag}: {item.value} {item.currency}")
-    except Exception as e:
-        print(f"⚠️ 读取账户摘要失败: {e}")
+        try:
+            summary = ib.accountSummary(IB_ACCOUNT_ID)
+            interesting = {'NetLiquidation', 'TotalCashValue', 'BuyingPower', 'AvailableFunds', 'GrossPositionValue', 'InitMarginReq'}
+            print(f"账户摘要 ({IB_ACCOUNT_ID}):")
+            shown = 0
+            for item in summary:
+                if item.tag in interesting and (not item.currency or item.currency == 'USD'):
+                    print(f"  {item.tag}: {item.value} {item.currency}")
+                    shown += 1
+            if shown == 0:
+                for item in summary[:8]:
+                    print(f"  {item.tag}: {item.value} {item.currency}")
+        except Exception as e:
+            print(f"⚠️ 读取账户摘要失败: {e}")
 
-    print("佣金口径仅供参考: IB≈$0.25/张 + CME 等，单边常约 $0.6–1（以账户报表为准）")
-    print("=" * 60 + "\n")
+        print("佣金口径仅供参考: IB≈$0.25/张 + CME 等，单边常约 $0.6–1（以账户报表为准）")
+        print("=" * 60 + "\n")
 
     IB_CONN = ib
-    return ib
+    _IB_LAST_HEARTBEAT_TS = time_module.time()
+    return True
+
+
+def ib_connect(exit_on_fail=True):
+    """启动时连接 IB Gateway。exit_on_fail=True 时失败退出进程。"""
+    ok = _ib_try_connect(verbose=True)
+    if not ok and exit_on_fail:
+        print("启动连接失败，进程退出。请先确认 IB Gateway 已登录且 API 端口可用。")
+        sys.exit(1)
+    return IB_CONN if ok else None
 
 
 def ib_disconnect():
@@ -439,20 +488,88 @@ def ib_disconnect():
         IB_CONN = None
 
 
-def ib_ensure_connected():
-    global IB_CONN
-    if IB_CONN is not None and IB_CONN.isConnected():
-        return True
-    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] IB 断线，尝试重连...")
-    try:
-        ib_disconnect()
-        ib_connect()
-        return True
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"重连失败: {e}")
+def ib_heartbeat(force=False):
+    """
+    轻量探活（reqCurrentTime）。失败则清理本地连接态并返回 False。
+    用于发现「isConnected 仍为 True 但 socket 已死」的僵连接。
+    """
+    global _IB_LAST_HEARTBEAT_TS
+    now_ts = time_module.time()
+    if not force and (now_ts - _IB_LAST_HEARTBEAT_TS) < IB_HEARTBEAT_INTERVAL_SEC:
+        return IB_CONN is not None and IB_CONN.isConnected()
+
+    if IB_CONN is None or not IB_CONN.isConnected():
         return False
+
+    try:
+        IB_CONN.reqCurrentTime()
+        IB_CONN.sleep(0.3)
+        _IB_LAST_HEARTBEAT_TS = now_ts
+        return True
+    except Exception as e:
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts}] IB 心跳失败: {e}，标记断线")
+        ib_disconnect()
+        return False
+
+
+def ib_ensure_connected(max_attempts=None, interval_sec=None):
+    """
+    确保已连接；断线则自动重连。
+    默认无限重试（IB_RECONNECT_MAX_ATTEMPTS=0），不因 Gateway 短暂不可用而退出进程。
+    Gateway Auto Restart 期间会短暂拒连，重试即可恢复。
+    """
+    if max_attempts is None:
+        max_attempts = IB_RECONNECT_MAX_ATTEMPTS
+    if interval_sec is None:
+        interval_sec = IB_RECONNECT_INTERVAL_SEC
+
+    if ib_heartbeat(force=False):
+        return True
+    # heartbeat 可能因间隔未到而跳过探活；再确认一次 isConnected
+    if IB_CONN is not None and IB_CONN.isConnected():
+        if ib_heartbeat(force=True):
+            return True
+
+    attempt = 0
+    while True:
+        attempt += 1
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts}] IB 断线，尝试重连 (#{attempt}"
+              f"{'' if max_attempts <= 0 else f'/{max_attempts}'})...")
+        ib_disconnect()
+        verbose = (attempt == 1 or attempt % 10 == 0)
+        try:
+            if _ib_try_connect(verbose=verbose):
+                ts_ok = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"[{ts_ok}] IB 重连成功")
+                return True
+        except Exception as e:
+            print(f"[{ts}] 重连异常: {e}")
+
+        if max_attempts > 0 and attempt >= max_attempts:
+            print(f"[{ts}] IB 重连失败，已达上限 {max_attempts} 次")
+            return False
+
+        print(f"[{ts}] 重连失败，{interval_sec}s 后重试"
+              f"（请确认 Gateway 已登录；Lock and Exit 建议用「自动重启」）...")
+        time_module.sleep(interval_sec)
+
+
+def sleep_with_ib_keepalive(total_seconds, chunk_sec=None):
+    """长等待分段 sleep，期间做心跳；断线则阻塞重连，避免周末/夜间 Gateway 重启后僵死。"""
+    if chunk_sec is None:
+        chunk_sec = IB_KEEPALIVE_SLEEP_CHUNK_SEC
+    if total_seconds <= 0:
+        return
+    end_ts = time_module.time() + total_seconds
+    while True:
+        remaining = end_ts - time_module.time()
+        if remaining <= 0:
+            break
+        time_module.sleep(min(chunk_sec, remaining))
+        if not ib_heartbeat(force=True):
+            ib_ensure_connected()
 
 
 def get_mnq_price():
@@ -635,6 +752,10 @@ def get_ib_position_qty():
         return int(total) if total == int(total) else total
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 读取 IB 仓位失败: {e}")
+        # socket 已死但 isConnected 可能仍为 True，强制清理以便后续重连
+        err = str(e).lower()
+        if 'socket' in err or 'disconnect' in err or '10053' in err or '10054' in err:
+            ib_disconnect()
         return 0
 
 
@@ -1386,6 +1507,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S.%f')}] 主循环开始 (精确时间)")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 时间精度: 秒={now.second}, 微秒={now.microsecond}")
+
+        # Gateway 可能因 Auto Restart / 网络抖动断线；先探活，断则阻塞重连（不退出进程）
+        if not ib_heartbeat():
+            if not ib_ensure_connected():
+                time_module.sleep(IB_RECONNECT_INTERVAL_SEC)
+                continue
         
         # 模拟模式下不再重新获取持仓状态，保持本地状态
         # current_positions = get_current_positions()
@@ -1540,8 +1667,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             retry_hours = 1 if calendar_stale else 12
             next_check_time = now + timedelta(hours=retry_hours)
             wait_seconds = (next_check_time - now).total_seconds()
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {retry_hours} 小时后重新检查")
-            time_module.sleep(wait_seconds)
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {retry_hours} 小时后重新检查"
+                  f"（分段等待并保持 IB 心跳，Gateway 重启后会自动重连）")
+            sleep_with_ib_keepalive(wait_seconds)
             continue
             
         # 检查是否是新交易日，如果是则重置今日开仓计数
@@ -1926,7 +2054,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 tomorrow_start = datetime.combine(tomorrow, time(trading_start_time[0], trading_start_time[1]), tzinfo=now.tzinfo)
                 next_check_time = tomorrow_start
             wait_seconds = min(1800, (next_check_time - now).total_seconds())
-            time_module.sleep(wait_seconds)
+            sleep_with_ib_keepalive(wait_seconds)
             continue
             
         # 使用新的VWAP计算方法
@@ -2318,7 +2446,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {sleep_seconds:.1f} 秒到下一个精确检查时间 {next_check_time.strftime('%H:%M:%S')}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间精度检查: 秒={now.second}, 微秒={now.microsecond}")
-            time_module.sleep(sleep_seconds)
+            # 超过心跳间隔的长等待用分段保活，短等待直接 sleep（下一轮主循环会探活）
+            if sleep_seconds >= IB_HEARTBEAT_INTERVAL_SEC:
+                sleep_with_ib_keepalive(sleep_seconds)
+            else:
+                time_module.sleep(sleep_seconds)
 
 if __name__ == "__main__":
     sys.stdout = Logger(LOG_FILE)
@@ -2335,6 +2467,7 @@ if __name__ == "__main__":
     print("  · 每季度换月：请更新 MNQ_EXPIRY（或设为空自动选近月）")
     print("  · 无 CME/MNQ 期货权限时 qualify 失败即停")
     print("  · 满仓模式：能买多少张就买多少张，保证金与爆仓风险很高")
+    print("  · Gateway Lock and Exit 请用「自动重启」；脚本会心跳+自动重连，断线不退出")
     print("=" * 60)
 
     print("\n--- 风控设置 ---")
@@ -2357,6 +2490,9 @@ if __name__ == "__main__":
     local_disp = (IB_CONTRACT.localSymbol if IB_CONTRACT else None) or TRADE_SYMBOL
     print(f"执行合约: {local_disp} (FUT/CME) expiry={expiry_disp}")
     print(f"IB Gateway: {IB_HOST}:{IB_PORT} clientId={IB_CLIENT_ID}")
+    print(f"IB 断线重连: 间隔 {IB_RECONNECT_INTERVAL_SEC}s，"
+          f"{'无限重试' if IB_RECONNECT_MAX_ATTEMPTS <= 0 else f'最多 {IB_RECONNECT_MAX_ATTEMPTS} 次'}，"
+          f"心跳 {IB_HEARTBEAT_INTERVAL_SEC}s")
     print(f"账户净值: ${INITIAL_CAPITAL:.2f}")
     print(f"仓位模式: 满仓（可用保证金 × {MARGIN_USAGE_PCT:g} / 单张初始保证金）")
     if MAX_MNQ_CONTRACTS and MAX_MNQ_CONTRACTS > 0:
