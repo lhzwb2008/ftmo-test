@@ -421,8 +421,12 @@ def _ib_try_connect(verbose=True):
     print(f"交易账户: {IB_ACCOUNT_ID} (可用: {accounts})")
 
     # 用 accountUpdates 拉账户字段，避免反复 reqAccountSummary 触发 Error 322
+    # ib_insync: reqAccountUpdates(account='') —— 不要传 subscribe 布尔（会 TypeError）
     try:
-        ib.reqAccountUpdates(True, IB_ACCOUNT_ID)
+        if IB_ACCOUNT_ID:
+            ib.reqAccountUpdates(IB_ACCOUNT_ID)
+        else:
+            ib.reqAccountUpdates()
         ib.sleep(1.0)
     except Exception as e:
         print(f"⚠️ reqAccountUpdates 失败: {e}")
@@ -503,7 +507,8 @@ def ib_disconnect():
     if IB_CONN is not None:
         try:
             if IB_ACCOUNT_ID:
-                IB_CONN.reqAccountUpdates(False, IB_ACCOUNT_ID)
+                # 底层 client 才有 subscribe 开关；高层 API 只有 account 参数
+                IB_CONN.client.reqAccountUpdates(False, IB_ACCOUNT_ID)
         except Exception:
             pass
         try:
@@ -524,7 +529,9 @@ def refresh_ib_account_data(wait_sec=0.8):
         return False
     try:
         if IB_ACCOUNT_ID:
-            IB_CONN.reqAccountUpdates(True, IB_ACCOUNT_ID)
+            IB_CONN.reqAccountUpdates(IB_ACCOUNT_ID)
+        else:
+            IB_CONN.reqAccountUpdates()
         IB_CONN.sleep(wait_sec)
         return True
     except Exception as e:
