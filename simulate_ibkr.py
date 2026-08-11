@@ -21,7 +21,7 @@ Windows 运行前准备：
   7. python simulate_ibkr.py
 
 .env 仅需 Longport 凭证；IB 连接参数写死在下方常量。
-仓位：每次开仓按 IB 可用保证金尽量满仓（whatIf 估单张保证金 → floor(可用×缓冲/单张保证金)）。
+仓位：按 IB 净值 × 缓冲 / 保守单张保证金估算张数后市价下单（默认不订 IB 行情、不用 whatIf）。
 断线：运行中自动心跳探活 + 无限重连（Gateway Auto Restart 窗口内会短暂拒连，脚本会等待恢复）。
 风险：QQQ 信号 vs MNQ 存在基差；每季度需换月（更新 MNQ_EXPIRY 或依赖自动选月）；满仓保证金风险极高。
 """
@@ -75,10 +75,20 @@ IB_RECONNECT_MAX_ATTEMPTS = 0        # 运行中重连次数；0=无限重试直
 IB_HEARTBEAT_INTERVAL_SEC = 300      # 心跳探活间隔（秒）
 IB_KEEPALIVE_SLEEP_CHUNK_SEC = 300   # 长等待分段 sleep，以便心跳/重连
 _IB_LAST_HEARTBEAT_TS = 0.0
-# 满仓时预留一点保证金缓冲，避免 whatIf 与实盘差额导致拒单（0.95=用 95% 可用资金）
-MARGIN_USAGE_PCT = 0.95
+# 满仓时预留保证金缓冲，避免 whatIf 与实盘差额导致拒单（Error 201）
+MARGIN_USAGE_PCT = 0.85
+# 信号来自 Longport，IB 只做市价执行，默认不订阅 IB 行情、不用 whatIf（避免 Error 354）
+# 张数 = floor(净值 × MARGIN_USAGE_PCT / 单张保守保证金)
+IB_USE_MARKET_DATA = False
+IB_USE_WHATIF_MARGIN = False
+# 无 whatIf 时的保守单张初始保证金（MNQ 实盘常约 $3.5k–$5k+；偏保守防 Error 201）
+MNQ_INIT_MARGIN_FALLBACK_USD = 5000.0
+# 也按名义×比例估算，与固定值取较大者
+MNQ_MARGIN_NOTIONAL_PCT_FALLBACK = 0.12
 # 可选硬顶；<=0 表示不限制（能买多少买多少）
 MAX_MNQ_CONTRACTS = 0
+# accountSummary 订阅状态（保留标志；账户刷新走 accountUpdates）
+_ACCOUNT_SUMMARY_SUBSCRIBED = False
 
 # 资金和风控设置（净值从 IB 读取；止盈/日亏默认关闭）
 ACCOUNT_START_BALANCE = None
@@ -189,13 +199,7 @@ def apply_ib_account_capital():
     """连接 Gateway 后读取 NetLiquidation；仓位按可用保证金满仓，不按杠杆。"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, MAX_DAILY_LOSS_AMOUNT
 
-    # accountSummary 异步推送，稍等再读
-    if IB_CONN is not None and IB_CONN.isConnected():
-        try:
-            IB_CONN.reqAccountSummary()
-            IB_CONN.sleep(1.5)
-        except Exception:
-            pass
+    refresh_ib_account_data(wait_sec=1.5)
 
     balance = get_account_balance()
     if balance <= 0:
@@ -209,7 +213,7 @@ def apply_ib_account_capital():
     if avail > 0:
         print(f"可用保证金/购买力: ${avail:,.2f} → 开仓按满仓估算张数（使用 {MARGIN_USAGE_PCT*100:.0f}%）")
     else:
-        print("⚠️ 暂未读到 AvailableFunds/ExcessLiquidity；开仓时会再试 whatIf 估算")
+        print("⚠️ 暂未读到 AvailableFunds/ExcessLiquidity；开仓将按净值×缓冲估算张数")
 
     if PROFIT_TARGET_PCT > 0:
         tp_buffer = balance * TP_BUFFER_PCT
@@ -386,6 +390,13 @@ def _ib_try_connect(verbose=True):
     except Exception:
         pass
 
+    # Paper / 无实时行情：仅在显式启用 IB 行情时切换延迟数据类型
+    if IB_USE_MARKET_DATA:
+        try:
+            ib.reqMarketDataType(3)  # 3=Delayed
+        except Exception:
+            pass
+
     try:
         accounts = ib.managedAccounts()
     except Exception as e:
@@ -409,6 +420,13 @@ def _ib_try_connect(verbose=True):
         print(f"⚠️ IB_ACCOUNT={IB_ACCOUNT} 不在账户列表 {accounts}，改用 {IB_ACCOUNT_ID}")
     print(f"交易账户: {IB_ACCOUNT_ID} (可用: {accounts})")
 
+    # 用 accountUpdates 拉账户字段，避免反复 reqAccountSummary 触发 Error 322
+    try:
+        ib.reqAccountUpdates(True, IB_ACCOUNT_ID)
+        ib.sleep(1.0)
+    except Exception as e:
+        print(f"⚠️ reqAccountUpdates 失败: {e}")
+
     contract = resolve_mnq_contract(ib)
     if contract is None:
         print(f"❌ qualifyContracts 失败: {TRADE_SYMBOL} (FUT/CME/USD)")
@@ -427,7 +445,7 @@ def _ib_try_connect(verbose=True):
     print(f"✅ 合约已确认: {local} expiry={expiry} conId={IB_CONTRACT.conId} "
           f"exchange={IB_CONTRACT.exchange} multiplier={IB_CONTRACT.multiplier}")
 
-    if verbose:
+    if verbose and IB_USE_MARKET_DATA:
         try:
             ticker = ib.reqMktData(IB_CONTRACT, '', False, False)
             ib.sleep(2)
@@ -440,11 +458,14 @@ def _ib_try_connect(verbose=True):
                 print(f"MNQ 参考价: {mnq_px:.2f}")
                 print(f"  1 张名义约 ${notional_1:,.0f}（点值 ${MNQ_POINT_VALUE:g}/点）；保证金以 Gateway 为准")
             else:
-                print("⚠️ 暂未拿到 MNQ 有效报价（可继续；开仓前会再取价）")
+                print("⚠️ 暂未拿到 MNQ 有效报价（可继续；开仓用保守保证金估算）")
             ib.cancelMktData(IB_CONTRACT)
         except Exception as e:
             print(f"⚠️ 获取报价异常: {e}")
+    elif verbose:
+        print("IB 行情订阅: 已关闭（信号用 Longport；仓位按保守保证金估算后市价下单）")
 
+    if verbose:
         try:
             summary = ib.accountSummary(IB_ACCOUNT_ID)
             interesting = {'NetLiquidation', 'TotalCashValue', 'BuyingPower', 'AvailableFunds', 'GrossPositionValue', 'InitMarginReq'}
@@ -478,14 +499,38 @@ def ib_connect(exit_on_fail=True):
 
 
 def ib_disconnect():
-    global IB_CONN
+    global IB_CONN, _ACCOUNT_SUMMARY_SUBSCRIBED
     if IB_CONN is not None:
+        try:
+            if IB_ACCOUNT_ID:
+                IB_CONN.reqAccountUpdates(False, IB_ACCOUNT_ID)
+        except Exception:
+            pass
         try:
             if IB_CONN.isConnected():
                 IB_CONN.disconnect()
         except Exception:
             pass
         IB_CONN = None
+    _ACCOUNT_SUMMARY_SUBSCRIBED = False
+
+
+def refresh_ib_account_data(wait_sec=0.8):
+    """
+    刷新账户资金字段。只用 accountUpdates / accountValues，
+    不再反复 reqAccountSummary（会触发 Error 322）。
+    """
+    if IB_CONN is None or not IB_CONN.isConnected():
+        return False
+    try:
+        if IB_ACCOUNT_ID:
+            IB_CONN.reqAccountUpdates(True, IB_ACCOUNT_ID)
+        IB_CONN.sleep(wait_sec)
+        return True
+    except Exception as e:
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts}] 刷新账户数据失败: {e}")
+        return False
 
 
 def ib_heartbeat(force=False):
@@ -526,7 +571,6 @@ def ib_ensure_connected(max_attempts=None, interval_sec=None):
 
     if ib_heartbeat(force=False):
         return True
-    # heartbeat 可能因间隔未到而跳过探活；再确认一次 isConnected
     if IB_CONN is not None and IB_CONN.isConnected():
         if ib_heartbeat(force=True):
             return True
@@ -573,16 +617,25 @@ def sleep_with_ib_keepalive(total_seconds, chunk_sec=None):
 
 
 def get_mnq_price():
-    """优先 IB ticker；失败返回 None。"""
+    """可选：从 IB 取 MNQ 价。默认关闭行情订阅时直接返回 None（用 QQQ 粗估即可）。"""
+    if not IB_USE_MARKET_DATA:
+        return None
     if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
         return None
     try:
+        try:
+            IB_CONN.reqMarketDataType(3)
+        except Exception:
+            pass
         ticker = IB_CONN.reqMktData(IB_CONTRACT, '', False, False)
         IB_CONN.sleep(1.5)
         last = ticker.marketPrice()
         if last != last or last <= 0:
             last = ticker.last or ticker.close or ticker.bid or ticker.ask
-        IB_CONN.cancelMktData(IB_CONTRACT)
+        try:
+            IB_CONN.cancelMktData(IB_CONTRACT)
+        except Exception:
+            pass
         if last and last == last and last > 0:
             return float(last)
     except Exception as e:
@@ -591,7 +644,7 @@ def get_mnq_price():
 
 
 def get_ib_account_tag(tag, prefer_usd=True):
-    """读取账户字段（accountSummary / accountValues）。"""
+    """读取账户字段（优先 accountValues，其次 accountSummary 缓存）。"""
     if IB_CONN is None or not IB_CONN.isConnected():
         return 0.0
 
@@ -608,19 +661,19 @@ def get_ib_account_tag(tag, prefer_usd=True):
                 val = float(item.value)
             except (TypeError, ValueError):
                 continue
-            if val > best:
+            if abs(val) > abs(best):
                 best = val
         return best
 
     try:
-        v = _parse(IB_CONN.accountSummary(IB_ACCOUNT_ID or ''))
-        if v > 0:
+        v = _parse(IB_CONN.accountValues(IB_ACCOUNT_ID or ''))
+        if v != 0:
             return v
     except Exception:
         pass
     try:
-        v = _parse(IB_CONN.accountValues(IB_ACCOUNT_ID or ''))
-        if v > 0:
+        v = _parse(IB_CONN.accountSummary(IB_ACCOUNT_ID or ''))
+        if v != 0:
             return v
     except Exception:
         pass
@@ -628,19 +681,46 @@ def get_ib_account_tag(tag, prefer_usd=True):
 
 
 def get_ib_buying_power():
-    """优先 ExcessLiquidity / AvailableFunds；再试 BuyingPower。"""
-    for tag in ('ExcessLiquidity', 'AvailableFunds', 'BuyingPower', 'FullAvailableFunds'):
+    """优先 ExcessLiquidity / AvailableFunds；再试 BuyingPower；最后回退净值。"""
+    for tag in ('ExcessLiquidity', 'AvailableFunds', 'FullAvailableFunds', 'BuyingPower'):
         v = get_ib_account_tag(tag)
         if v > 0:
             return v
-    return 0.0
+    nlv = get_ib_account_tag('NetLiquidation')
+    return nlv if nlv > 0 else 0.0
+
+
+def _parse_whatif_margin(state):
+    """从 whatIf OrderState 提取初始保证金（优先 Change，避免 After 含其它仓位）。"""
+    if state is None:
+        return None
+    for attr in ('initMarginChange', 'fullInitMarginChange'):
+        raw = getattr(state, attr, None)
+        if raw is None or raw == '':
+            continue
+        try:
+            val = abs(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    for attr in ('initMarginAfter', 'fullInitMarginAfter'):
+        raw = getattr(state, attr, None)
+        if raw is None or raw == '':
+            continue
+        try:
+            val = abs(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    return None
 
 
 def get_mnq_init_margin_per_contract(action='BUY'):
-    """
-    用 whatIfOrder 估算 1 张 MNQ 初始保证金增量。
-    失败返回 None。
-    """
+    """可选 whatIf 估 1 张保证金；默认关闭（不依赖 IB 行情）。"""
+    if not IB_USE_WHATIF_MARGIN:
+        return None
     if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
         return None
     try:
@@ -648,7 +728,29 @@ def get_mnq_init_margin_per_contract(action='BUY'):
         if IB_ACCOUNT_ID:
             order.account = IB_ACCOUNT_ID
         state = IB_CONN.whatIfOrder(IB_CONTRACT, order)
-        for attr in ('initMarginChange', 'fullInitMarginChange', 'maintMarginChange'):
+        margin = _parse_whatif_margin(state)
+        if margin and margin > 0:
+            return margin
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] whatIf 保证金估算失败: {e}")
+    return None
+
+
+def whatif_order_init_margin(action, quantity):
+    """可选：对指定张数 whatIf。默认关闭。"""
+    if not IB_USE_WHATIF_MARGIN:
+        return None
+    if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
+        return None
+    quantity = int(abs(quantity))
+    if quantity < 1:
+        return None
+    try:
+        order = MarketOrder(action.upper(), quantity)
+        if IB_ACCOUNT_ID:
+            order.account = IB_ACCOUNT_ID
+        state = IB_CONN.whatIfOrder(IB_CONTRACT, order)
+        for attr in ('initMarginAfter', 'fullInitMarginAfter', 'initMarginChange', 'fullInitMarginChange'):
             raw = getattr(state, attr, None)
             if raw is None or raw == '':
                 continue
@@ -659,7 +761,7 @@ def get_mnq_init_margin_per_contract(action='BUY'):
             if val > 0:
                 return val
     except Exception as e:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] whatIf 保证金估算失败: {e}")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] whatIf({quantity}) 失败: {e}")
     return None
 
 
@@ -670,36 +772,50 @@ def estimate_mnq_price_from_qqq(qqq_px):
     return float(qqq_px) * NQ_QQQ_RATIO
 
 
+def _fallback_margin_per_contract(mnq_px):
+    """不依赖 IB 行情/whatIf 的保守单张保证金。"""
+    by_notional = 0.0
+    if mnq_px and mnq_px > 0:
+        by_notional = float(mnq_px) * MNQ_POINT_VALUE * MNQ_MARGIN_NOTIONAL_PCT_FALLBACK
+    return max(MNQ_INIT_MARGIN_FALLBACK_USD, by_notional)
+
+
 def calc_ib_order_quantity(mnq_px=None, qqq_px=None, side='Buy'):
-    """按可用保证金尽量满仓：floor(可用×缓冲 / 单张初始保证金)。"""
+    """
+    按净值预算满仓：floor(NLV × 缓冲 / 单张保守保证金)。
+    默认不订 IB 行情、不做 whatIf；市价单直接下。
+    """
     ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
     if not ib_ensure_connected() or IB_CONTRACT is None:
         print(f"[{ts}] 无法计算手数：IB 未连接")
         return 0
 
-    # 刷新账户字段
-    try:
-        IB_CONN.reqAccountSummary()
-        IB_CONN.sleep(0.8)
-    except Exception:
-        pass
+    refresh_ib_account_data(wait_sec=0.8)
 
     available = get_ib_buying_power()
+    nlv = get_ib_account_tag('NetLiquidation')
+    # IB 大宗商品规则：NLV 必须大于总初始保证金；预算按净值封顶
+    if nlv > 0:
+        if available <= 0 or available > nlv:
+            if available > nlv:
+                print(f"[{ts}] 可用资金 ${available:,.0f} > 净值 ${nlv:,.0f}，按净值作为预算基数")
+            available = nlv
     usable = available * MARGIN_USAGE_PCT
     action = 'BUY' if side == 'Buy' else 'SELL'
-    margin_1 = get_mnq_init_margin_per_contract(action=action)
 
-    if margin_1 is None or margin_1 <= 0:
-        # 回退：用名义的粗估保证金（约 5%），仅应急
-        if mnq_px is None or mnq_px <= 0:
-            mnq_px = get_mnq_price()
-        if (mnq_px is None or mnq_px <= 0) and qqq_px:
-            mnq_px = estimate_mnq_price_from_qqq(qqq_px)
-        if mnq_px is None or mnq_px <= 0:
-            print(f"[{ts}] 无法计算手数：缺少保证金与 MNQ 价格")
-            return 0
-        margin_1 = mnq_px * MNQ_POINT_VALUE * 0.05
-        print(f"[{ts}] ⚠️ whatIf 不可用，回退按名义 5% 估保证金 ≈ ${margin_1:,.0f}/张")
+    if mnq_px is None or mnq_px <= 0:
+        mnq_px = get_mnq_price()
+    if (mnq_px is None or mnq_px <= 0) and qqq_px:
+        mnq_px = estimate_mnq_price_from_qqq(qqq_px)
+
+    margin_1 = get_mnq_init_margin_per_contract(action=action)
+    if margin_1 and margin_1 > 0:
+        margin_source = 'whatIf×1'
+    else:
+        margin_1 = _fallback_margin_per_contract(mnq_px)
+        margin_source = 'conservative'
+        print(f"[{ts}] 仓位估算用保守保证金 ≈ ${margin_1:,.0f}/张"
+              f"（≥${MNQ_INIT_MARGIN_FALLBACK_USD:,.0f} 或名义×{MNQ_MARGIN_NOTIONAL_PCT_FALLBACK:.0%}；不订 IB 行情）")
 
     if usable <= 0:
         print(f"[{ts}] 无法计算手数：可用保证金/购买力为 0")
@@ -709,20 +825,30 @@ def calc_ib_order_quantity(mnq_px=None, qqq_px=None, side='Buy'):
     if MAX_MNQ_CONTRACTS and MAX_MNQ_CONTRACTS > 0:
         qty = min(qty, int(MAX_MNQ_CONTRACTS))
 
-    if mnq_px is None or mnq_px <= 0:
-        mnq_px = get_mnq_price()
-    if (mnq_px is None or mnq_px <= 0) and qqq_px:
-        mnq_px = estimate_mnq_price_from_qqq(qqq_px)
-    notional = (qty * mnq_px * MNQ_POINT_VALUE) if (mnq_px and mnq_px > 0) else 0.0
+    # 仅当显式开启 whatIf 时做整单二次校验
+    if qty >= 1 and IB_USE_WHATIF_MARGIN:
+        full_margin = whatif_order_init_margin(action, qty)
+        budget_cap = nlv * MARGIN_USAGE_PCT if nlv > 0 else usable
+        if full_margin and full_margin > 0:
+            if full_margin > budget_cap:
+                new_qty = int(floor(qty * budget_cap / full_margin))
+                print(f"[{ts}] 整单 whatIf 总初始保证金 ${full_margin:,.0f} > 预算 ${budget_cap:,.0f}，"
+                      f"张数 {qty} → {new_qty}")
+                qty = max(0, new_qty)
+            else:
+                print(f"[{ts}] 整单 whatIf 通过: {qty} 张总初始保证金≈${full_margin:,.0f}")
+
+    notional = (qty * mnq_px * MNQ_POINT_VALUE) if (mnq_px and mnq_px > 0 and qty > 0) else 0.0
     eff_lev = (notional / INITIAL_CAPITAL) if (INITIAL_CAPITAL and INITIAL_CAPITAL > 0 and notional > 0) else 0.0
 
-    print(f"[{ts}] 满仓计算: 可用=${available:,.0f} × {MARGIN_USAGE_PCT:g} / 单张保证金≈${margin_1:,.0f} "
-          f"= {qty} 张 MNQ"
+    print(f"[{ts}] 满仓计算: 预算=${usable:,.0f} (基数${available:,.0f}×{MARGIN_USAGE_PCT:g}) / "
+          f"单张≈${margin_1:,.0f} ({margin_source}) = {qty} 张 MNQ"
           + (f" (名义约 ${notional:,.0f} ≈ {eff_lev:.1f}x 净值)" if notional > 0 else ""))
     if qty < 1:
         print(f"[{ts}] ⚠️ 可用保证金不足 1 张（约需 ${margin_1:,.0f}+），跳过开仓")
         return 0
     return qty
+
 
 def get_ib_position_qty():
     """返回 MNQ 净仓位（多头>0，空头<0）。"""
