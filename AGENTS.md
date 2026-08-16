@@ -30,7 +30,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
   - `LONGPORT_APP_KEY`
   - `LONGPORT_APP_SECRET`
   - `LONGPORT_ACCESS_TOKEN`
-- **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `MNQ`（Micro Nasdaq-100 期货，非 IBUST100 CFD）；开仓按可用保证金尽量满仓。需本机已登录 IB Gateway 且有 CME/MNQ 权限。合约月见 `MNQ_EXPIRY`（空=自动近月）。IB 连接参数写死在脚本常量（默认 `127.0.0.1:4001`）；`.env` 仅需 Longport 凭证。不写 SQLite、不跑 MT5。
+- **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `MNQ`（Micro Nasdaq-100 期货，非 IBUST100 CFD）；开仓按 IBKR **日内**初始保证金满仓（名义×7.71%、使用 100% 净值，有效杠杆约 13x；Error 201 则按 90%/85%/70% 减张重试；收盘前平仓，不要按隔夜 12% 估）。需本机已登录 IB Gateway 且有 CME/MNQ 权限。合约月见 `MNQ_EXPIRY`（空=自动近月）。IB 连接参数写死在脚本常量（默认 `127.0.0.1:4002` Paper / `4001` Live）；`.env` 仅需 Longport 凭证。不写 SQLite、不跑 MT5。
 - **Data fetcher** (`data_fetch_from_longport.py`) also requires Longport credentials.
 
 ### Key gotchas
