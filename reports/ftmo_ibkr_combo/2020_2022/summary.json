@@ -1,0 +1,553 @@
+{
+  "key": "2020_2022",
+  "label": "2020-07 ~ 2022-08",
+  "data_path": "/Users/Wezhang/workspace/quantra/qqq_market_hours_with_indicators.csv",
+  "start": "2020-07-02",
+  "end": "2022-08-05",
+  "trading_days": 525,
+  "calendar_days": 764,
+  "p1_date": "2020-07-23",
+  "funded_date": "2020-08-12",
+  "challenge_fees_paid": 5400.0,
+  "payouts_to_ibkr": 429609.64,
+  "refunds_to_ibkr": 5400.0,
+  "accrued_unpaid": 0.0,
+  "account": {
+    "challenges_bought": 1,
+    "p1_pass": 1,
+    "p2_pass": 1,
+    "fail_p1": 0,
+    "fail_p2": 0,
+    "fail_funded": 0,
+    "payouts": 31,
+    "payout_to_ibkr": 42960.96,
+    "refund_to_ibkr": 540.0,
+    "fees_paid": 540.0,
+    "final_phase": "funded",
+    "final_equity": 99733.85,
+    "events": [
+      {
+        "date": "2020-07-23",
+        "type": "p1_pass",
+        "detail": "reset to p2 @ size"
+      },
+      {
+        "date": "2020-08-12",
+        "type": "funded",
+        "detail": "start funded"
+      },
+      {
+        "date": "2020-08-26",
+        "type": "payout",
+        "detail": "trader $2,981 refund $540"
+      },
+      {
+        "date": "2020-09-09",
+        "type": "payout",
+        "detail": "trader $1,773 refund $0"
+      },
+      {
+        "date": "2020-09-23",
+        "type": "payout",
+        "detail": "trader $2,542 refund $0"
+      },
+      {
+        "date": "2020-10-12",
+        "type": "payout",
+        "detail": "trader $254 refund $0"
+      },
+      {
+        "date": "2020-10-30",
+        "type": "payout",
+        "detail": "trader $512 refund $0"
+      },
+      {
+        "date": "2021-01-04",
+        "type": "payout",
+        "detail": "trader $348 refund $0"
+      },
+      {
+        "date": "2021-01-19",
+        "type": "payout",
+        "detail": "trader $859 refund $0"
+      },
+      {
+        "date": "2021-02-02",
+        "type": "payout",
+        "detail": "trader $1,215 refund $0"
+      },
+      {
+        "date": "2021-03-01",
+        "type": "payout",
+        "detail": "trader $627 refund $0"
+      },
+      {
+        "date": "2021-03-15",
+        "type": "payout",
+        "detail": "trader $95 refund $0"
+      },
+      {
+        "date": "2021-05-14",
+        "type": "payout",
+        "detail": "trader $223 refund $0"
+      },
+      {
+        "date": "2021-06-17",
+        "type": "payout",
+        "detail": "trader $1,498 refund $0"
+      },
+      {
+        "date": "2021-07-20",
+        "type": "payout",
+        "detail": "trader $309 refund $0"
+      },
+      {
+        "date": "2021-08-03",
+        "type": "payout",
+        "detail": "trader $585 refund $0"
+      },
+      {
+        "date": "2021-08-30",
+        "type": "payout",
+        "detail": "trader $632 refund $0"
+      },
+      {
+        "date": "2021-10-04",
+        "type": "payout",
+        "detail": "trader $617 refund $0"
+      },
+      {
+        "date": "2021-10-18",
+        "type": "payout",
+        "detail": "trader $314 refund $0"
+      },
+      {
+        "date": "2021-11-12",
+        "type": "payout",
+        "detail": "trader $159 refund $0"
+      },
+      {
+        "date": "2021-12-09",
+        "type": "payout",
+        "detail": "trader $281 refund $0"
+      },
+      {
+        "date": "2021-12-23",
+        "type": "payout",
+        "detail": "trader $3,413 refund $0"
+      },
+      {
+        "date": "2022-01-06",
+        "type": "payout",
+        "detail": "trader $876 refund $0"
+      },
+      {
+        "date": "2022-01-26",
+        "type": "payout",
+        "detail": "trader $398 refund $0"
+      },
+      {
+        "date": "2022-02-09",
+        "type": "payout",
+        "detail": "trader $2,202 refund $0"
+      },
+      {
+        "date": "2022-02-23",
+        "type": "payout",
+        "detail": "trader $3,815 refund $0"
+      },
+      {
+        "date": "2022-03-09",
+        "type": "payout",
+        "detail": "trader $1,786 refund $0"
+      },
+      {
+        "date": "2022-03-23",
+        "type": "payout",
+        "detail": "trader $3,820 refund $0"
+      },
+      {
+        "date": "2022-04-06",
+        "type": "payout",
+        "detail": "trader $2,638 refund $0"
+      },
+      {
+        "date": "2022-04-20",
+        "type": "payout",
+        "detail": "trader $2,709 refund $0"
+      },
+      {
+        "date": "2022-05-04",
+        "type": "payout",
+        "detail": "trader $1,785 refund $0"
+      },
+      {
+        "date": "2022-05-18",
+        "type": "payout",
+        "detail": "trader $3,264 refund $0"
+      },
+      {
+        "date": "2022-07-07",
+        "type": "payout",
+        "detail": "trader $434 refund $0"
+      }
+    ]
+  },
+  "ibkr": {
+    "ibkr_equity": 4156705.63,
+    "ibkr_realized_pnl": 3721696.0,
+    "ibkr_fees_slip": 566233.92,
+    "ibkr_trade_days": 486,
+    "ibkr_skip_days": 39,
+    "ibkr_margin_call": 0,
+    "ibkr_wipe": 0,
+    "ibkr_daily_stop": 0,
+    "ibkr_max_dd_pct": 48.23,
+    "ibkr_peak": 4592942.9,
+    "ibkr_first_trade": "2020-08-27",
+    "ibkr_lev_median": 12.91,
+    "ibkr_lev_mean": 12.89,
+    "ibkr_qty_median": 85.0,
+    "net_profit": 4151305.63
+  },
+  "monthly": [
+    {
+      "month": "2020-07",
+      "phase": "p2",
+      "passed_p1": true,
+      "is_funded": false,
+      "funded_pnl": 0.0,
+      "funded_pnl_cum": 0.0,
+      "accrued": 0.0,
+      "payout_cum": 0.0,
+      "ibkr": 0.0,
+      "net_wealth": -5400.0,
+      "n_fail": 0
+    },
+    {
+      "month": "2020-08",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 35505.16,
+      "funded_pnl_cum": 35505.16,
+      "accrued": 0.0,
+      "payout_cum": 29809.59,
+      "ibkr": 34411.32,
+      "net_wealth": 29011.32,
+      "n_fail": 0
+    },
+    {
+      "month": "2020-09",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 55488.51,
+      "funded_pnl_cum": 90993.67,
+      "accrued": 0.0,
+      "payout_cum": 72954.82,
+      "ibkr": 98515.93,
+      "net_wealth": 93115.93,
+      "n_fail": 0
+    },
+    {
+      "month": "2020-10",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 9776.91,
+      "funded_pnl_cum": 100770.58,
+      "accrued": 0.0,
+      "payout_cum": 80616.46,
+      "ibkr": 107510.29,
+      "net_wealth": 102110.29,
+      "n_fail": 0
+    },
+    {
+      "month": "2020-11",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": -24801.29,
+      "funded_pnl_cum": 75969.29,
+      "accrued": 0.0,
+      "payout_cum": 80616.46,
+      "ibkr": 84795.93,
+      "net_wealth": 79395.93,
+      "n_fail": 0
+    },
+    {
+      "month": "2020-12",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 9955.49,
+      "funded_pnl_cum": 85924.77,
+      "accrued": 0.0,
+      "payout_cum": 80616.46,
+      "ibkr": 90509.76,
+      "net_wealth": 85109.76,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-01",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 35499.23,
+      "funded_pnl_cum": 121424.0,
+      "accrued": 4457.52,
+      "payout_cum": 92681.69,
+      "ibkr": 129013.58,
+      "net_wealth": 128071.1,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-02",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 9605.37,
+      "funded_pnl_cum": 131029.37,
+      "accrued": 0.0,
+      "payout_cum": 104836.43,
+      "ibkr": 143118.52,
+      "net_wealth": 137718.52,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-03",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": -41640.45,
+      "funded_pnl_cum": 89388.92,
+      "accrued": 0.0,
+      "payout_cum": 112048.63,
+      "ibkr": 97317.7,
+      "net_wealth": 91917.7,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-04",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 27175.13,
+      "funded_pnl_cum": 116564.05,
+      "accrued": 0.0,
+      "payout_cum": 112048.63,
+      "ibkr": 122266.85,
+      "net_wealth": 116866.85,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-05",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 22152.29,
+      "funded_pnl_cum": 138716.34,
+      "accrued": 0.0,
+      "payout_cum": 114278.22,
+      "ibkr": 148058.74,
+      "net_wealth": 142658.74,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-06",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 20057.47,
+      "funded_pnl_cum": 158773.81,
+      "accrued": 0.0,
+      "payout_cum": 129258.34,
+      "ibkr": 177190.21,
+      "net_wealth": 171790.21,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-07",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 25405.7,
+      "funded_pnl_cum": 184179.51,
+      "accrued": 14991.86,
+      "payout_cum": 132351.75,
+      "ibkr": 221093.81,
+      "net_wealth": 230685.67,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-08",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": -3522.72,
+      "funded_pnl_cum": 180656.79,
+      "accrued": 0.0,
+      "payout_cum": 144525.43,
+      "ibkr": 226245.6,
+      "net_wealth": 220845.6,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-09",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": -15937.0,
+      "funded_pnl_cum": 164719.79,
+      "accrued": 0.0,
+      "payout_cum": 144525.43,
+      "ibkr": 197947.37,
+      "net_wealth": 192547.37,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-10",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 18867.08,
+      "funded_pnl_cum": 183586.87,
+      "accrued": 0.0,
+      "payout_cum": 153827.46,
+      "ibkr": 237400.58,
+      "net_wealth": 232000.58,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-11",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": -9791.7,
+      "funded_pnl_cum": 173795.18,
+      "accrued": 0.0,
+      "payout_cum": 155415.55,
+      "ibkr": 216713.18,
+      "net_wealth": 211313.18,
+      "n_fail": 0
+    },
+    {
+      "month": "2021-12",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 62849.8,
+      "funded_pnl_cum": 236644.98,
+      "accrued": 0.0,
+      "payout_cum": 192352.46,
+      "ibkr": 395308.98,
+      "net_wealth": 389908.98,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-01",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 19717.14,
+      "funded_pnl_cum": 256362.12,
+      "accrued": 0.0,
+      "payout_cum": 205089.7,
+      "ibkr": 457983.51,
+      "net_wealth": 452583.51,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-02",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 75205.98,
+      "funded_pnl_cum": 331568.1,
+      "accrued": 0.0,
+      "payout_cum": 265254.48,
+      "ibkr": 889382.06,
+      "net_wealth": 883982.06,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-03",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 84308.56,
+      "funded_pnl_cum": 415876.66,
+      "accrued": 11387.69,
+      "payout_cum": 321313.64,
+      "ibkr": 1839833.29,
+      "net_wealth": 1845820.98,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-04",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 90112.04,
+      "funded_pnl_cum": 505988.7,
+      "accrued": 30004.34,
+      "payout_cum": 374786.62,
+      "ibkr": 3832437.85,
+      "net_wealth": 3857042.19,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-05",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 13165.11,
+      "funded_pnl_cum": 519153.81,
+      "accrued": 0.0,
+      "payout_cum": 425273.74,
+      "ibkr": 4056795.96,
+      "net_wealth": 4051395.96,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-06",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": -16015.81,
+      "funded_pnl_cum": 503138.0,
+      "accrued": 0.0,
+      "payout_cum": 425273.74,
+      "ibkr": 3400117.36,
+      "net_wealth": 3394717.36,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-07",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": 32845.15,
+      "funded_pnl_cum": 535983.15,
+      "accrued": 0.0,
+      "payout_cum": 429609.64,
+      "ibkr": 4366867.39,
+      "net_wealth": 4361467.39,
+      "n_fail": 0
+    },
+    {
+      "month": "2022-08",
+      "phase": "funded",
+      "passed_p1": true,
+      "is_funded": true,
+      "funded_pnl": -1632.59,
+      "funded_pnl_cum": 534350.56,
+      "accrued": 0.0,
+      "payout_cum": 429609.64,
+      "ibkr": 4156705.63,
+      "net_wealth": 4151305.63,
+      "n_fail": 0
+    }
+  ]
+}
