@@ -374,6 +374,37 @@ def _safe_ib_disconnect(ib):
         pass
 
 
+def _ib_subscribe_account_updates(ib, account='', wait_sec=1.5):
+    """
+    订阅账户资金推送，但不阻塞等待 accountDownloadEnd。
+    ib.reqAccountUpdates() 会等下载结束；纸账户/只读 API 常永不回调，导致进程卡死。
+    """
+    if ib is None or not ib.isConnected():
+        return False
+    try:
+        ib.client.reqAccountUpdates(True, account or '')
+        if wait_sec and wait_sec > 0:
+            ib.sleep(float(wait_sec))
+        return True
+    except Exception as e:
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts}] 订阅账户更新失败: {e}")
+        return False
+
+
+def _ib_cached_account_summary(ib, account=''):
+    """只读已缓存的 accountSummary，不触发阻塞的 reqAccountSummary。"""
+    if ib is None:
+        return []
+    try:
+        items = list(ib.wrapper.acctSummary.values())
+    except Exception:
+        return []
+    if account:
+        return [v for v in items if getattr(v, 'account', '') == account]
+    return items
+
+
 def _ib_try_connect(verbose=True):
     """
     尝试连接 IB Gateway 一次并 qualify MNQ。
@@ -465,13 +496,9 @@ def _ib_try_connect(verbose=True):
         print(f"✅ 合约已确认: {local} expiry={expiry} conId={IB_CONTRACT.conId} "
               f"exchange={IB_CONTRACT.exchange} multiplier={IB_CONTRACT.multiplier}")
 
-        # ib_insync: reqAccountUpdates(account='') —— 不要传 subscribe 布尔
+        # 底层订阅；勿用阻塞的 ib.reqAccountUpdates()（等 accountDownloadEnd）
         try:
-            if IB_ACCOUNT_ID:
-                ib.reqAccountUpdates(IB_ACCOUNT_ID)
-            else:
-                ib.reqAccountUpdates()
-            ib.sleep(1.0)
+            _ib_subscribe_account_updates(ib, IB_ACCOUNT_ID or '', wait_sec=1.5)
         except Exception as e:
             print(f"⚠️ reqAccountUpdates 失败: {e}（可继续；稍后刷新账户）")
             if not ib.isConnected():
@@ -502,7 +529,9 @@ def _ib_try_connect(verbose=True):
         if verbose:
             try:
                 if ib.isConnected():
-                    summary = ib.accountSummary(IB_ACCOUNT_ID)
+                    summary = list(ib.accountValues(IB_ACCOUNT_ID or ''))
+                    if not summary:
+                        summary = _ib_cached_account_summary(ib, IB_ACCOUNT_ID or '')
                     interesting = {
                         'NetLiquidation', 'TotalCashValue', 'BuyingPower',
                         'AvailableFunds', 'GrossPositionValue', 'InitMarginReq'
@@ -516,6 +545,8 @@ def _ib_try_connect(verbose=True):
                     if shown == 0:
                         for item in summary[:8]:
                             print(f"  {item.tag}: {item.value} {item.currency}")
+                    if shown == 0 and not summary:
+                        print("  （暂未收到账户字段，稍后由 apply_ib_account_capital 重试）")
             except Exception as e:
                 print(f"⚠️ 读取账户摘要失败: {e}")
 
@@ -588,12 +619,7 @@ def refresh_ib_account_data(wait_sec=0.8):
     if IB_CONN is None or not IB_CONN.isConnected():
         return False
     try:
-        if IB_ACCOUNT_ID:
-            IB_CONN.reqAccountUpdates(IB_ACCOUNT_ID)
-        else:
-            IB_CONN.reqAccountUpdates()
-        IB_CONN.sleep(wait_sec)
-        return True
+        return _ib_subscribe_account_updates(IB_CONN, IB_ACCOUNT_ID or '', wait_sec=wait_sec)
     except Exception as e:
         ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{ts}] 刷新账户数据失败: {e}")
@@ -739,7 +765,7 @@ def get_ib_account_tag(tag, prefer_usd=True):
     except Exception:
         pass
     try:
-        v = _parse(IB_CONN.accountSummary(IB_ACCOUNT_ID or ''))
+        v = _parse(_ib_cached_account_summary(IB_CONN, IB_ACCOUNT_ID or ''))
         if v != 0:
             return v
     except Exception:
@@ -1102,7 +1128,7 @@ def get_account_balance():
 
     def _from_summary():
         try:
-            for item in IB_CONN.accountSummary(IB_ACCOUNT_ID or ''):
+            for item in _ib_cached_account_summary(IB_CONN, IB_ACCOUNT_ID or ''):
                 if item.tag == 'NetLiquidation' and (not item.currency or item.currency == 'USD'):
                     return float(item.value)
         except Exception:
@@ -1118,14 +1144,11 @@ def get_account_balance():
             pass
         return 0.0
 
-    bal = _from_summary()
-    if bal > 0:
-        return bal
     for tag in ('NetLiquidation', 'EquityWithLoanValue', 'AvailableFunds', 'TotalCashValue'):
         bal = _from_values(tag)
         if bal > 0:
             return bal
-    return 0.0
+    return _from_summary()
 
 
 def get_current_positions():
