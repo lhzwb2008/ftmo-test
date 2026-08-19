@@ -83,6 +83,12 @@ IB_OPEN_RETRY_QTY_FRACS = (1.00, 0.90, 0.85, 0.70)
 # 张数 = floor(净值 × MARGIN_USAGE_PCT / 单张日内初始保证金)
 IB_USE_MARKET_DATA = False
 IB_USE_WHATIF_MARGIN = False
+# 市价单显式 DAY。Gateway「订单预设」把空 TIF 改成 DAY 时会报 10349，ib_insync 常把原单标成 Cancelled，实际已成交。
+IB_TIF = 'DAY'
+IB_INFORMATIONAL_ERROR_CODES = frozenset({
+    10349,  # Order TIF was set to DAY based on order preset
+    2104, 2106, 2107, 2108, 2119, 2158, 399,
+})
 # 与 ftmo_ibkr_combo_backtest 主口径一致：IBKR 日内初始（收盘前平仓），不是隔夜 12%
 # 公开表约 $4,468–$4,597/口，合名义 ~7.5–7.7%；100% 净值有效杠杆约 13x
 MNQ_INTRADAY_IM_PCT = 0.0771
@@ -817,9 +823,7 @@ def get_mnq_init_margin_per_contract(action='BUY'):
     if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
         return None
     try:
-        order = MarketOrder(action.upper(), 1)
-        if IB_ACCOUNT_ID:
-            order.account = IB_ACCOUNT_ID
+        order = _ib_market_order(action.upper(), 1)
         state = IB_CONN.whatIfOrder(IB_CONTRACT, order)
         margin = _parse_whatif_margin(state)
         if margin and margin > 0:
@@ -839,9 +843,7 @@ def whatif_order_init_margin(action, quantity):
     if quantity < 1:
         return None
     try:
-        order = MarketOrder(action.upper(), quantity)
-        if IB_ACCOUNT_ID:
-            order.account = IB_ACCOUNT_ID
+        order = _ib_market_order(action.upper(), quantity)
         state = IB_CONN.whatIfOrder(IB_CONTRACT, order)
         for attr in ('initMarginAfter', 'fullInitMarginAfter', 'initMarginChange', 'fullInitMarginChange'):
             raw = getattr(state, attr, None)
@@ -943,6 +945,27 @@ def calc_ib_order_quantity(mnq_px=None, qqq_px=None, side='Buy'):
     return qty
 
 
+def _ib_market_order(action, quantity):
+    order = MarketOrder(action, quantity)
+    order.tif = IB_TIF
+    if IB_ACCOUNT_ID:
+        order.account = IB_ACCOUNT_ID
+    return order
+
+
+def _position_moved_as_expected(pos_before, pos_after, action):
+    """仓位是否朝 BUY/SELL 方向变动至少 1 张（含部分成交）。"""
+    try:
+        delta = float(pos_after) - float(pos_before)
+    except (TypeError, ValueError):
+        return False
+    if action == 'BUY':
+        return delta >= 1
+    if action == 'SELL':
+        return delta <= -1
+    return False
+
+
 def get_ib_position_qty():
     """返回 MNQ 净仓位（多头>0，空头<0）。"""
     if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
@@ -1021,17 +1044,20 @@ def _trade_error_codes(trade):
 
 
 def _trade_error_code(trade):
-    """优先返回 Error 201（保证金不足）；否则第一个错误码。"""
+    """优先返回 Error 201（保证金不足）；忽略 10349 等提示码。"""
     codes = _trade_error_codes(trade)
     if 201 in codes:
         return 201
-    return codes[0] if codes else 0
+    for code in codes:
+        if code not in IB_INFORMATIONAL_ERROR_CODES:
+            return code
+    return 0
 
 
 def place_ib_market(action, quantity):
     """
     市价单。action: 'BUY' | 'SELL'；quantity > 0（张）。
-    返回 dict: ok, orderId, avg_fill, commission, error
+    以仓位变化为准：Error 10349 可能把订单标成 Cancelled，但实际已成交。
     """
     ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
     if not ib_ensure_connected() or IB_CONTRACT is None:
@@ -1046,44 +1072,61 @@ def place_ib_market(action, quantity):
 
     local = (IB_CONTRACT.localSymbol or TRADE_SYMBOL) if IB_CONTRACT else TRADE_SYMBOL
     try:
-        order = MarketOrder(action, quantity)
-        if IB_ACCOUNT_ID:
-            order.account = IB_ACCOUNT_ID
+        pos_before = get_ib_position_qty()
+        order = _ib_market_order(action, quantity)
         trade = IB_CONN.placeOrder(IB_CONTRACT, order)
-        print(f"[{ts}] 已提交市价单: {action} {quantity} {local} orderId={trade.order.orderId}")
+        print(f"[{ts}] 已提交市价单: {action} {quantity} {local} tif={order.tif} orderId={trade.order.orderId}")
 
-        # 等待成交（市价通常很快）
+        status = ''
         for _ in range(40):
             IB_CONN.sleep(0.25)
             status = trade.orderStatus.status
             if status in ('Filled', 'Cancelled', 'ApiCancelled', 'Inactive'):
                 break
 
+        codes = _trade_error_codes(trade)
+        if status != 'Filled':
+            extra = 8 if (status in ('Cancelled', 'ApiCancelled', 'Inactive', 'Submitted', 'PreSubmitted', 'PendingSubmit') or 10349 in codes) else 2
+            for _ in range(extra):
+                if trade.orderStatus.status == 'Filled':
+                    break
+                pos_mid = get_ib_position_qty()
+                if _position_moved_as_expected(pos_before, pos_mid, action):
+                    break
+                IB_CONN.sleep(1.0)
+
         avg_fill = _trade_fill_avg(trade)
         commission = _trade_commission(trade)
         status = trade.orderStatus.status
         err_code = _trade_error_code(trade)
         pos = get_ib_position_qty()
+        moved = _position_moved_as_expected(pos_before, pos, action)
         print(f"[{ts}] 订单状态={status}, avgFill={avg_fill}, commission={commission}, "
-              f"errorCode={err_code or '-'}, 当前仓位={pos}")
+              f"errorCode={err_code or '-'}, 仓位 {pos_before}→{pos}")
 
-        if status != 'Filled':
+        if status == 'Filled' or moved:
+            if status != 'Filled':
+                print(f"[{ts}] 订单状态非 Filled（常为 10349/预设改 TIF），但仓位已变，按成交处理")
             return {
-                'ok': False,
+                'ok': True,
                 'orderId': trade.order.orderId,
                 'avg_fill': avg_fill,
                 'commission': commission,
                 'position': pos,
-                'error_code': err_code,
-                'error': f'status={status}' + (f' errorCode={err_code}' if err_code else ''),
+                'error_code': 0,
             }
+
+        info_only = bool(codes) and set(codes).issubset(IB_INFORMATIONAL_ERROR_CODES)
+        if info_only and err_code == 10349:
+            print(f"[{ts}] Error 10349 且仓位未变，视为未成交")
         return {
-            'ok': True,
+            'ok': False,
             'orderId': trade.order.orderId,
             'avg_fill': avg_fill,
             'commission': commission,
             'position': pos,
-            'error_code': 0,
+            'error_code': err_code,
+            'error': f'status={status}' + (f' errorCode={err_code}' if err_code else ''),
         }
     except Exception as e:
         print(f"[{ts}] 下单异常: {e}")
@@ -1091,7 +1134,7 @@ def place_ib_market(action, quantity):
 
 
 def close_ib_position():
-    """按 ib.positions() 核对后反向市价平仓；无仓位则成功返回。"""
+    """按 ib.positions() 核对后反向市价平仓；无仓位则成功返回。以平后仓位=0 为准。"""
     ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
     if not ib_ensure_connected():
         return {'ok': False, 'error': 'not connected'}
@@ -1104,7 +1147,21 @@ def close_ib_position():
     action = 'SELL' if pos > 0 else 'BUY'
     qty = abs(int(pos)) if float(pos) == int(pos) else abs(pos)
     print(f"[{ts}] 平仓: 当前仓位={pos} → {action} {qty}")
-    return place_ib_market(action, qty)
+    result = place_ib_market(action, qty)
+    pos_after = get_ib_position_qty()
+    if pos_after == 0:
+        if not result:
+            result = {}
+        result['ok'] = True
+        result['position'] = 0
+        return result
+    print(f"[{ts}] 平仓后仍有仓位 {pos_after}，未完全平掉")
+    if not result:
+        result = {}
+    result['ok'] = False
+    result['position'] = pos_after
+    result['error'] = result.get('error') or f'residual position {pos_after}'
+    return result
 
 
 def get_us_eastern_time():
@@ -2123,6 +2180,20 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if not is_trigger_time:
             # 如果不是触发时间，跳过本次循环
             continue
+
+        # 每个检查点以 IB 真实仓位为准（10349 假失败时本地会错当成空仓，从而漏止损）
+        try:
+            ib_pos = get_ib_position_qty()
+            ib_pos = int(ib_pos) if float(ib_pos) == int(ib_pos) else ib_pos
+            if ib_pos != position_quantity:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 同步 IB 仓位: 本地 {position_quantity} → {ib_pos}")
+                if position_quantity != 0 and ib_pos == 0:
+                    entry_price = None
+                    max_profit_price = None
+                    trailing_tp_activated = False
+                position_quantity = ib_pos
+        except Exception as e:
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 同步 IB 仓位失败: {e}")
             
         # 检查是否是交易时间结束点，如果是且有持仓，则强制平仓
         is_trading_end = (current_hour, current_minute) == (trading_end_time[0], trading_end_time[1])
@@ -2620,17 +2691,23 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 执行: {TRADE_SYMBOL} × {qty} 张（满仓）")
 
                 order_id = submit_order(symbol, side, qty, outside_rth=outside_rth_setting)
-                if not order_id:
+                ib_pos = get_ib_position_qty()
+                ib_pos = int(ib_pos) if float(ib_pos) == int(ib_pos) else ib_pos
+                if ib_pos == 0:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓失败，保持空仓")
                     continue
+                if not order_id:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 下单回报失败但 IB 已成交 {ib_pos} 张，按真实仓位对齐")
 
                 _LAST_OPEN_SIGNAL_KEY = signal_key
-                position_quantity = qty if signal > 0 else -qty
+                position_quantity = ib_pos
                 entry_price = latest_price
-                actual_notional = qty * entry_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {TRADE_SYMBOL} qty={qty} 张 "
+                filled_qty = abs(int(ib_pos)) if float(ib_pos) == int(ib_pos) else abs(ib_pos)
+                side = "Buy" if ib_pos > 0 else "Sell"
+                actual_notional = filled_qty * entry_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {TRADE_SYMBOL} qty={filled_qty} 张 "
                       f"信号入场价(QQQ): {entry_price} orderId={order_id}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位: {qty} 张 MNQ ≈ ${actual_notional:,.0f} 名义 "
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位: {filled_qty} 张 MNQ ≈ ${actual_notional:,.0f} 名义 "
                       f"(按可用保证金满仓)")
 
                 DAILY_TRADES.append({
@@ -2733,7 +2810,7 @@ if __name__ == "__main__":
     print("\n--- 风控设置 ---")
     apply_optional_risk_settings()
 
-    print("版本: 2.1.0")
+    print("版本: 2.1.1")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
     print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
