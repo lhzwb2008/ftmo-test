@@ -19,15 +19,21 @@ FTMO 10×100K（challenge 2x / funded 1.5x）+ IBKR MNQ 逐日联合回测。
   2) 2022-07-01 ~ 2024-08-07  同上
   3) 2024-07-01 ~ 2026-08-07  quantra/qqq_longport_2year.csv
 
+最差起点（python ftmo_ibkr_combo_backtest.py --worst）:
+  从多起点抽样里，挑两个「进入 funded 最慢、且之后仍有满两年数据」的开考日。
+  2020-11-13 / 2020-10-19 几乎同一段慢行情，故第二段改用另一窗口最差的 2023-02-08。
+
 用法:
   conda activate quantra
   python ftmo_ibkr_combo_backtest.py
+  python ftmo_ibkr_combo_backtest.py --worst
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import date
 from math import floor
@@ -106,6 +112,32 @@ WINDOWS = [
         'end_date': date(2026, 8, 7),
     },
 ]
+
+# 2x 抽样进入 funded 最慢、且满两年行情仍覆盖的两个起点（失败不重买口径）
+WORST_WINDOWS = [
+    {
+        'key': 'worst_20201113',
+        'label': '2020-11-13 起两年',
+        'data_path': HIST_DATA,
+        'start_date': date(2020, 11, 13),
+        'end_date': date(2022, 11, 13),
+        'note': '2x 抽样最慢：397 自然日 funded',
+    },
+    {
+        'key': 'worst_20230208',
+        'label': '2023-02-08 起两年',
+        'data_path': HIST_DATA,
+        'start_date': date(2023, 2, 8),
+        'end_date': date(2025, 2, 8),
+        'note': '另一段最慢且有两年数据：275 自然日 funded',
+    },
+]
+
+
+def active_windows():
+    if '--worst' in sys.argv:
+        return WORST_WINDOWS
+    return WINDOWS
 
 
 def strategy_config(window):
@@ -727,6 +759,8 @@ def run_window(window):
     start_fees = N_FTMO_ACCOUNTS * CHALLENGE_FEE
     print('\n' + '=' * 72)
     print(f"窗口 {window['label']}  |  {os.path.basename(window['data_path'])}")
+    if window.get('note'):
+        print(window['note'])
     print('=' * 72)
     print(f"数据: {cfg['data_path']}  {cfg['start_date']} ~ {cfg['end_date']}")
     print('预处理...')
@@ -819,26 +853,28 @@ def run_window(window):
 
 
 def run_combo():
-    print('FTMO 10×100K 2x/1.5x + IBKR MNQ  多窗口回测')
+    windows = active_windows()
+    mode = '最差起点两年' if windows is WORST_WINDOWS else '默认窗口'
+    print(f'FTMO 10×100K 2x/1.5x + IBKR MNQ  {mode}')
     print(f'IBKR 日内 IM {IBKR_INTRADAY_IM_PCT*100:.2f}%  usage 100% → 约 {1.0/IBKR_INTRADAY_IM_PCT:.1f}x')
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     results = []
-    for window in WINDOWS:
+    for window in windows:
         summary = run_window(window)
         if summary:
             results.append(summary)
 
     print('\n' + '=' * 72)
-    print('三段对比（净利润 = IBKR 期末 + 应计未出 − 报名费）')
+    print('对比（净利润 = IBKR 期末 + 应计未出 − 报名费）')
     print('=' * 72)
     print(
-        f"{'窗口':<22}{'交易日':>6}{'P1':>12}{'Funded':>12}"
+        f"{'窗口':<24}{'交易日':>6}{'P1':>12}{'Funded':>12}"
         f"{'出金':>12}{'IBKR':>14}{'净利':>14}{'MDD':>8}{'爆仓':>6}"
     )
     for s in results:
         fails = s['account']['fail_p1'] + s['account']['fail_p2'] + s['account']['fail_funded']
         print(
-            f"{s['label']:<22}{s['trading_days']:>6}"
+            f"{s['label']:<24}{s['trading_days']:>6}"
             f"{(s['p1_date'] or '-'):>12}{(s['funded_date'] or '-'):>12}"
             f"${s['payouts_to_ibkr']:>10,.0f}"
             f"${s['ibkr']['ibkr_equity']:>12,.0f}"

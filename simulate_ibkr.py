@@ -23,6 +23,8 @@ Windows 运行前准备：
 .env 仅需 Longport 凭证；IB 连接参数写死在下方常量。
 仓位：按 IB 净值 100% / 日内单张初始保证金估算张数；Error 201 则按 90%→85%→70% 减张重试（默认不订 IB 行情、不用 whatIf）。
 断线：运行中自动心跳探活 + 无限重连（Gateway Auto Restart 窗口内会短暂拒连，脚本会等待恢复）。
+执行层对齐 Longport 实盘：每轮以 IB 仓位为唯一真相；下单看仓位变化不看 Filled；读仓失败不当成空仓。
+平仓：信号仍由完整 15m K 判定；一旦成立立刻市价平到仓位=0，不等当前分钟 K，失败则短间隔持续补平。
 风险：QQQ 信号 vs MNQ 存在基差；每季度需换月（更新 MNQ_EXPIRY 或依赖自动选月）；满仓保证金风险极高。
 """
 
@@ -89,6 +91,11 @@ IB_INFORMATIONAL_ERROR_CODES = frozenset({
     10349,  # Order TIF was set to DAY based on order preset
     2104, 2106, 2107, 2108, 2119, 2158, 399,
 })
+# 平仓信号一旦成立：立刻市价平到仓位=0，失败则短间隔重试（不等下一根 K）
+IB_CLOSE_RETRY_ATTEMPTS = 8
+IB_CLOSE_RETRY_SEC = 2
+# placeOrder 网络/异常时的重发次数（仅无挂单且仓位未变时才重发，避免叠单）
+IB_PLACE_RETRY = 3
 # 与 ftmo_ibkr_combo_backtest 主口径一致：IBKR 日内初始（收盘前平仓），不是隔夜 12%
 # 公开表约 $4,468–$4,597/口，合名义 ~7.5–7.7%；100% 净值有效杠杆约 13x
 MNQ_INTRADAY_IM_PCT = 0.0771
@@ -532,6 +539,12 @@ def _ib_try_connect(verbose=True):
         elif verbose:
             print("IB 行情订阅: 已关闭（信号用 Longport；仓位按日内保证金估算后市价下单）")
 
+        try:
+            ib.reqPositions()
+            ib.sleep(0.5)
+        except Exception as e:
+            print(f"⚠️ reqPositions 订阅失败: {e}（稍后读仓会再请求）")
+
         if verbose:
             try:
                 if ib.isConnected():
@@ -699,20 +712,36 @@ def ib_ensure_connected(max_attempts=None, interval_sec=None):
         time_module.sleep(interval_sec)
 
 
-def sleep_with_ib_keepalive(total_seconds, chunk_sec=None):
-    """长等待分段 sleep，期间做心跳；断线则阻塞重连，避免周末/夜间 Gateway 重启后僵死。"""
+def sleep_with_ib_keepalive(total_seconds, chunk_sec=None, wake_on_new_date=True):
+    """
+    长等待分段 sleep，期间心跳；断线则重连。
+    重连异常不中断等待（否则会回到主循环，按「今天非交易日」再睡一截）。
+    默认跨过美东日期就返回，让主循环重新判断是否交易日。
+    """
     if chunk_sec is None:
         chunk_sec = IB_KEEPALIVE_SLEEP_CHUNK_SEC
     if total_seconds <= 0:
         return
+    start_date = get_us_eastern_time().date()
     end_ts = time_module.time() + total_seconds
     while True:
+        now_et = get_us_eastern_time()
+        if wake_on_new_date and now_et.date() > start_date:
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 长等待跨日，结束睡眠并重新判断交易日")
+            return
         remaining = end_ts - time_module.time()
         if remaining <= 0:
-            break
-        time_module.sleep(min(chunk_sec, remaining))
-        if not ib_heartbeat(force=True):
-            ib_ensure_connected()
+            return
+        try:
+            time_module.sleep(min(chunk_sec, remaining))
+            if not ib_heartbeat(force=True):
+                # 只试一轮，失败则下一分片再试。避免 Gateway 重启时卡死在无限重连、错过跨日醒来。
+                ib_ensure_connected(max_attempts=1)
+        except Exception as e:
+            ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[{ts}] 保活等待中异常（继续等到目标时间，不重新计时）: {e}")
+            remaining = end_ts - time_module.time()
+            time_module.sleep(min(IB_RECONNECT_INTERVAL_SEC, max(remaining, 1)))
 
 
 def get_mnq_price():
@@ -954,7 +983,9 @@ def _ib_market_order(action, quantity):
 
 
 def _position_moved_as_expected(pos_before, pos_after, action):
-    """仓位是否朝 BUY/SELL 方向变动至少 1 张（含部分成交）。"""
+    """仓位是否朝 BUY/SELL 方向变动至少 1 张（含部分成交）。未知仓位不当成已成交。"""
+    if pos_before is None or pos_after is None:
+        return False
     try:
         delta = float(pos_after) - float(pos_before)
     except (TypeError, ValueError):
@@ -966,13 +997,29 @@ def _position_moved_as_expected(pos_before, pos_after, action):
     return False
 
 
-def get_ib_position_qty():
-    """返回 MNQ 净仓位（多头>0，空头<0）。"""
-    if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
-        return 0
+def _normalize_qty(qty):
+    if qty is None:
+        return None
     try:
-        IB_CONN.reqPositions()
-        IB_CONN.sleep(0.5)
+        q = float(qty)
+    except (TypeError, ValueError):
+        return None
+    return int(q) if q == int(q) else q
+
+
+def get_ib_position_qty(refresh=True):
+    """
+    返回 MNQ 净仓位（多头>0，空头<0）。
+    读失败返回 None，禁止把未知当成 0（否则会漏止损、重复开仓）。
+    """
+    if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
+        return None
+    try:
+        if refresh:
+            IB_CONN.reqPositions()
+            IB_CONN.sleep(0.35)
+        else:
+            IB_CONN.sleep(0)
         total = 0.0
         for p in IB_CONN.positions():
             if IB_ACCOUNT_ID and p.account and p.account != IB_ACCOUNT_ID:
@@ -991,14 +1038,13 @@ def get_ib_position_qty():
             )
             if same_con or same_mnq:
                 total += float(p.position)
-        return int(total) if total == int(total) else total
+        return _normalize_qty(total)
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 读取 IB 仓位失败: {e}")
-        # socket 已死但 isConnected 可能仍为 True，强制清理以便后续重连
         err = str(e).lower()
         if 'socket' in err or 'disconnect' in err or '10053' in err or '10054' in err:
             ib_disconnect()
-        return 0
+        return None
 
 
 def _trade_fill_avg(trade):
@@ -1057,11 +1103,9 @@ def _trade_error_code(trade):
 def place_ib_market(action, quantity):
     """
     市价单。action: 'BUY' | 'SELL'；quantity > 0（张）。
-    以仓位变化为准：Error 10349 可能把订单标成 Cancelled，但实际已成交。
+    对齐 Longport：提交成功与否以仓位变化为准，不迷信 Filled。
+    仅在「无挂单且仓位未变」时才重发，避免 10349 假失败叠成双倍仓。
     """
-    ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
-    if not ib_ensure_connected() or IB_CONTRACT is None:
-        return {'ok': False, 'error': 'not connected'}
     quantity = int(abs(quantity))
     if quantity < 1:
         return {'ok': False, 'error': 'quantity < 1'}
@@ -1070,98 +1114,242 @@ def place_ib_market(action, quantity):
     if action not in ('BUY', 'SELL'):
         return {'ok': False, 'error': f'invalid action {action}'}
 
-    local = (IB_CONTRACT.localSymbol or TRADE_SYMBOL) if IB_CONTRACT else TRADE_SYMBOL
-    try:
+    last = {'ok': False, 'error': 'not attempted'}
+    for attempt in range(1, IB_PLACE_RETRY + 1):
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        if not ib_ensure_connected() or IB_CONTRACT is None:
+            last = {'ok': False, 'error': 'not connected'}
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+            continue
+
         pos_before = get_ib_position_qty()
-        order = _ib_market_order(action, quantity)
-        trade = IB_CONN.placeOrder(IB_CONTRACT, order)
-        print(f"[{ts}] 已提交市价单: {action} {quantity} {local} tif={order.tif} orderId={trade.order.orderId}")
+        if pos_before is None:
+            print(f"[{ts}] 下单 #{attempt}: 仓位未知，不盲发")
+            last = {'ok': False, 'error': 'position unknown'}
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+            continue
 
-        status = ''
-        for _ in range(40):
-            IB_CONN.sleep(0.25)
-            status = trade.orderStatus.status
-            if status in ('Filled', 'Cancelled', 'ApiCancelled', 'Inactive'):
-                break
+        working = _mnq_working_trades()
+        if working:
+            oids = [t.order.orderId for t in working]
+            print(f"[{ts}] 下单 #{attempt}: 已有未完成订单 {oids}，等待成交（不叠单）")
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+            pos = get_ib_position_qty()
+            if _position_moved_as_expected(pos_before, pos, action):
+                return {
+                    'ok': True,
+                    'orderId': oids[0] if oids else None,
+                    'avg_fill': None,
+                    'commission': None,
+                    'position': pos,
+                    'error_code': 0,
+                }
+            last = {'ok': False, 'error': 'working order pending', 'position': pos}
+            continue
 
-        codes = _trade_error_codes(trade)
-        if status != 'Filled':
-            extra = 8 if (status in ('Cancelled', 'ApiCancelled', 'Inactive', 'Submitted', 'PreSubmitted', 'PendingSubmit') or 10349 in codes) else 2
-            for _ in range(extra):
-                if trade.orderStatus.status == 'Filled':
+        local = (IB_CONTRACT.localSymbol or TRADE_SYMBOL) if IB_CONTRACT else TRADE_SYMBOL
+        try:
+            order = _ib_market_order(action, quantity)
+            trade = IB_CONN.placeOrder(IB_CONTRACT, order)
+            print(f"[{ts}] 已提交市价单: {action} {quantity} {local} tif={order.tif} "
+                  f"orderId={trade.order.orderId} (#{attempt}/{IB_PLACE_RETRY})")
+
+            status = ''
+            for _ in range(40):
+                IB_CONN.sleep(0.25)
+                status = trade.orderStatus.status
+                if status in ('Filled', 'Cancelled', 'ApiCancelled', 'Inactive'):
                     break
-                pos_mid = get_ib_position_qty()
-                if _position_moved_as_expected(pos_before, pos_mid, action):
-                    break
-                IB_CONN.sleep(1.0)
 
-        avg_fill = _trade_fill_avg(trade)
-        commission = _trade_commission(trade)
-        status = trade.orderStatus.status
-        err_code = _trade_error_code(trade)
-        pos = get_ib_position_qty()
-        moved = _position_moved_as_expected(pos_before, pos, action)
-        print(f"[{ts}] 订单状态={status}, avgFill={avg_fill}, commission={commission}, "
-              f"errorCode={err_code or '-'}, 仓位 {pos_before}→{pos}")
-
-        if status == 'Filled' or moved:
+            codes = _trade_error_codes(trade)
             if status != 'Filled':
-                print(f"[{ts}] 订单状态非 Filled（常为 10349/预设改 TIF），但仓位已变，按成交处理")
-            return {
-                'ok': True,
+                extra = 8 if (status in ('Cancelled', 'ApiCancelled', 'Inactive', 'Submitted', 'PreSubmitted', 'PendingSubmit') or 10349 in codes) else 2
+                for _ in range(extra):
+                    if trade.orderStatus.status == 'Filled':
+                        break
+                    pos_mid = get_ib_position_qty()
+                    if _position_moved_as_expected(pos_before, pos_mid, action):
+                        break
+                    IB_CONN.sleep(1.0)
+
+            avg_fill = _trade_fill_avg(trade)
+            commission = _trade_commission(trade)
+            status = trade.orderStatus.status
+            err_code = _trade_error_code(trade)
+            pos = get_ib_position_qty()
+            moved = _position_moved_as_expected(pos_before, pos, action)
+            print(f"[{ts}] 订单状态={status}, avgFill={avg_fill}, commission={commission}, "
+                  f"errorCode={err_code or '-'}, 仓位 {pos_before}→{pos}")
+
+            last = {
+                'ok': False,
                 'orderId': trade.order.orderId,
                 'avg_fill': avg_fill,
                 'commission': commission,
                 'position': pos,
-                'error_code': 0,
+                'error_code': err_code,
+                'error': f'status={status}' + (f' errorCode={err_code}' if err_code else ''),
             }
 
-        info_only = bool(codes) and set(codes).issubset(IB_INFORMATIONAL_ERROR_CODES)
-        if info_only and err_code == 10349:
-            print(f"[{ts}] Error 10349 且仓位未变，视为未成交")
-        return {
-            'ok': False,
-            'orderId': trade.order.orderId,
-            'avg_fill': avg_fill,
-            'commission': commission,
-            'position': pos,
-            'error_code': err_code,
-            'error': f'status={status}' + (f' errorCode={err_code}' if err_code else ''),
-        }
+            if status == 'Filled' or moved:
+                if status != 'Filled':
+                    print(f"[{ts}] 订单状态非 Filled（常为 10349/预设改 TIF），但仓位已变，按成交处理")
+                last['ok'] = True
+                last['error_code'] = 0
+                return last
+
+            if err_code == 201:
+                return last
+
+            if _mnq_working_trades():
+                print(f"[{ts}] 订单仍在队列，不重发")
+                return last
+
+            info_only = bool(codes) and set(codes).issubset(IB_INFORMATIONAL_ERROR_CODES)
+            if info_only and err_code == 10349:
+                print(f"[{ts}] Error 10349 且仓位未变，视为未成交")
+            if attempt < IB_PLACE_RETRY:
+                print(f"[{ts}] 未成交且无挂单，{IB_CLOSE_RETRY_SEC}s 后重发")
+                time_module.sleep(IB_CLOSE_RETRY_SEC)
+        except Exception as e:
+            print(f"[{ts}] 下单异常: {e}")
+            pos = get_ib_position_qty()
+            if _position_moved_as_expected(pos_before, pos, action):
+                print(f"[{ts}] 下单异常但仓位已变，按成交处理")
+                return {'ok': True, 'orderId': None, 'position': pos, 'error_code': 0, 'error': str(e)}
+            last = {'ok': False, 'error': str(e), 'position': pos}
+            if _mnq_working_trades():
+                print(f"[{ts}] 异常后仍有挂单，不重发")
+                return last
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+    return last
+
+
+def _mnq_working_trades():
+    """当前 MNQ 未完成订单（避免平仓叠单打成反向仓）。"""
+    trades = []
+    if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
+        return trades
+    try:
+        IB_CONN.sleep(0)
+        con_id = getattr(IB_CONTRACT, 'conId', None)
+        for t in IB_CONN.openTrades():
+            st = t.orderStatus.status if t.orderStatus else ''
+            if st in ('Filled', 'Cancelled', 'ApiCancelled', 'Inactive'):
+                continue
+            c = t.contract
+            same = (con_id and c.conId == con_id) or (c.secType == 'FUT' and c.symbol == TRADE_SYMBOL)
+            if same:
+                trades.append(t)
     except Exception as e:
-        print(f"[{ts}] 下单异常: {e}")
-        return {'ok': False, 'error': str(e)}
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 查询未完成订单失败: {e}")
+    return trades
 
 
-def close_ib_position():
-    """按 ib.positions() 核对后反向市价平仓；无仓位则成功返回。以平后仓位=0 为准。"""
+def _cancel_mnq_working_orders():
     ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
-    if not ib_ensure_connected():
-        return {'ok': False, 'error': 'not connected'}
+    trades = _mnq_working_trades()
+    for t in trades:
+        try:
+            print(f"[{ts}] 撤销未完成 MNQ 订单 orderId={t.order.orderId} status={t.orderStatus.status}")
+            IB_CONN.cancelOrder(t.order)
+        except Exception as e:
+            print(f"[{ts}] 撤单失败: {e}")
+    if trades and IB_CONN is not None and IB_CONN.isConnected():
+        IB_CONN.sleep(1.0)
 
-    pos = get_ib_position_qty()
-    if pos == 0:
-        print(f"[{ts}] 平仓跳过: IB 仓位已为 0")
-        return {'ok': True, 'orderId': None, 'avg_fill': None, 'position': 0, 'skipped': True}
 
-    action = 'SELL' if pos > 0 else 'BUY'
-    qty = abs(int(pos)) if float(pos) == int(pos) else abs(pos)
-    print(f"[{ts}] 平仓: 当前仓位={pos} → {action} {qty}")
-    result = place_ib_market(action, qty)
-    pos_after = get_ib_position_qty()
-    if pos_after == 0:
-        if not result:
-            result = {}
-        result['ok'] = True
-        result['position'] = 0
-        return result
-    print(f"[{ts}] 平仓后仍有仓位 {pos_after}，未完全平掉")
-    if not result:
-        result = {}
-    result['ok'] = False
-    result['position'] = pos_after
-    result['error'] = result.get('error') or f'residual position {pos_after}'
-    return result
+def book_exit_price(symbol, fallback=None):
+    """记账用价格。平仓执行不依赖它，缺报价也不推迟下单。"""
+    try:
+        quote = get_quote(symbol) or {}
+        px = float(quote.get("last_done") or 0)
+        if px > 0:
+            return px
+    except Exception:
+        pass
+    try:
+        if fallback is not None and float(fallback) > 0:
+            return float(fallback)
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def close_ib_position(max_attempts=None, retry_sec=None):
+    """
+    反向市价平仓直到 IB 仓位为 0。
+    策略平仓信号与 K 线无关：一旦要平，就连续重试，不以单次回报成败为准。
+    """
+    if max_attempts is None:
+        max_attempts = IB_CLOSE_RETRY_ATTEMPTS
+    if retry_sec is None:
+        retry_sec = IB_CLOSE_RETRY_SEC
+    ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+    last = {'ok': False, 'error': 'not attempted', 'position': None}
+
+    for attempt in range(1, max_attempts + 1):
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        if not ib_ensure_connected():
+            print(f"[{ts}] 平仓 #{attempt}/{max_attempts}: IB 未连接，{retry_sec}s 后重试")
+            time_module.sleep(retry_sec)
+            continue
+        pos = get_ib_position_qty()
+        if pos is None:
+            print(f"[{ts}] 平仓 #{attempt}/{max_attempts}: 仓位未知，{retry_sec}s 后重试")
+            time_module.sleep(retry_sec)
+            continue
+        if pos == 0:
+            if attempt == 1:
+                print(f"[{ts}] 平仓跳过: IB 仓位已为 0")
+                return {'ok': True, 'orderId': None, 'avg_fill': None, 'position': 0, 'skipped': True}
+            last = last if isinstance(last, dict) else {}
+            last['ok'] = True
+            last['position'] = 0
+            print(f"[{ts}] 平仓完成（第 {attempt} 次确认空仓）")
+            return last
+
+        working = _mnq_working_trades()
+        if working:
+            if attempt <= 3:
+                oids = [t.order.orderId for t in working]
+                print(f"[{ts}] 平仓 #{attempt}/{max_attempts}: 已有未完成订单 {oids}，等待成交（不叠单）")
+                time_module.sleep(retry_sec)
+                continue
+            print(f"[{ts}] 平仓 #{attempt}/{max_attempts}: 未完成订单超时，撤单后按剩余仓位重挂")
+            _cancel_mnq_working_orders()
+            pos = get_ib_position_qty()
+            if pos is None:
+                time_module.sleep(retry_sec)
+                continue
+            if pos == 0:
+                last = last if isinstance(last, dict) else {}
+                last['ok'] = True
+                last['position'] = 0
+                print(f"[{ts}] 撤单后仓位已为 0")
+                return last
+
+        action = 'SELL' if pos > 0 else 'BUY'
+        qty = abs(int(pos)) if float(pos) == int(pos) else abs(pos)
+        print(f"[{ts}] 平仓 #{attempt}/{max_attempts}: 当前仓位={pos} → {action} {qty}")
+        last = place_ib_market(action, qty) or {}
+        pos_after = get_ib_position_qty()
+        last['position'] = pos_after
+        if pos_after == 0:
+            last['ok'] = True
+            print(f"[{ts}] 平仓成功，IB 仓位已为 0")
+            return last
+        print(f"[{ts}] 平仓后仓位 {pos_after}，{retry_sec}s 后继续平")
+        time_module.sleep(retry_sec)
+
+    pos_left = get_ib_position_qty() if ib_ensure_connected() else last.get('position')
+    print(f"[{ts}] 平仓重试耗尽，残留仓位 {pos_left}（将持续补平，不等下一根 K）")
+    if not isinstance(last, dict):
+        last = {}
+    last['ok'] = False
+    last['position'] = pos_left
+    last['error'] = last.get('error') or f'residual position {pos_left}'
+    return last
 
 
 def get_us_eastern_time():
@@ -1209,8 +1397,10 @@ def get_account_balance():
 
 
 def get_current_positions():
-    """返回 {TRADE_SYMBOL: {quantity, cost_price}}。"""
+    """返回 {TRADE_SYMBOL: {quantity, cost_price}}。仓位未知则返回空（调用方不得当成已空仓）。"""
     qty = get_ib_position_qty()
+    if qty is None:
+        return {}
     return {TRADE_SYMBOL: {"quantity": qty, "cost_price": 0}}
 
 
@@ -1770,6 +1960,26 @@ def is_trading_day(symbol=None):
 
     return True, False
 
+
+def wait_seconds_until_next_session(now, trading_start_time, calendar_stale=False):
+    """
+    非交易日等待：对齐 simulate.py / simulate_futures_core，不固定睡 12 小时。
+
+    Longport 实盘用 time.sleep(12h)，周日 13:00 会睡到周一 01:00，开盘前自然醒。
+    IBKR 有 Gateway 每日 23:45 ET 重启，保活被打断后若再按「今天非交易日」固定睡 12h，
+    周日 23:45 会睡到周一 11:45，错过 09:40。改为睡到下一美东自然日的开盘时间。
+    日历过期则短间隔重试（与 simulate.py 15 秒同思路）。
+    """
+    if calendar_stale:
+        return 60
+    eastern = pytz.timezone('US/Eastern')
+    next_day = now.date() + timedelta(days=1)
+    next_check = eastern.localize(datetime.combine(
+        next_day,
+        time(trading_start_time[0], trading_start_time[1]),
+    ))
+    return max((next_check - now).total_seconds(), 60)
+
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
@@ -1791,10 +2001,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     entry_price = None
     try:
         ib_pos = get_ib_position_qty()
-        if ib_pos != 0:
-            position_quantity = int(ib_pos) if float(ib_pos) == int(ib_pos) else ib_pos
+        if ib_pos:
+            position_quantity = _normalize_qty(ib_pos)
             print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 检测到 IB 已有 {TRADE_SYMBOL} 仓位: {position_quantity}，将按策略管理平仓")
             print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 注意: 入场价未知，策略止损按噪声带；盈亏统计可能不完整")
+        elif ib_pos is None:
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 启动时未能读取 IB 仓位，主循环将持续重试")
     except Exception as e:
         print(f"同步 IB 仓位失败: {e}")
 
@@ -1808,12 +2020,94 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     trailing_tp_activated = False   # 追踪止盈是否已激活
     trailing_tp_day_stop = False    # 当日是否已因追踪止盈平仓（触发后当日不再开仓）
     last_processed_trigger = None    # 已处理的触发点(date, k_h, k_m)，用于触发窗口内去重，避免空转刷屏
+    pending_flatten = False          # 平仓信号已成立但 IB 尚未空仓，持续补平、不开新仓
+    pending_flatten_meta = {}
     
     # 持仓数据字典（供监控线程使用）
     position_data = {
         'quantity': 0,
         'entry_price': None
     }
+
+    def reset_local_after_flat():
+        nonlocal position_quantity, entry_price, current_stop, max_profit_price, trailing_tp_activated, pending_flatten, pending_flatten_meta
+        position_quantity = 0
+        entry_price = None
+        current_stop = None
+        max_profit_price = None
+        trailing_tp_activated = False
+        pending_flatten = False
+        pending_flatten_meta = {}
+        with pnl_lock:
+            position_data['quantity'] = 0
+            position_data['entry_price'] = None
+
+    def book_close_pnl(action_label, exit_px, qty, side, entry):
+        global DAILY_PNL, TOTAL_PNL
+        if not entry or not exit_px or exit_px <= 0 or not qty:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {action_label}完成（无完整入场价/报价，跳过盈亏记账）")
+            return
+        direction = 1 if qty > 0 else -1
+        pnl, pnl_pct = calculate_pnl(entry, exit_px, direction, qty)
+        with pnl_lock:
+            DAILY_PNL += pnl
+            TOTAL_PNL += pnl
+        now_str = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        DAILY_TRADES.append({
+            "time": now_str,
+            "action": action_label,
+            "side": side,
+            "entry_price": entry,
+            "exit_price": exit_px,
+            "pnl": pnl
+        })
+        print(f"[{now_str}] {action_label}完成: 价格=${exit_px:.2f}, 盈亏=${pnl:+.2f} ({pnl_pct:+.2f}%)")
+
+    def execute_flatten(action_label="平仓", exit_px_hint=None, count_round=False, trailing=False):
+        """立刻市价平到 IB 仓位=0。失败则挂 pending，主循环短间隔补平，不等下一根 K。"""
+        nonlocal pending_flatten, pending_flatten_meta, position_quantity, trailing_tp_day_stop, positions_opened_today
+        ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+        if pending_flatten and pending_flatten_meta.get('qty'):
+            qty_for_pnl = pending_flatten_meta['qty']
+            entry_for_book = pending_flatten_meta.get('entry', entry_price)
+            side = pending_flatten_meta.get('side') or ("Sell" if qty_for_pnl > 0 else "Buy")
+            count_round = pending_flatten_meta.get('count_round', count_round)
+            trailing = pending_flatten_meta.get('trailing', trailing)
+            action_label = pending_flatten_meta.get('action_label', action_label)
+            exit_px_hint = exit_px_hint or pending_flatten_meta.get('exit_px')
+        else:
+            qty_for_pnl = position_quantity
+            entry_for_book = entry_price
+            side = "Sell" if qty_for_pnl > 0 else "Buy"
+        exit_px = book_exit_price(symbol, exit_px_hint)
+        close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
+        leftover = None
+        if ib_ensure_connected():
+            leftover = get_ib_position_qty()
+        if leftover == 0:
+            book_close_pnl(action_label, exit_px, qty_for_pnl, side, entry_for_book)
+            if count_round:
+                positions_opened_today += 1
+            if trailing:
+                trailing_tp_day_stop = True
+                print(f"[{ts}] 追踪止盈已触发，今日不再开新仓")
+            reset_local_after_flat()
+            print(f"[{ts}] 平仓完成，ID: {close_order_id or 'IB_FLAT'}")
+            return True
+        pending_flatten = True
+        pending_flatten_meta = {
+            'action_label': action_label,
+            'exit_px': exit_px or exit_px_hint,
+            'count_round': count_round,
+            'trailing': trailing,
+            'qty': qty_for_pnl,
+            'entry': entry_for_book,
+            'side': side,
+        }
+        if leftover:
+            position_quantity = int(leftover) if float(leftover) == int(leftover) else leftover
+        print(f"[{ts}] 平仓未完全完成，残留仓位 {leftover}，进入持续补平（不等下一根 K、不开新仓）")
+        return False
     
     # 监控线程对象
     monitor_thread = None
@@ -1830,14 +2124,42 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if not ib_ensure_connected():
                 time_module.sleep(IB_RECONNECT_INTERVAL_SEC)
                 continue
-        
-        # 模拟模式下不再重新获取持仓状态，保持本地状态
-        # current_positions = get_current_positions()
-        # symbol_position = current_positions.get(symbol, {"quantity": 0, "cost_price": 0})
-        # position_quantity = symbol_position["quantity"]
-        
-        # 模拟模式：不需要获取账户余额
-        # current_balance = get_account_balance()
+
+        # 对齐 Longport：每轮以券商仓位为唯一真相，不靠本地缓存
+        ib_pos = get_ib_position_qty()
+        if ib_pos is None:
+            if pending_flatten:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位未知，仍尝试补平")
+                execute_flatten()
+                time_module.sleep(IB_CLOSE_RETRY_SEC)
+                continue
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位未知，本轮不下单（避免把未知当成空仓）")
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+            continue
+        ib_pos = _normalize_qty(ib_pos)
+        if ib_pos != position_quantity:
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 同步 IB 仓位: 本地 {position_quantity} → {ib_pos}")
+            if position_quantity != 0 and ib_pos == 0 and not pending_flatten:
+                entry_price = None
+                max_profit_price = None
+                trailing_tp_activated = False
+            elif position_quantity == 0 and ib_pos != 0:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 发现 IB 已有仓位，按券商仓位管理（止损/平仓），不开新仓")
+            position_quantity = ib_pos
+
+        # 平仓信号一旦成立：优先补平到空仓，不进入 15m 开仓/长等待
+        if pending_flatten:
+            meta = pending_flatten_meta or {}
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持续补平未完成仓位")
+            if execute_flatten(
+                action_label=meta.get('action_label', '平仓'),
+                exit_px_hint=meta.get('exit_px'),
+                count_round=meta.get('count_round', False),
+                trailing=meta.get('trailing', False),
+            ):
+                continue
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+            continue
         
         # 更新持仓数据供监控线程使用
         with pnl_lock:
@@ -1847,50 +2169,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 检查监控线程是否设置了强制平仓标志
         if FORCE_CLOSE_POSITION and position_quantity != 0:
             print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! 收到强制平仓信号 !!!!!")
-            
-            # 获取当前价格
-            quote = get_quote(symbol)
-            current_price = float(quote.get("last_done", 0))
-            
-            # 执行平仓
-            side = "Sell" if position_quantity > 0 else "Buy"
-            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
-            if not close_order_id:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 强制平仓失败，保持仓位等待重试")
+            action_type = "平仓(止盈)" if PROFIT_TARGET_TRIGGERED else "平仓(止损)"
+            if not execute_flatten(action_label=action_type):
+                time_module.sleep(IB_CLOSE_RETRY_SEC)
                 continue
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 强制平仓完成，ID: {close_order_id}")
-            
-            # 计算盈亏（全仓计算）
-            if entry_price and current_price > 0:
-                direction = 1 if position_quantity > 0 else -1
-                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
-                with pnl_lock:
-                    DAILY_PNL += pnl
-                    TOTAL_PNL += pnl
-                # 记录平仓交易（根据是止盈还是止损区分）
-                action_type = "平仓(止盈)" if PROFIT_TARGET_TRIGGERED else "平仓(止损)"
-                DAILY_TRADES.append({
-                    "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                    "action": action_type,
-                    "side": side,
-                    "entry_price": entry_price,
-                    "exit_price": current_price,
-                    "pnl": pnl
-                })
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {action_type}完成: 价格=${current_price:.2f}, 盈亏=${pnl:+.2f} ({pnl_pct:+.2f}%)")
-            
-            # 重置持仓
-            position_quantity = 0
-            entry_price = None
-            current_stop = None
-            # 🎯 重置动态追踪止盈状态
-            max_profit_price = None
-            trailing_tp_activated = False
-            
-            with pnl_lock:
-                position_data['quantity'] = 0
-                position_data['entry_price'] = None
-            
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日不再进行新的交易")
             print("=" * 60)
         
@@ -1919,39 +2201,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今天不是交易日，跳过交易")
             if position_quantity != 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 非交易日，执行平仓")
-                
-                # 获取当前价格用于计算盈亏
-                quote = get_quote(symbol)
-                current_price = float(quote.get("last_done", 0))
-                
-                side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
-                if not close_order_id:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓失败，保持仓位")
+                if not execute_flatten(action_label="平仓"):
+                    time_module.sleep(IB_CLOSE_RETRY_SEC)
                     continue
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓完成，ID: {close_order_id}")
-                
-                # 计算盈亏（全仓计算）
-                if entry_price and current_price > 0:
-                    direction = 1 if position_quantity > 0 else -1
-                    pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
-                    DAILY_PNL += pnl
-                    TOTAL_PNL += pnl
-                    # 记录平仓交易
-                    DAILY_TRADES.append({
-                        "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                        "action": "平仓",
-                        "side": side,
-                        "entry_price": entry_price,
-                        "exit_price": current_price,
-                        "pnl": pnl
-                    })
-                    
-                position_quantity = 0
-                entry_price = None
-                # 🎯 重置动态追踪止盈状态
-                max_profit_price = None
-                trailing_tp_activated = False
                 
                 # 在交易日结束时打印当日所有交易记录
                 if DAILY_TRADES:
@@ -1981,11 +2233,13 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"  当日盈亏: ${DAILY_PNL:+.2f}")
                     print(f"  累计盈亏: ${TOTAL_PNL:+.2f}")
                     print("=" * 50)
-            retry_hours = 1 if calendar_stale else 12
-            next_check_time = now + timedelta(hours=retry_hours)
-            wait_seconds = (next_check_time - now).total_seconds()
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {retry_hours} 小时后重新检查"
-                  f"（分段等待并保持 IB 心跳，Gateway 重启后会自动重连）")
+            wait_seconds = wait_seconds_until_next_session(
+                now, trading_start_time, calendar_stale=calendar_stale
+            )
+            next_check_time = now + timedelta(seconds=wait_seconds)
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {wait_seconds / 3600:.1f} 小时后重新检查"
+                  f"（目标 {next_check_time.strftime('%Y-%m-%d %H:%M:%S')}；"
+                  f"分段保活，跨日或 Gateway 重启后会重新判断交易日）")
             sleep_with_ib_keepalive(wait_seconds)
             continue
             
@@ -2180,20 +2434,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if not is_trigger_time:
             # 如果不是触发时间，跳过本次循环
             continue
-
-        # 每个检查点以 IB 真实仓位为准（10349 假失败时本地会错当成空仓，从而漏止损）
-        try:
-            ib_pos = get_ib_position_qty()
-            ib_pos = int(ib_pos) if float(ib_pos) == int(ib_pos) else ib_pos
-            if ib_pos != position_quantity:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 同步 IB 仓位: 本地 {position_quantity} → {ib_pos}")
-                if position_quantity != 0 and ib_pos == 0:
-                    entry_price = None
-                    max_profit_price = None
-                    trailing_tp_activated = False
-                position_quantity = ib_pos
-        except Exception as e:
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 同步 IB 仓位失败: {e}")
             
         # 检查是否是交易时间结束点，如果是且有持仓，则强制平仓
         is_trading_end = (current_hour, current_minute) == (trading_end_time[0], trading_end_time[1])
@@ -2203,83 +2443,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             continue
         if is_trading_end and position_quantity != 0:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间为交易结束时间 {trading_end_time[0]}:{trading_end_time[1]}，执行平仓")
-            
-            # 获取历史数据
-            if LOG_VERBOSE:
-                print("获取历史数据")
-            df = get_historical_data(symbol)
-            if df.empty:
-                print("错误: 获取历史数据为空")
-                sys.exit(1)
-                
-            if DEBUG_MODE:
-                df = df[df["DateTime"] <= now]
-            
-            # 获取当前时间点的价格数据
-            current_time = now.strftime('%H:%M')
-            
-            # 尝试获取当前时间点数据，如果没有则等待重试
-            retry_count = 0
-            max_retries = 10
-            retry_interval = 5
-            current_price = None
-            
-            while retry_count < max_retries:
-                current_data = df[(df["Date"] == current_date) & (df["Time"] == current_time)]
-                
-                if not current_data.empty:
-                    # 使用当前时间点的价格
-                    current_price = float(current_data["Close"].iloc[0])
-                    break
-                else:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        if LOG_VERBOSE:
-                            print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
-                        time_module.sleep(retry_interval)
-                        # 重新获取数据
-                        df = get_historical_data(symbol)
-                        if DEBUG_MODE:
-                            df = df[df["DateTime"] <= now]
-            
-            if current_price is None:
-                print(f"错误: 尝试{max_retries}次后仍无法获取当前时间点 {current_time} 的数据")
-                sys.exit(1)
-            
-            # 执行平仓
-            side = "Sell" if position_quantity > 0 else "Buy"
-            close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
-            if not close_order_id:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 收盘平仓失败，保持仓位")
+            if not execute_flatten(action_label="平仓"):
+                time_module.sleep(IB_CLOSE_RETRY_SEC)
                 continue
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓完成，ID: {close_order_id}")
-            
-            # 计算盈亏（全仓计算）
-            if entry_price:
-                direction = 1 if position_quantity > 0 else -1
-                pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {TRADE_SYMBOL} 出场价: {current_price}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:+.2f}%)")
-                # 更新收益统计
-                DAILY_PNL += pnl
-                TOTAL_PNL += pnl
-                # 记录平仓交易
-                DAILY_TRADES.append({
-                    "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                    "action": "平仓",
-                    "side": side,
-                    "entry_price": entry_price,
-                    "exit_price": current_price,
-                    "pnl": pnl
-                })
-            else:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {TRADE_SYMBOL} 出场价: {current_price}")
-                
-            position_quantity = 0
-            entry_price = None
-            # 🎯 重置动态追踪止盈状态
-            max_profit_price = None
-            trailing_tp_activated = False
             
             # 在交易日结束时打印当日所有交易记录
             if DAILY_TRADES:
@@ -2326,8 +2492,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         
         df = get_historical_data(symbol)
         if df.empty:
-            print("Error: Could not get historical data")
-            sys.exit(1)
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 获取历史数据为空，跳过本轮信号（不平仓判定；有仓则下一检查点再判）")
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+            continue
         if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 历史数据获取完成: {len(df)} 条")
             
@@ -2341,40 +2508,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前不在交易时间内 ({trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d})")
             if position_quantity != 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易日结束，执行平仓")
-                
-                # 获取当前价格用于计算盈亏
-                quote = get_quote(symbol)
-                current_price = float(quote.get("last_done", 0))
-                
-                side = "Sell" if position_quantity > 0 else "Buy"
-                close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
-                if not close_order_id:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易时段外平仓失败，保持仓位")
-                else:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓完成，ID: {close_order_id}")
-                    
-                    # 计算盈亏（全仓计算）
-                    if entry_price and current_price > 0:
-                        direction = 1 if position_quantity > 0 else -1
-                        pnl, pnl_pct = calculate_pnl(entry_price, current_price, direction, position_quantity)
-                        DAILY_PNL += pnl
-                        TOTAL_PNL += pnl
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓盈亏: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
-                        # 记录平仓交易
-                        DAILY_TRADES.append({
-                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                            "action": "平仓",
-                            "side": side,
-                            "entry_price": entry_price,
-                            "exit_price": current_price,
-                            "pnl": pnl
-                        })
-                        
-                    position_quantity = 0
-                    entry_price = None
-                    # 🎯 重置动态追踪止盈状态
-                    max_profit_price = None
-                    trailing_tp_activated = False
+                if not execute_flatten(action_label="平仓"):
+                    time_module.sleep(IB_CLOSE_RETRY_SEC)
+                    continue
             now = get_us_eastern_time()
             today = now.date()
             today_start = datetime.combine(today, time(trading_start_time[0], trading_start_time[1]), tzinfo=now.tzinfo)
@@ -2395,6 +2531,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         df = calculate_noise_area(df, lookback_days, K1, K2)
         
         if position_quantity != 0:
+            check_price = None
+            trailing_tp_exit = False
+            exit_reason = "Stop Loss"
             # 使用检查时间点的数据进行止损检查
             if 'check_time_str' not in locals():
                 # 如果没有设置check_time_str，使用当前时间的前一分钟
@@ -2506,83 +2645,19 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 持仓检查: 数量={position_quantity}, 退出信号={exit_signal}, 当前止损={current_stop}")
             if exit_signal:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号!")
-                    
-                    # 确保使用当前时间点的价格数据
-                    current_time = now.strftime('%H:%M')
-                    
-                    # 尝试获取当前时间点数据，如果没有则等待重试
-                    retry_count = 0
-                    max_retries = 10
-                    retry_interval = 5
-                    exit_price = None
-                    
-                    while retry_count < max_retries:
-                        current_data = df[(df["Date"] == current_date) & (df["Time"] == current_time)]
-                        
-                        if not current_data.empty:
-                            # 使用当前时间点的价格
-                            exit_price = float(current_data["Close"].iloc[0])
-                            break
-                        else:
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                if LOG_VERBOSE:
-                                    print(f"警告: 当前时间点 {current_time} 没有数据，等待{retry_interval}秒后重试 ({retry_count}/{max_retries})")
-                                time_module.sleep(retry_interval)
-                                # 重新获取数据
-                                df = get_historical_data(symbol)
-                                if DEBUG_MODE:
-                                    df = df[df["DateTime"] <= now]
-                                # 重新计算VWAP和噪声区域
-                                df["VWAP"] = calculate_vwap(df)
-                                df = calculate_noise_area(df, lookback_days, K1, K2)
-                    
-                    if exit_price is None:
-                        print(f"错误: 尝试{max_retries}次后仍无法获取当前时间点 {current_time} 的数据")
-                        continue  # 继续下一次循环，而不是退出
-                    
-                    # 执行平仓
-                    side = "Sell" if position_quantity > 0 else "Buy"
-                    close_order_id = submit_order(symbol, side, 0, outside_rth=outside_rth_setting, is_close=True)
-                    if not close_order_id:
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 止损/追踪止盈平仓失败，保持仓位")
-                        continue
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓完成，ID: {close_order_id}")
-                    
-                    # 计算盈亏（全仓计算）
-                    if entry_price:
-                        direction = 1 if position_quantity > 0 else -1
-                        pnl, pnl_pct = calculate_pnl(entry_price, exit_price, direction, position_quantity)
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 平仓成功: {side} {TRADE_SYMBOL} 出场价: {exit_price}")
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易结果: {'盈利' if pnl > 0 else '亏损'} ${abs(pnl):.2f} ({pnl_pct:+.2f}%)")
-                        # 更新收益统计
-                        DAILY_PNL += pnl
-                        TOTAL_PNL += pnl
-                        # 记录平仓交易
-                        DAILY_TRADES.append({
-                            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                            "action": "平仓",
-                            "side": side,
-                            "entry_price": entry_price,
-                            "exit_price": exit_price,
-                            "pnl": pnl
-                        })
-                    
-                    # 平仓后增加交易次数计数器
-                    positions_opened_today += 1
-                    
-                    position_quantity = 0
-                    entry_price = None
-                    # 🎯 重置动态追踪止盈状态
-                    max_profit_price = None
-                    trailing_tp_activated = False
-                    
-                    # 🎯 追踪止盈触发后，当日不再开新仓
-                    if trailing_tp_exit:
-                        trailing_tp_day_stop = True
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 🎯 追踪止盈已触发，今日不再开新仓")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发退出信号（{exit_reason}），立刻市价平仓")
+                    if not execute_flatten(
+                        action_label="平仓",
+                        exit_px_hint=check_price,
+                        count_round=True,
+                        trailing=bool(trailing_tp_exit),
+                    ):
+                        time_module.sleep(IB_CLOSE_RETRY_SEC)
+                    continue
         else:
+            if pending_flatten:
+                time_module.sleep(IB_CLOSE_RETRY_SEC)
+                continue
             # 检查是否已有持仓，如果有则不再开仓
             if position_quantity != 0:
                 if LOG_VERBOSE:
@@ -2673,11 +2748,18 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] IB 未连接，跳过开仓")
                     continue
                 ib_pos = get_ib_position_qty()
+                if ib_pos is None:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位未知，跳过开仓")
+                    continue
+                ib_pos = _normalize_qty(ib_pos)
                 if ib_pos != 0:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] IB 已有仓位 {ib_pos}，同步本地状态，不开新仓")
-                    position_quantity = int(ib_pos) if float(ib_pos) == int(ib_pos) else ib_pos
+                    position_quantity = ib_pos
                     if entry_price is None:
                         entry_price = latest_price
+                    continue
+                if _mnq_working_trades():
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有未完成订单，本窗口不重复开仓")
                     continue
 
                 side = "Buy" if signal > 0 else "Sell"
@@ -2692,7 +2774,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
 
                 order_id = submit_order(symbol, side, qty, outside_rth=outside_rth_setting)
                 ib_pos = get_ib_position_qty()
-                ib_pos = int(ib_pos) if float(ib_pos) == int(ib_pos) else ib_pos
+                ib_pos = _normalize_qty(ib_pos)
+                if ib_pos is None:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 下单后仓位未知，下一轮以券商仓位为准（不假设成交/失败）")
+                    continue
                 if ib_pos == 0:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓失败，保持空仓")
                     continue
@@ -2759,6 +2844,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             position_data['quantity'] = position_quantity
             position_data['entry_price'] = entry_price
 
+        # 未完成平仓时不要空等到下一个 15m
+        if pending_flatten:
+            time_module.sleep(IB_CLOSE_RETRY_SEC)
+            continue
+
         # 计算下一个精确的检查时间点（避免累积误差）
         current_time = now.time()
         current_hour, current_minute = current_time.hour, current_time.minute
@@ -2810,7 +2900,10 @@ if __name__ == "__main__":
     print("\n--- 风控设置 ---")
     apply_optional_risk_settings()
 
-    print("版本: 2.1.1")
+    print("版本: 2.1.4")
+    print("执行: 每轮以 IB 仓位为准；下单看仓位不看 Filled；读仓失败不当空仓")
+    print("平仓: 信号用完整 15m K；一旦成立立刻市价平到仓位=0，失败持续补平")
+    print("等待: 非交易日睡到下一开盘，不固定 12h；跨日提前醒，避免周日晚睡过周一早盘")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
     print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
