@@ -21,7 +21,7 @@ Windows 运行前准备：
   7. python simulate_ibkr.py
 
 .env 仅需 Longport 凭证；IB 连接参数写死在下方常量。
-仓位：按 IB 净值 100% / 日内单张初始保证金估算张数；Error 201 则按 90%→85%→70% 减张重试（默认不订 IB 行情、不用 whatIf）。
+仓位：按 IB 净值 100% / 官表日内单张初始保证金估算张数；Error 201 先强制刷官表重算，仍不足再 90%→85%→70% 减张（默认不订 IB 行情、不用 whatIf）。
 断线：运行中自动心跳探活 + 无限重连（Gateway Auto Restart 窗口内会短暂拒连，脚本会等待恢复）。
 执行层对齐 Longport 实盘：每轮以 IB 仓位为唯一真相；下单看仓位变化不看 Filled；读仓失败不当成空仓。
 平仓：信号仍由完整 15m K 判定；一旦成立立刻市价平到仓位=0，不等当前分钟 K，失败则短间隔持续补平。
@@ -33,6 +33,10 @@ from datetime import datetime, time, timedelta, date as date_type
 import time as time_module
 import os
 import sys
+import json
+import re
+import ssl
+import urllib.request
 import pytz
 from math import floor
 from dotenv import load_dotenv
@@ -77,9 +81,9 @@ IB_RECONNECT_MAX_ATTEMPTS = 0        # 运行中/启动重连次数；0=无限�
 IB_HEARTBEAT_INTERVAL_SEC = 120      # 心跳探活间隔（秒）；缩短以便更快发现重启断线
 IB_KEEPALIVE_SLEEP_CHUNK_SEC = 60    # 长等待分段 sleep，以便心跳/重连
 _IB_LAST_HEARTBEAT_TS = 0.0
-# 先按净值 100% 估张数（日内约 13x）；Error 201 再减张，不在估算阶段预留 15%
+# 先按净值 100% 估张数（日内约 13x）；201 先刷官表重算，仍不足再按比例减张，不在估算阶段预留 15%
 MARGIN_USAGE_PCT = 1.0
-# 开仓被 201 拒单后，按首次张数的这些比例重试（90% 吃小误差，70% 约等于隔夜保证金）
+# 开仓被 201 拒单且刷表后仍过不了，按首次张数的这些比例重试（90% 吃小误差，70% 约等于隔夜保证金）
 IB_OPEN_RETRY_QTY_FRACS = (1.00, 0.90, 0.85, 0.70)
 # 信号来自 Longport，IB 只做市价执行，默认不订阅 IB 行情、不用 whatIf（避免 Error 354）
 # 张数 = floor(净值 × MARGIN_USAGE_PCT / 单张日内初始保证金)
@@ -97,10 +101,30 @@ IB_CLOSE_RETRY_SEC = 2
 # placeOrder 网络/异常时的重发次数（仅无挂单且仓位未变时才重发，避免叠单）
 IB_PLACE_RETRY = 3
 # 与 ftmo_ibkr_combo_backtest 主口径一致：IBKR 日内初始（收盘前平仓），不是隔夜 12%
-# 公开表约 $4,468–$4,597/口，合名义 ~7.5–7.7%；100% 净值有效杠杆约 13x
+# 优先用 IBKR 官表 Intraday Initial（每个美东自然日拉一次并缓存）；失败才退回名义×7.71%
+# 公开表约 $4,400–$4,600/口，合名义 ~7.5–7.7%；100% 净值有效杠杆约 13x
 MNQ_INTRADAY_IM_PCT = 0.0771
-# 点位极低时的美元下限，避免低估；当前 MNQ 名义下不会碰到
+# 点位极低时的美元下限，仅用于百分比回退，不用来覆盖官表数字
 MNQ_INIT_MARGIN_FLOOR_USD = 3000.0
+IB_MNQ_MARGIN_URL = (
+    'https://www.interactivebrokers.com/en/trading/margin-futures-fops.php'
+    '?ex=us&hm=us&pm=0&rgt=0&rsk=1&rst=101004100808080101'
+)
+IB_MNQ_MARGIN_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)) or '.',
+    'ibkr_mnq_margin.json',
+)
+# 官表一行：交易所, 标的, 描述, 交易类, 日内初始, 日内维持, 隔夜初始, 隔夜维持, ...
+_MNQ_MARGIN_ROW_RE = re.compile(
+    r'>MNQ</td>\s*<td[^>]*>\s*MICRO E-MINI NASDAQ-100 INDEX\s*</td>\s*'
+    r'<td[^>]*>\s*MNQ\s*</td>\s*'
+    r'<td[^>]*>\s*([0-9,.]+)\s*</td>\s*'
+    r'<td[^>]*>\s*([0-9,.]+)\s*</td>\s*'
+    r'<td[^>]*>\s*([0-9,.]+)\s*</td>\s*'
+    r'<td[^>]*>\s*([0-9,.]+)\s*</td>',
+    re.I | re.S,
+)
+_MNQ_OFFICIAL_MARGIN = None  # {'asof', 'intraday_initial', ...}
 # 可选硬顶；<=0 表示不限制（能买多少买多少）
 MAX_MNQ_CONTRACTS = 0
 # accountSummary 订阅状态（保留标志；账户刷新走 accountUpdates）
@@ -707,8 +731,10 @@ def ib_ensure_connected(max_attempts=None, interval_sec=None):
             print(f"[{ts}] IB 重连失败，已达上限 {max_attempts} 次")
             return False
 
-        print(f"[{ts}] 重连失败，{interval_sec}s 后重试"
-              f"（请确认 Gateway 已登录；Lock and Exit 建议用「自动重启」）...")
+        if attempt == 1 or attempt % 40 == 0:
+            print(f"[{ts}] 重连失败，将一直等待 Gateway 登录（含 IB Key 确认），{interval_sec}s 后重试 #{attempt}")
+        else:
+            print(f"[{ts}] 重连失败，{interval_sec}s 后重试")
         time_module.sleep(interval_sec)
 
 
@@ -896,8 +922,109 @@ def estimate_mnq_price_from_qqq(qqq_px):
     return float(qqq_px) * NQ_QQQ_RATIO
 
 
+def _parse_usd_number(text):
+    try:
+        return float(str(text).replace(',', '').strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_mnq_margin_cache():
+    try:
+        with open(IB_MNQ_MARGIN_CACHE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get('intraday_initial'):
+            return data
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _save_mnq_margin_cache(data):
+    try:
+        with open(IB_MNQ_MARGIN_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入保证金缓存失败: {e}")
+
+
+def _fetch_ibkr_mnq_margin_from_official_table():
+    """从 IBKR 公开期货保证金表解析 MNQ 一行。失败返回 None。"""
+    req = urllib.request.Request(
+        IB_MNQ_MARGIN_URL,
+        headers={'User-Agent': 'Mozilla/5.0 (compatible; ftmo-ibkr-margin/1.0)'},
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=25, context=ctx) as resp:
+        html = resp.read().decode('utf-8', errors='replace')
+    m = _MNQ_MARGIN_ROW_RE.search(html)
+    if not m:
+        raise ValueError('官表 HTML 未找到 MNQ 行')
+    intra_init, intra_maint, ovn_init, ovn_maint = (_parse_usd_number(g) for g in m.groups())
+    if not intra_init or intra_init < 100:
+        raise ValueError(f'MNQ 日内初始保证金异常: {intra_init}')
+    now = get_us_eastern_time()
+    return {
+        'asof': now.date().isoformat(),
+        'fetched_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'intraday_initial': intra_init,
+        'intraday_maintenance': intra_maint,
+        'overnight_initial': ovn_init,
+        'overnight_maintenance': ovn_maint,
+        'source': IB_MNQ_MARGIN_URL,
+    }
+
+
+def ensure_official_mnq_margin(force=False):
+    """
+    每个美东自然日最多拉一次 IBKR 官表。
+    CME SPAN / IBKR 表通常隔夜更新；盘中 15m 不再刷新，避免张数来回跳。
+    """
+    global _MNQ_OFFICIAL_MARGIN
+    today = get_us_eastern_time().date().isoformat()
+    if not force and _MNQ_OFFICIAL_MARGIN and _MNQ_OFFICIAL_MARGIN.get('asof') == today:
+        return _MNQ_OFFICIAL_MARGIN
+
+    cached = _load_mnq_margin_cache()
+    if not force and cached and cached.get('asof') == today:
+        _MNQ_OFFICIAL_MARGIN = cached
+        return cached
+
+    ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            data = _fetch_ibkr_mnq_margin_from_official_table()
+            _MNQ_OFFICIAL_MARGIN = data
+            _save_mnq_margin_cache(data)
+            print(f"[{ts}] 已更新 IBKR 官表 MNQ 保证金: 日内初始 ${data['intraday_initial']:,.2f}"
+                  f" / 隔夜初始 ${data['overnight_initial']:,.2f}（今日盘中按此固定）")
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt < 3:
+                print(f"[{ts}] 拉取 IBKR 官表失败 ({attempt}/3): {e}，3 秒后重试")
+                time_module.sleep(3)
+                ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+    if cached and cached.get('intraday_initial'):
+        _MNQ_OFFICIAL_MARGIN = cached
+        print(f"[{ts}] 拉取 IBKR 官表失败（{last_err}），沿用缓存 {cached.get('asof')} "
+              f"日内初始 ${cached['intraday_initial']:,.2f}")
+        return cached
+    print(f"[{ts}] 拉取 IBKR 官表失败且无缓存（{last_err}），开仓回退名义×{MNQ_INTRADAY_IM_PCT:.2%}")
+    return None
+
+
+def official_mnq_intraday_initial():
+    data = _MNQ_OFFICIAL_MARGIN or _load_mnq_margin_cache()
+    if not data:
+        return None
+    val = _parse_usd_number(data.get('intraday_initial'))
+    return val if val and val > 0 else None
+
+
 def _fallback_margin_per_contract(mnq_px):
-    """不依赖 IB 行情/whatIf：按 IBKR 日内初始保证金比例估单张保证金。"""
+    """官表不可用时：按 IBKR 日内初始保证金比例估单张保证金。"""
     by_notional = 0.0
     if mnq_px and mnq_px > 0:
         by_notional = float(mnq_px) * MNQ_POINT_VALUE * MNQ_INTRADAY_IM_PCT
@@ -936,10 +1063,18 @@ def calc_ib_order_quantity(mnq_px=None, qqq_px=None, side='Buy'):
     if margin_1 and margin_1 > 0:
         margin_source = 'whatIf×1'
     else:
-        margin_1 = _fallback_margin_per_contract(mnq_px)
-        margin_source = 'intraday'
-        print(f"[{ts}] 仓位估算用日内保证金 ≈ ${margin_1:,.0f}/张"
-              f"（名义×{MNQ_INTRADAY_IM_PCT:.2%}，下限 ${MNQ_INIT_MARGIN_FLOOR_USD:,.0f}；不订 IB 行情）")
+        ensure_official_mnq_margin()
+        official = official_mnq_intraday_initial()
+        if official:
+            margin_1 = official
+            margin_source = 'IBKR官表日内初始'
+        else:
+            margin_1 = _fallback_margin_per_contract(mnq_px)
+            margin_source = 'intraday%'
+        asof = (_MNQ_OFFICIAL_MARGIN or {}).get('asof', '')
+        extra = f'，官表日期 {asof}' if official and asof else ''
+        print(f"[{ts}] 仓位估算用{margin_source} ≈ ${margin_1:,.0f}/张{extra}"
+              f"（下限仅用于百分比回退 ${MNQ_INIT_MARGIN_FLOOR_USD:,.0f}；不订 IB 行情）")
 
     if usable <= 0:
         print(f"[{ts}] 无法计算手数：可用保证金/购买力为 0")
@@ -1701,7 +1836,13 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     
     return df
 
-def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False):
+def _is_margin_reject(result):
+    err_code = (result or {}).get('error_code') or 0
+    err_text = str((result or {}).get('error', ''))
+    return err_code == 201 or '201' in err_text
+
+
+def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False, qqq_px=None):
     """
     直连 IB Gateway 市价开/平仓。
     - 开仓: side Buy/Sell，quantity 为 MNQ 张数（必须 >= 1）
@@ -1719,7 +1860,8 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
         qty = int(quantity)
         result = None
         tried = set()
-        # 先按 100% 张数下；201 再 90%→85%→70%（70% 约等于隔夜保证金能过的张数）
+        refreshed_on_201 = False
+        # 先按当日官表满仓张数下；201 先强制刷表重算，仍不足再 90%→85%→70%
         for frac in IB_OPEN_RETRY_QTY_FRACS:
             qty_try = int(qty * frac) if frac < 1.0 else qty
             if qty_try < 1 or qty_try in tried:
@@ -1731,11 +1873,29 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
             result = place_ib_market(action, qty_try)
             if result and result.get('ok'):
                 break
-            err_code = (result or {}).get('error_code') or 0
-            err_text = str((result or {}).get('error', ''))
-            is_201 = err_code == 201 or '201' in err_text
-            if not is_201:
+            if not _is_margin_reject(result):
                 break
+            if refreshed_on_201:
+                continue
+            refreshed_on_201 = True
+            old_m = official_mnq_intraday_initial()
+            print(f"[{ts}] Error 201，强制刷新 IBKR 官表后重算张数")
+            ensure_official_mnq_margin(force=True)
+            new_m = official_mnq_intraday_initial()
+            new_qty = calc_ib_order_quantity(qqq_px=qqq_px or price, side=side)
+            ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+            if new_qty >= 1 and new_qty not in tried and new_qty < qty_try:
+                print(f"[{ts}] 官表日内初始 ${old_m or 0:,.2f} → ${new_m or 0:,.2f}，"
+                      f"张数 {qty_try} → {new_qty}，再试一次")
+                tried.add(new_qty)
+                result = place_ib_market(action, new_qty)
+                if result and result.get('ok'):
+                    break
+                if not _is_margin_reject(result):
+                    break
+            else:
+                print(f"[{ts}] 刷新官表后张数未下降（重算 {new_qty}，原 {qty_try}；"
+                      f"单张 ${old_m or 0:,.2f} → ${new_m or 0:,.2f}），改按比例减张")
 
     if not result or not result.get('ok'):
         err = (result or {}).get('error', 'unknown')
@@ -1828,7 +1988,7 @@ def daily_loss_monitor_thread(symbol, position_data):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 最大允许亏损额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 已禁用")
-    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 仓位模式: 日内保证金满仓（约 13x；201 则减张）")
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 仓位模式: 日内保证金满仓（约 13x；201 先刷官表再减张）")
     
     while DAILY_LOSS_MONITOR_ACTIVE:
         try:
@@ -1991,6 +2151,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     print(f"当前美东时间: {now_et.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"交易时间: {trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d}")
     print(f"每日最大开仓次数: {max_positions_per_day}")
+    ensure_official_mnq_margin()
     if DEBUG_MODE:
         print(f"调试模式已开启! 使用时间: {now_et.strftime('%Y-%m-%d %H:%M:%S')}")
         if DEBUG_ONCE:
@@ -2250,6 +2411,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
             PROFIT_TARGET_TRIGGERED = False  # 重置止盈标志
             trailing_tp_day_stop = False  # 🎯 重置追踪止盈当日停止开仓标志
+            ensure_official_mnq_margin()
             
             # 停止旧的监控线程
             if monitor_thread is not None and monitor_thread.is_alive():
@@ -2309,7 +2471,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 初始资金: ${INITIAL_CAPITAL:.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日盈亏: ${DAILY_PNL:+.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 累计盈亏: ${TOTAL_PNL:+.2f}")
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位模式: 日内保证金满仓（约 13x；201 则减张）")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位模式: 日内保证金满仓（约 13x；201 先刷官表再减张）")
             if MAX_DAILY_LOSS_AMOUNT > 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内最大亏损限额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
             else:
@@ -2772,7 +2934,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                       f"上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 执行: {TRADE_SYMBOL} × {qty} 张（满仓）")
 
-                order_id = submit_order(symbol, side, qty, outside_rth=outside_rth_setting)
+                order_id = submit_order(symbol, side, qty, outside_rth=outside_rth_setting, qqq_px=latest_price)
                 ib_pos = get_ib_position_qty()
                 ib_pos = _normalize_qty(ib_pos)
                 if ib_pos is None:
@@ -2900,10 +3062,11 @@ if __name__ == "__main__":
     print("\n--- 风控设置 ---")
     apply_optional_risk_settings()
 
-    print("版本: 2.1.4")
+    print("版本: 2.1.7")
     print("执行: 每轮以 IB 仓位为准；下单看仓位不看 Filled；读仓失败不当空仓")
     print("平仓: 信号用完整 15m K；一旦成立立刻市价平到仓位=0，失败持续补平")
-    print("等待: 非交易日睡到下一开盘，不固定 12h；跨日提前醒，避免周日晚睡过周一早盘")
+    print("等待: 非交易日睡到下一开盘；Gateway 未登录（含 IB Key）会一直重连，不退出")
+    print("保证金: 每个美东自然日拉一次 IBKR 官表；盘中不刷；201 时强制再拉一次重算")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
     print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
@@ -2913,6 +3076,7 @@ if __name__ == "__main__":
 
     ib_connect()
     apply_ib_account_capital()
+    ensure_official_mnq_margin()
 
     print("\n--- 用户配置参数 ---")
     print(f"信号品种: {SYMBOL}")
@@ -2924,7 +3088,12 @@ if __name__ == "__main__":
           f"{'无限重试' if IB_RECONNECT_MAX_ATTEMPTS <= 0 else f'最多 {IB_RECONNECT_MAX_ATTEMPTS} 次'}，"
           f"心跳 {IB_HEARTBEAT_INTERVAL_SEC}s")
     print(f"账户净值: ${INITIAL_CAPITAL:.2f}")
-    print(f"仓位模式: 满仓（净值 × {MARGIN_USAGE_PCT:g} / 日内初始保证金，名义×{MNQ_INTRADAY_IM_PCT:.2%}；201 则 90%/85%/70% 减张）")
+    official = official_mnq_intraday_initial()
+    if official:
+        asof = (_MNQ_OFFICIAL_MARGIN or {}).get('asof', '')
+        print(f"仓位模式: 满仓（净值 × {MARGIN_USAGE_PCT:g} / IBKR官表日内初始 ${official:,.2f}，日期 {asof}；201 先刷官表重算，仍不足再 90%/85%/70%）")
+    else:
+        print(f"仓位模式: 满仓（净值 × {MARGIN_USAGE_PCT:g} / 日内初始保证金，名义×{MNQ_INTRADAY_IM_PCT:.2%}；201 先刷官表重算，仍不足再 90%/85%/70%）")
     if MAX_MNQ_CONTRACTS and MAX_MNQ_CONTRACTS > 0:
         print(f"张数硬顶: {MAX_MNQ_CONTRACTS}")
     else:

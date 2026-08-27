@@ -4,3 +4,4 @@ __pycache__
 *.log
 *.backup
 *.csv
+ibkr_mnq_margin.json
