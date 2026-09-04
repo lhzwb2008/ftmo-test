@@ -130,9 +130,11 @@ MAX_MNQ_CONTRACTS = 0
 # accountSummary 订阅状态（保留标志；账户刷新走 accountUpdates）
 _ACCOUNT_SUMMARY_SUBSCRIBED = False
 
-# 资金和风控设置（净值从 IB 读取；止盈/日亏默认关闭）
+# 资金和风控设置（仓位按 IB 实时净值满仓；日志/盈亏% 用固定初始资金）
+# Paper 已重置为 $100,000；进程重启后累计盈亏仍相对此基数，不改用当时净值
+PAPER_INITIAL_CAPITAL = 100_000.0
 ACCOUNT_START_BALANCE = None
-INITIAL_CAPITAL = None
+INITIAL_CAPITAL = PAPER_INITIAL_CAPITAL
 LEVERAGE = None  # 兼容旧日志字段；期货满仓模式下不再使用
 
 # 可选账户级止盈/日内止损（自营默认关闭；设正数启用）
@@ -255,9 +257,16 @@ def apply_ib_account_capital():
         time_module.sleep(IB_RECONNECT_INTERVAL_SEC)
 
     ACCOUNT_START_BALANCE = balance
-    INITIAL_CAPITAL = balance
+    INITIAL_CAPITAL = PAPER_INITIAL_CAPITAL
     avail = get_ib_buying_power()
     print(f"IB 账户净值(NetLiquidation): ${balance:,.2f}")
+    print(f"初始资金(盈亏基数): ${INITIAL_CAPITAL:,.2f}")
+    if INITIAL_CAPITAL > 0:
+        drift = abs(balance / INITIAL_CAPITAL - 1.0)
+        if drift > 0.15:
+            print(f"⚠️ IB 净值与初始资金相差 {drift:.0%}；"
+                  f"仓位仍按实时净值满仓，累计盈亏% 按 ${INITIAL_CAPITAL:,.0f} 计。"
+                  f"若刚提交 Paper 重置，需等下一工作日到账后再启动。")
     if avail > 0:
         print(f"可用保证金/购买力: ${avail:,.2f} → 开仓按满仓估算张数（使用 {MARGIN_USAGE_PCT*100:.0f}%）")
     else:
@@ -1098,7 +1107,8 @@ def calc_ib_order_quantity(mnq_px=None, qqq_px=None, side='Buy'):
                 print(f"[{ts}] 整单 whatIf 通过: {qty} 张总初始保证金≈${full_margin:,.0f}")
 
     notional = (qty * mnq_px * MNQ_POINT_VALUE) if (mnq_px and mnq_px > 0 and qty > 0) else 0.0
-    eff_lev = (notional / INITIAL_CAPITAL) if (INITIAL_CAPITAL and INITIAL_CAPITAL > 0 and notional > 0) else 0.0
+    lev_base = nlv if nlv > 0 else INITIAL_CAPITAL
+    eff_lev = (notional / lev_base) if (lev_base and lev_base > 0 and notional > 0) else 0.0
 
     print(f"[{ts}] 满仓计算: 预算=${usable:,.0f} (基数${available:,.0f}×{MARGIN_USAGE_PCT:g}) / "
           f"单张≈${margin_1:,.0f} ({margin_source}) = {qty} 张 MNQ"
@@ -3087,7 +3097,9 @@ if __name__ == "__main__":
     print(f"IB 断线重连: 间隔 {IB_RECONNECT_INTERVAL_SEC}s，"
           f"{'无限重试' if IB_RECONNECT_MAX_ATTEMPTS <= 0 else f'最多 {IB_RECONNECT_MAX_ATTEMPTS} 次'}，"
           f"心跳 {IB_HEARTBEAT_INTERVAL_SEC}s")
-    print(f"账户净值: ${INITIAL_CAPITAL:.2f}")
+    print(f"初始资金(盈亏基数): ${INITIAL_CAPITAL:,.2f}")
+    if ACCOUNT_START_BALANCE:
+        print(f"IB 当前净值: ${ACCOUNT_START_BALANCE:,.2f}（开仓按此满仓，不按初始资金）")
     official = official_mnq_intraday_initial()
     if official:
         asof = (_MNQ_OFFICIAL_MARGIN or {}).get('asof', '')
