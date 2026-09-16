@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 import numpy as np
 from functools import wraps
 
-from longport.openapi import Config, TradeContext, OrderSide, OrderType, TimeInForceType, OutsideRTH
+from longport.openapi import Config, TradeContext, OrderSide, OrderType, TimeInForceType, OutsideRTH, OrderStatus
 
 from trend_er5_gate import history_days_back, apply_entry_gates_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
@@ -656,6 +656,45 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
     return response.order_id
 
 
+ORDER_TERMINAL_OK = {OrderStatus.Filled, OrderStatus.PartialFilled}
+ORDER_TERMINAL_FAIL = {
+    OrderStatus.Rejected,
+    OrderStatus.Canceled,
+    OrderStatus.Expired,
+}
+
+
+def get_order_detail(order_id):
+    return TRADE_CTX.order_detail(order_id=str(order_id))
+
+
+def wait_for_order_terminal(order_id, timeout=12, interval=0.5):
+    """等到券商订单进入终态（成交/拒绝/撤单），避免只拿到 order_id 就当成功。"""
+    deadline = time_module.time() + timeout
+    last = None
+    while time_module.time() < deadline:
+        try:
+            last = get_order_detail(order_id)
+            status = getattr(last, "status", None)
+            if status in ORDER_TERMINAL_OK or status in ORDER_TERMINAL_FAIL:
+                return last
+        except Exception as e:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 查询订单 {order_id} 失败: {e}")
+        time_module.sleep(interval)
+    return last
+
+
+def order_reject_reason(detail):
+    if detail is None:
+        return "未知（未查到订单详情）"
+    for key in ("msg", "message", "remark", "tag"):
+        val = getattr(detail, key, None)
+        if val:
+            return str(val)
+    status = getattr(detail, "status", None)
+    return str(status) if status is not None else "未知"
+
+
 def live_symbol_qty(symbol):
     """从账户拉该标的实盘净持仓（多正空负；无持仓为 0）。"""
     positions = get_current_positions()
@@ -684,14 +723,19 @@ def close_live_position(symbol, outside_rth=None, reason="平仓"):
     side = "Sell" if qty > 0 else "Buy"
     order_id = submit_order(symbol, side, abs(qty), outside_rth=outside_rth)
     print(f"[{ts}] {reason}订单已提交: {side} {abs(qty)} {symbol}，ID: {order_id}（按实盘持仓）")
+    detail = wait_for_order_terminal(order_id)
+    status = getattr(detail, "status", None) if detail is not None else None
     leftover = wait_until_flat(symbol)
+    if status in ORDER_TERMINAL_FAIL:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {reason}被拒绝: {order_reject_reason(detail)}，实盘剩余 {leftover} 股")
+        return None, leftover, side
     if leftover != 0:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 警告: {reason}后账户仍有 {leftover} 股")
     return order_id, qty, side
 
 
 def open_if_flat(symbol, side, quantity, outside_rth=None):
-    """空仓才开：已有持仓则跳过，策略同一时间只保留一仓。"""
+    """空仓才开：已有持仓则跳过。提交后等券商终态，仓位以实盘为准。"""
     ts = get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S")
     qty = live_symbol_qty(symbol)
     if qty != 0:
@@ -699,7 +743,22 @@ def open_if_flat(symbol, side, quantity, outside_rth=None):
         return None, qty
     order_id = submit_order(symbol, side, quantity, outside_rth=outside_rth)
     print(f"[{ts}] 开仓订单已提交: {side} {quantity} {symbol}，ID: {order_id}")
-    return order_id, 0
+    detail = wait_for_order_terminal(order_id)
+    status = getattr(detail, "status", None) if detail is not None else None
+    if status in ORDER_TERMINAL_FAIL:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 开仓被拒绝: {order_reject_reason(detail)}")
+        return None, live_symbol_qty(symbol)
+    deadline = time_module.time() + 8
+    live_qty = live_symbol_qty(symbol)
+    while time_module.time() < deadline and live_qty == 0:
+        time_module.sleep(0.5)
+        live_qty = live_symbol_qty(symbol)
+    if live_qty == 0:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 开仓未在实盘确认（订单状态 {status}），按空仓处理")
+        return None, 0
+    filled = getattr(detail, "executed_quantity", None) if detail is not None else None
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 开仓已成交: 实盘 {live_qty} 股（成交数量 {filled}）")
+    return order_id, live_qty
 
 def check_exit_conditions(df, position_quantity, current_stop):
     # 获取当前时间点
@@ -1481,32 +1540,33 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: {price}, VWAP: {latest_row['VWAP']:.4f}, 上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
                 
                 available_capital = get_account_balance()
-                # 应用杠杆比例
+                # 应用杠杆比例；顶格 10x 市价单会触发购买力风控，多空都减 1 股留余量
                 adjusted_capital = available_capital * LEVERAGE
                 position_size = floor(adjusted_capital / latest_price)
+                if position_size > 0:
+                    position_size -= 1
                 if position_size <= 0:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: Insufficient capital for position")
-                    sys.exit(1)
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: 资金不足（10x 减1股后为 0），跳过本根K")
+                    continue
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 调整后资金: ${adjusted_capital:.2f}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股（10x 计算结果减 1 股）")
                 side = "Buy" if signal > 0 else "Sell"
                 order_id, live_qty = open_if_flat(symbol, side, position_size, outside_rth=outside_rth_setting)
                 if not order_id:
                     position_quantity = live_qty
                     continue
-                
-                position_quantity = position_size if signal > 0 else -position_size
+
+                position_quantity = live_qty
                 entry_price = latest_price
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} {position_size} {symbol} 价格: {entry_price}")
-                
-                # 记录开仓交易
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} 实盘 {live_qty} {symbol} 价格: {entry_price}")
+
                 DAILY_TRADES.append({
                     "time": now.strftime('%Y-%m-%d %H:%M:%S'),
                     "action": "开仓",
                     "side": side,
-                    "quantity": position_size,
+                    "quantity": abs(int(live_qty)),
                     "price": entry_price,
-                    "pnl": None  # 开仓时还没有盈亏
+                    "pnl": None
                 })
         
 
@@ -1539,7 +1599,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
 
 if __name__ == "__main__":
     print("\n长桥API交易策略启动")
-    print("版本: 1.3.2 (ftmo-test: 开平仓前校验实盘持仓)")
+    print("版本: 1.3.3 (ftmo-test: 开仓等券商终态，10x 减 1 股)")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"行情缓存: {os.path.abspath(MARKET_DATA_DB_PATH)}")
     if DEBUG_MODE:
