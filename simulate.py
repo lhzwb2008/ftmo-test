@@ -656,12 +656,12 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
     return response.order_id
 
 
-ORDER_TERMINAL_OK = {OrderStatus.Filled, OrderStatus.PartialFilled}
-ORDER_TERMINAL_FAIL = {
+ORDER_TERMINAL_OK = (OrderStatus.Filled, OrderStatus.PartialFilled)
+ORDER_TERMINAL_FAIL = (
     OrderStatus.Rejected,
     OrderStatus.Canceled,
     OrderStatus.Expired,
-}
+)
 
 
 def get_order_detail(order_id):
