@@ -7,7 +7,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.00"
+#property version   "1.02"
 #property strict
 
 #property script_show_inputs
@@ -98,6 +98,7 @@ int OnInit()
     }
     
     Print("✅ EA初始化成功 — Aqua Pay Later");
+    Print("🧩 编译版本: 1.02（开仓前校验止损；服务器 Invalid stops 只拒绝一次，不再重试）");
     Print("🔢 实例编号: ", InstanceId);
     Print("📌 阶段: ", AccountPhase == AQUA_PL_CHALLENGE ? "CHALLENGE" : "FUNDED");
     Print("🗄 信号库: ", g_db_path);
@@ -260,7 +261,11 @@ double CalcDailyFloorSLPrice(double lots, double open_price, ENUM_POSITION_TYPE 
     
     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
     double sl = (type == POSITION_TYPE_BUY) ? open_price + offset : open_price - offset;
-    return NormalizeDouble(sl, digits);
+    sl = NormalizeDouble(sl, digits);
+    // 余额已不高于触发线时 offset >= 0，止损会落到盈利一侧。返回 0，避免被当成更紧的止损随市价单发出去。
+    if(type == POSITION_TYPE_BUY && sl >= open_price) return 0;
+    if(type == POSITION_TYPE_SELL && sl <= open_price) return 0;
+    return sl;
 }
 
 //+------------------------------------------------------------------+
@@ -283,6 +288,115 @@ double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type)
     double hard_sl  = CalcHardSLPrice(lots, open_price, type);
     double daily_sl = CalcDailyFloorSLPrice(lots, open_price, type);
     return TighterSL(type, hard_sl, daily_sl);
+}
+
+//+------------------------------------------------------------------+
+//| 止损是否在现价正确一侧，且不近于经纪商最小距离                       |
+//| 多单：SL <= Bid - 最小距离；空单：SL >= Ask + 最小距离              |
+//+------------------------------------------------------------------+
+bool SlIsPlaceable(ENUM_POSITION_TYPE type, double sl)
+{
+    if(sl <= 0) return false;
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+    if(point <= 0) point = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    // stops level 为 0 时仍要求至少离开现价 1 个点，避免止损贴在买/卖价上被拒
+    if(min_stop < point) min_stop = point;
+    double market = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                                : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    if(market <= 0) return false;
+    if(type == POSITION_TYPE_BUY) return (sl <= market - min_stop);
+    return (sl >= market + min_stop);
+}
+
+//+------------------------------------------------------------------+
+//| 余额已经不高于日亏触发线：停止当日新开仓。不平掉已有持仓，           |
+//| 净值可能仍靠浮盈停在触发线上方，此时强平会把浮盈兑现成亏损。         |
+//+------------------------------------------------------------------+
+void HaltDailyNewEntries()
+{
+    if(daily_halted) return;
+    daily_halted = true;
+    GlobalVariableSet(DailyGVName("halted"), 1.0);
+    Print("🛑 余额已不高于日内触发线，停止当日新开仓（保留现有持仓，由净值触线逻辑兜底）");
+    Print("🛑 余额=$", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
+          " 净值=$", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+          " 触发线=$", DoubleToString(DailyTriggerFloor(), 2),
+          " 锚点=$", DoubleToString(daily_anchor, 2));
+    WriteDailyStatus("balance_below_floor");
+}
+
+//+------------------------------------------------------------------+
+//| 开仓前确认保护止损能被服务器接受。不能挂出就消费信号，避免每秒重试。 |
+//| 日亏保护开着但止损不合法：放弃本次开仓。余额已穿触发线则当日停开。   |
+//+------------------------------------------------------------------+
+bool PrepareOpenSl(long signal_id, ENUM_POSITION_TYPE type, double daily_sl, double hard_sl, double &sl_out)
+{
+    sl_out = 0;
+    bool daily_on = g_daily_loss_pct > 0;
+    bool daily_ok = SlIsPlaceable(type, daily_sl);
+    bool hard_ok = SlIsPlaceable(type, hard_sl);
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+    if(daily_on && !daily_ok)
+    {
+        Print("🚫 日亏保护止损无法挂出，放弃开仓。计算价=", DoubleToString(daily_sl, digits),
+              " 余额=$", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
+              " 净值=$", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+              " 触发线=$", DoubleToString(DailyTriggerFloor(), 2));
+        if(AccountInfoDouble(ACCOUNT_BALANCE) <= DailyTriggerFloor())
+            HaltDailyNewEntries();
+        MarkSignalConsumed(signal_id);
+        return false;
+    }
+
+    if(daily_ok && hard_ok)
+        sl_out = TighterSL(type, hard_sl, daily_sl);
+    else if(daily_ok)
+        sl_out = daily_sl;
+    else if(hard_ok)
+        sl_out = hard_sl;
+
+    if((daily_sl > 0 || hard_sl > 0) && sl_out <= 0)
+    {
+        Print("🚫 保护止损距离现价不足，放弃开仓。日亏线=", DoubleToString(daily_sl, digits),
+              " 硬止损=", DoubleToString(hard_sl, digits));
+        MarkSignalConsumed(signal_id);
+        return false;
+    }
+    if(sl_out > 0 && !SlIsPlaceable(type, sl_out))
+    {
+        Print("🚫 保护止损距离现价不足，放弃开仓。止损=", DoubleToString(sl_out, digits));
+        MarkSignalConsumed(signal_id);
+        return false;
+    }
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| 下单被拒时打印当时的价格和日亏锚点。Invalid stops 消费信号，不再重试。 |
+//+------------------------------------------------------------------+
+void NoteOrderRejected(long signal_id, double price, double sl)
+{
+    uint rc = trade.ResultRetcode();
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    Print("❌ 执行失败: ", rc, " ", trade.ResultRetcodeDescription());
+    Print("❌ 请求价=", DoubleToString(price, digits),
+          " 止损=", DoubleToString(sl, digits),
+          " Bid=", DoubleToString(bid, digits),
+          " Ask=", DoubleToString(ask, digits),
+          " 余额=$", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
+          " 净值=$", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+          " 触发线=$", DoubleToString(DailyTriggerFloor(), 2),
+          " 锚点=$", DoubleToString(daily_anchor, 2));
+    if(rc != TRADE_RETCODE_INVALID_STOPS)
+        return;
+    Print("🚫 服务器拒绝止损(Invalid stops)，本信号不再重试");
+    if(g_daily_loss_pct > 0 && AccountInfoDouble(ACCOUNT_BALANCE) <= DailyTriggerFloor())
+        HaltDailyNewEntries();
+    MarkSignalConsumed(signal_id);
 }
 
 //+------------------------------------------------------------------+
@@ -497,6 +611,8 @@ void ProcessSignal(long signal_id, string action)
 {
     bool result = false;
     double lots = 0;
+    double sent_price = 0;
+    double sent_sl = 0;
     
     // 日内止损 / 日盈 cap 已触发：当日禁止一切新开仓，只消费掉开仓信号
     if((daily_halted || profit_cap_halted) && (action == "BUY" || action == "SELL"))
@@ -539,8 +655,16 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            // 开仓即挂保护性SL = min(硬止损, 日亏线)，取更紧者
-            double sl = CalcProtectiveSL(lots, ask, POSITION_TYPE_BUY);
+            double daily_sl = CalcDailyFloorSLPrice(lots, ask, POSITION_TYPE_BUY);
+            double hard_sl = CalcHardSLPrice(lots, ask, POSITION_TYPE_BUY);
+            double sl = 0;
+            if(!PrepareOpenSl(signal_id, POSITION_TYPE_BUY, daily_sl, hard_sl, sl))
+                return;
+            sent_price = ask;
+            sent_sl = sl;
+            Print("📤 准备开多 lots=", DoubleToString(lots, 2),
+                  " ask=", DoubleToString(ask, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
+                  " sl=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)));
             result = trade.Buy(lots, _Symbol, ask, sl, 0, "QQQ Signal Buy");
         }
     }
@@ -573,8 +697,16 @@ void ProcessSignal(long signal_id, string action)
             }
             
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            // 开仓即挂保护性SL = min(硬止损, 日亏线)，取更紧者
-            double sl = CalcProtectiveSL(lots, bid, POSITION_TYPE_SELL);
+            double daily_sl = CalcDailyFloorSLPrice(lots, bid, POSITION_TYPE_SELL);
+            double hard_sl = CalcHardSLPrice(lots, bid, POSITION_TYPE_SELL);
+            double sl = 0;
+            if(!PrepareOpenSl(signal_id, POSITION_TYPE_SELL, daily_sl, hard_sl, sl))
+                return;
+            sent_price = bid;
+            sent_sl = sl;
+            Print("📤 准备开空 lots=", DoubleToString(lots, 2),
+                  " bid=", DoubleToString(bid, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)),
+                  " sl=", DoubleToString(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)));
             result = trade.Sell(lots, _Symbol, bid, sl, 0, "QQQ Signal Sell");
         }
     }
@@ -600,7 +732,7 @@ void ProcessSignal(long signal_id, string action)
     }
     else
     {
-        Print("❌ 执行失败: ", trade.ResultRetcode());
+        NoteOrderRejected(signal_id, sent_price, sent_sl);
     }
 }
 
