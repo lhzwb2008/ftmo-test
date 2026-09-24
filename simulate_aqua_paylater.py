@@ -34,7 +34,8 @@ ACCOUNT_PHASE = None  # "challenge" | "funded"（启动时选择；与 EA Accoun
 
 # 风控比例（AquaFunded One-Step Pay Later / Starter-One Step [Pay-Later]）
 # Challenge: 目标 +3%；日亏无；最大回撤 5% trailing；浮亏封号约 -1%（EA HardSL≈0.95）
-# Funded: 无利润目标；日亏 3%；最大回撤 5% trailing；浮亏约 -1%；一致性 15%（建议单日止盈 $1100@150K）
+# Funded: 无利润目标；日亏 3%；最大回撤 5% trailing；浮亏约 -1%；一致性 15%
+# 200k 回测（2026-03-24~09-23）最优：杠杆 2x，日盈帽 $1100（同比放大到 $1467 只会抬高 trailing 地板，出金更少）
 PHASE_PROFIT_TARGET_PCT = {"challenge": 0.03, "funded": -1}  # 负数=禁用账户止盈
 PROFIT_TARGET_PCT = -1     # 当前阶段止盈比例（启动时根据阶段自动设置）
 TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标；账户达标会被平台自动关停，止盈只是兜底）
@@ -43,7 +44,7 @@ TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调�
 MAX_PROFIT_AMOUNT = -1  # 账户止盈目标金额（Challenge 自动计算；Funded 禁用）
 
 # Funded 一致性 15%：单日利润上限（达到后平仓且当日不再开仓；Challenge 禁用）
-# 150K 默认 $1100 → 提款至少约 $1100/0.15≈$7333 总利润才过一致性
+# 200k 账户日盈帽 $1100 → 按一致性 15%，累计利润至少约 $1100/0.15≈$7333 才便于提款
 DEFAULT_FUNDED_DAY_PROFIT_CAP = 1100.0
 MAX_DAILY_PROFIT_AMOUNT = -1  # 启动时按阶段设置；负数=禁用
 
@@ -155,7 +156,7 @@ def print_phase_ea_checklist(phase):
     else:
         print("  HardSLRiskPercent ≈ 0.95（浮亏封号 -1% 留缓冲）")
         print("  DailyLossPercent  = 3.0（Funded 官方日亏 3%）")
-        print(f"  DailyProfitCapUSD = {MAX_DAILY_PROFIT_AMOUNT:.0f}（一致性 15%；150K 默认 1100）")
+        print(f"  DailyProfitCapUSD = {MAX_DAILY_PROFIT_AMOUNT:.0f}（一致性 15%；200k 回测最优 1100）")
         print("  策略建议: 杠杆 2x + 日盈 cap，先保命再磨绿色交易日")
     print("-" * 60)
 
@@ -180,7 +181,7 @@ def prompt_capital_settings():
             if phase not in PHASE_PROFIT_TARGET_PCT:
                 print("错误: 必须是 challenge 或 funded，请重新输入")
                 continue
-            start_str = input("请输入账户起始资金（如 150000）: ").strip()
+            start_str = input("请输入账户起始资金（如 200000）: ").strip()
             current_str = input("请输入账户当前金额（如 148500）: ").strip()
             start_balance = float(start_str)
             current_balance = float(current_str)

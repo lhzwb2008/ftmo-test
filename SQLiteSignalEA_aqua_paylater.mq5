@@ -3,7 +3,7 @@
 //|              AquaFunded One-Step Pay Later 信号执行EA             |
 //| Challenge / Funded 必须用 AccountPhase 分开；DB/Magic 与普通 aqua 隔离 |
 //| Challenge: 无日亏；HardSL≈0.95（浮亏-1%）；无日盈cap；目标+3%在Python |
-//| Funded: 日亏3%；HardSL≈0.95；日盈cap默认1100（一致性15%）         |
+//| Funded: 日亏3%；HardSL≈0.95；日盈cap $1100（200k 回测最优，一致性15%）|
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
@@ -28,7 +28,7 @@ input bool                UseCommonPath = true;           // 使用通用目录�
 input double              Leverage = 2;                   // 杠杆倍数（建议 Challenge/Funded 均 2x）
 input double              RiskPercent = 100.0;            // 使用余额百分比(%)
 input int                 CheckIntervalSeconds = 1;       // 检查间隔（秒）
-input double              InitialBalance = 150000.0;      // 账户初始资金（Pay Later 常见 150K）
+input double              InitialBalance = 200000.0;      // 账户初始资金（Pay Later 默认 200K）
 input double              HardSLRiskPercent = 0.95;       // 浮亏封号-1%留缓冲；两阶段均建议 0.90~0.95
 
 //--- 日内亏损（仅 Funded 生效；Challenge 强制关闭）
@@ -38,7 +38,7 @@ input int      DailyResetServerHour = 0;               // 日亏锚点重置（�
 input bool     ForceResetDailyRisk = false;            // 强制重置日内锚点（出金后勾选一次）
 
 //--- Funded 一致性：单日利润上限（仅 Funded 生效；Challenge 强制关闭；0=Funded也禁用）
-input double   DailyProfitCapUSD = 1100.0;             // Funded 日盈上限 USD（150K 默认 1100）
+input double   DailyProfitCapUSD = 1100.0;             // Funded 日盈上限 USD（200K 回测最优 1100，勿按比例放大）
 
 //--- 全局变量
 CTrade trade;
