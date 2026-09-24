@@ -369,6 +369,12 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
     # 🛡️ 单笔止损：相对开仓价固定百分比；K 内用 Low/High 检测（与日内止损一致）
     enable_per_trade_stop_loss = config.get('enable_per_trade_stop_loss', False)
     per_trade_stop_loss_pct = config.get('per_trade_stop_loss_pct', 0.03)
+    # 单日利润上限（美元，相对日初权益）。达到后按触限价平仓并停止当日再开仓。<=0 关闭。
+    max_daily_profit_amount = config.get('max_daily_profit_amount')
+    try:
+        max_daily_profit_amount = float(max_daily_profit_amount) if max_daily_profit_amount is not None else 0.0
+    except (TypeError, ValueError):
+        max_daily_profit_amount = 0.0
 
     # 开仓趋势门控（可选）：由 run_backtest 写入 entry_trend_pass；无门控时为 True
     def apply_slippage(price, is_buy, is_entry):
@@ -632,6 +638,23 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
                         f"限额=${_max_daily_loss_amt:.2f}, 峰值=${intraday_capital_peak:.2f}, "
                         f"触限权益=${equity_floor:.2f}"
                     )
+
+            if (not stop_now and max_daily_profit_amount > 0
+                    and current_best_capital >= day_start_capital + max_daily_profit_amount):
+                equity_cap = day_start_capital + max_daily_profit_amount
+                current_best_capital = equity_cap
+                mark = _mark_price_for_equity(equity_cap)
+                if np.isnan(mark):
+                    mark = price
+                else:
+                    mark = float(min(max(mark, float(low)), float(high)))
+                stop_now = True
+                stop_exit_mark = mark
+                stop_reason = 'Daily Profit Cap'
+                stop_detail = (
+                    f"日盈上限强平! 时间: {current_time}, "
+                    f"上限=${max_daily_profit_amount:.2f}, 触限权益=${equity_cap:.2f}"
+                )
 
             current_drawdown = intraday_capital_peak - current_worst_capital
             if current_drawdown > intraday_max_drawdown:
@@ -1528,6 +1551,8 @@ def run_backtest(config):
     # 处理策略交易部分
     
     for i, trade_date in enumerate(filtered_dates):
+        if config.get('_stop_backtest'):
+            break
         # 获取当天的数据
         day_data = price_df[price_df['Date'] == trade_date].copy()
         day_data = day_data.sort_values('DateTime').reset_index(drop=True)
@@ -1557,6 +1582,13 @@ def run_backtest(config):
         # 计算仓位大小（应用杠杆）
         leveraged_capital = capital * leverage  # 应用杠杆倍数
         position_size = floor(leveraged_capital / day_open_price)
+        # 硬止损按初始资金的固定美元（与 EA InitialBalance × HardSLRiskPercent 一致），
+        # 再换成相对开仓价的百分比，供 simulate_day 的单笔止损使用。
+        hard_sl_pct_of_initial = config.get('hard_sl_pct_of_initial')
+        if hard_sl_pct_of_initial and position_size > 0 and day_open_price > 0:
+            hard_usd = float(initial_capital) * float(hard_sl_pct_of_initial)
+            config['enable_per_trade_stop_loss'] = True
+            config['per_trade_stop_loss_pct'] = hard_usd / (position_size * day_open_price)
         
         # 如果资金不足，跳过当天
         if position_size <= 0:
@@ -1677,7 +1709,15 @@ def run_backtest(config):
         # 更新资金并计算每日回报
         capital_start = capital
         capital += day_pnl
-        daily_return = day_pnl / capital_start
+        daily_return = day_pnl / capital_start if capital_start else 0.0
+
+        on_day_close = config.get('on_day_close')
+        if on_day_close is not None:
+            capital = on_day_close(
+                trade_date, trades, day_pnl, capital, intraday_low, intraday_high, capital_start,
+            )
+            if capital is None:
+                break
 
         # 存储每日结果
         daily_results.append({
