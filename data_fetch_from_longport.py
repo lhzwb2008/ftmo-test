@@ -2,47 +2,53 @@
 # -*- coding: utf-8 -*-
 
 from datetime import date, timedelta
-from zoneinfo import ZoneInfo
-from longport.openapi import QuoteContext, Config, Period, AdjustType
+
 import pandas as pd
+import pytz
+from dotenv import load_dotenv
+from longport.openapi import AdjustType, Config, Period, QuoteContext
+
+load_dotenv(override=True)
 
 # ———— 配置 & 初始化 ————
-config = Config.from_env()
-ctx    = QuoteContext(config)
+# longport 4.x 只有 from_apikey_env / from_apikey，没有 from_env
+config = Config.from_apikey_env()
+ctx = QuoteContext(config)
 
 # ———— 时区定义 ————
-TZ_HK = ZoneInfo('Asia/Hong_Kong')
-TZ_ET = ZoneInfo('US/Eastern')
+# history_candlesticks_by_date 的 timestamp 是 UTC 墙钟（美股 09:30 ET = 13:30 UTC），
+# 不是香港本地时间；按 HK 转会错到凌晨。
+TZ_UTC = pytz.UTC
+TZ_ET = pytz.timezone('US/Eastern')
 
 # ———— 用户参数：美东起止日期（inclusive） ————
 # 注意：history_candlesticks_by_date 接口接受 date 类型
 # 近一年行情 + 约 3 个月趋势特征预热（er5 / rank60 等）
-start_date = date(2024, 8, 1)
-end_date   = date(2026, 8, 10)  # 美东最近完整交易日；跑脚本前可按需改
+start_date = date(2025, 6, 1)
+end_date = date(2026, 9, 21)  # 美东最近完整交易日；跑脚本前可按需改
 
 all_candles = []
 
 # ———— 按天拉：每次用 history_candlesticks_by_date ————
 current = start_date
 while current <= end_date:
-    resp = ctx.history_candlesticks_by_date(
-        "QQQ.US",
-        Period.Min_1,
-        AdjustType.ForwardAdjust,
-        current,
-        current
-    )
-    print(f"{current} → 拉到 {len(resp)} 条")
-    all_candles.extend(resp)
+    if current.weekday() < 5:
+        resp = ctx.history_candlesticks_by_date(
+            "QQQ.US",
+            Period.Min_1,
+            AdjustType.ForwardAdjust,
+            current,
+            current
+        )
+        print(f"{current} → 拉到 {len(resp)} 条")
+        all_candles.extend(resp)
     current += timedelta(days=1)
 
 # ———— 转换时区 & 保存 ————
 rows = []
 for c in all_candles:
-    # API 返回的 timestamp 是香港本地的 naive 时间
-    dt_hk = c.timestamp.replace(tzinfo=TZ_HK)
-    # 转到美东
-    dt_et = dt_hk.astimezone(TZ_ET)
+    ts = c.timestamp.replace(tzinfo=None)
+    dt_et = TZ_UTC.localize(ts).astimezone(TZ_ET)
     rows.append({
         'DateTime': dt_et.strftime('%Y-%m-%d %H:%M:%S'),
         'Open':      c.open,
