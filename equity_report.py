@@ -2,7 +2,7 @@
 独立的按日权益 / 收益可视化报告。
 
 与 backtest 主逻辑完全隔离：只消费 daily_df / metrics / config，
-生成自包含 HTML（纯 SVG + CSS，不依赖 matplotlib / plotly）。
+生成自包含 HTML（纯 SVG + 轻量悬停提示，不依赖 matplotlib / plotly）。
 """
 
 from __future__ import annotations
@@ -73,6 +73,13 @@ def render_equity_report(
     monthly = _monthly_rows(daily_df)
     active_flags = _active_trade_day_flags(daily_df, trades_df)
     win_stats = _win_rate_stats(daily_ret, monthly, active_flags=active_flags)
+    current_dd = _current_drawdown_stats(dates, capital)
+    metrics_view = dict(metrics)
+    metrics_view.update(current_dd)
+    recent_days = _recent_active_trade_days(
+        daily_df, active_flags, trades_df, initial_capital, n=5,
+    )
+    dd_path = _drawdown_trade_path(trades_df, initial_capital)
 
     page = _build_html(
         title=f"{ticker} · Equity Report",
@@ -84,10 +91,12 @@ def render_equity_report(
         daily_ret=daily_ret,
         drawdowns=drawdowns,
         bh_capital=bh_capital,
-        metrics=metrics,
+        metrics=metrics_view,
         initial_capital=initial_capital,
         monthly=monthly,
         win_stats=win_stats,
+        recent_days=recent_days,
+        dd_path=dd_path,
     )
 
     if output_path is None:
@@ -175,6 +184,165 @@ def _win_rate_stats(
     }
 
 
+def _current_drawdown_stats(
+    dates: Sequence[datetime],
+    capital: Sequence[float],
+) -> dict[str, Any]:
+    """从历史权益最高点到报告末日终的当前回撤（日终口径）。"""
+    empty = {
+        'current_drawdown_pct': 0.0,
+        'current_drawdown_amount': 0.0,
+        'current_peak_date': None,
+        'current_drawdown_trading_days': 0,
+    }
+    if not capital:
+        return empty
+    cap = np.asarray(capital, dtype=float)
+    ath = float(np.nanmax(cap))
+    if not np.isfinite(ath) or ath <= 0:
+        return empty
+    peak_idx = int(np.max(np.flatnonzero(cap >= ath - 1e-9)))
+    end = float(cap[-1])
+    amount = end - ath
+    pct = (-amount / ath) if ath else 0.0
+    return {
+        'current_drawdown_pct': max(pct, 0.0),
+        'current_drawdown_amount': amount,
+        'current_peak_date': dates[peak_idx],
+        'current_drawdown_trading_days': max(len(cap) - 1 - peak_idx, 0),
+    }
+
+
+def _recent_active_trade_days(
+    daily_df: pd.DataFrame,
+    active_flags: Sequence[bool],
+    trades_df: Optional[pd.DataFrame],
+    initial_capital: float,
+    n: int = 5,
+) -> list[dict[str, Any]]:
+    """最近 n 个有成交日：日终盈亏（美元）与当日收益率。"""
+    if daily_df is None or len(daily_df) == 0:
+        return []
+    caps = daily_df['capital'].astype(float)
+    rets = daily_df['daily_return'].fillna(0).astype(float)
+    prev = caps.shift(1)
+    prev.iloc[0] = float(initial_capital)
+    pnls = caps - prev
+
+    counts: dict[Any, int] = {}
+    has_trades = trades_df is not None and len(trades_df) > 0 and 'Date' in trades_df.columns
+    if has_trades:
+        for d in trades_df['Date'].tolist():
+            if pd.isna(d):
+                continue
+            k = pd.Timestamp(d).date()
+            counts[k] = counts.get(k, 0) + 1
+
+    rows: list[dict[str, Any]] = []
+    for idx, flag, ret, pnl in zip(daily_df.index, active_flags, rets.tolist(), pnls.tolist()):
+        if not flag:
+            continue
+        k = pd.Timestamp(idx).date()
+        rows.append({
+            'date': pd.Timestamp(idx),
+            'pnl': float(pnl),
+            'ret': float(ret),
+            'trades': counts.get(k, 0) if has_trades else None,
+        })
+    return list(reversed(rows[-n:]))
+
+
+def _drawdown_trade_path(
+    trades_df: Optional[pd.DataFrame],
+    initial_capital: float,
+) -> dict[str, Any]:
+    """
+    按每笔平仓后的资金画回撤：横轴是成交顺序，一天可有多个点。
+    起点为初始资金。无成交时返回空，由图表退回日终路径。
+    """
+    empty: dict[str, Any] = {
+        'xs': [], 'dds': [], 'tips': [], 'spans': [], 'x_labels': [], 'n_trades': 0,
+    }
+    if trades_df is None or len(trades_df) == 0 or 'pnl' not in trades_df.columns:
+        return empty
+
+    df = trades_df.copy()
+    if 'exit_time' in df.columns:
+        df['_t'] = pd.to_datetime(df['exit_time'], errors='coerce')
+    elif 'Date' in df.columns:
+        df['_t'] = pd.to_datetime(df['Date'], errors='coerce')
+    else:
+        df['_t'] = pd.NaT
+    df = df.sort_values('_t', kind='mergesort', na_position='last').reset_index(drop=True)
+
+    xs: list[float] = [0.0]
+    eqs: list[float] = [float(initial_capital)]
+    tips: list[str] = [
+        '<div class="tip-date">起点</div>'
+        f'<div><span class="tip-k">权益</span> {_fmt_money(initial_capital)}</div>'
+        '<div><span class="tip-k">回撤</span> 0.00%</div>'
+    ]
+    times: list[Optional[pd.Timestamp]] = [None]
+
+    eq = float(initial_capital)
+    for i, row in df.iterrows():
+        pnl = float(row['pnl']) if pd.notna(row['pnl']) else 0.0
+        eq += pnl
+        xs.append(float(i) + 1.0)
+        eqs.append(eq)
+        ts = row['_t']
+        times.append(ts if pd.notna(ts) else None)
+        when = pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M') if pd.notna(ts) else f'#{int(i)+1}'
+        side = row['side'] if 'side' in df.columns and pd.notna(row['side']) else ''
+        side_cn = {'Long': '多', 'Short': '空'}.get(str(side), str(side) if side else '')
+        reason = ''
+        if 'exit_reason' in df.columns and pd.notna(row.get('exit_reason')):
+            reason = str(row['exit_reason'])
+        lines = [
+            f'<div class="tip-date">{html.escape(when)} · {html.escape(side_cn)} #{int(i)+1}</div>',
+            f'<div><span class="tip-k">盈亏</span> {html.escape(_fmt_signed_money(pnl))}</div>',
+            f'<div><span class="tip-k">权益</span> {html.escape(_fmt_money(eq))}</div>',
+        ]
+        if reason:
+            lines.append(f'<div><span class="tip-k">出场</span> {html.escape(str(reason))}</div>')
+        tips.append("".join(lines))
+
+    dds: list[float] = []
+    peak = eqs[0]
+    for e in eqs:
+        if e > peak:
+            peak = e
+        dds.append(((e - peak) / peak * 100.0) if peak else 0.0)
+
+    for i, dd in enumerate(dds):
+        if i == 0:
+            continue
+        tips[i] += f'<div><span class="tip-k">回撤</span> {dd:.2f}%</div>'
+
+    spans = [(float(x) - 0.5, float(x) + 0.5) for x in xs]
+
+    x_labels: list[tuple[float, str]] = []
+    n = len(xs)
+    if n:
+        pick = np.unique(np.linspace(0, n - 1, min(6, n), dtype=int))
+        for idx in pick:
+            lab = '起点'
+            if idx > 0 and times[idx] is not None:
+                lab = pd.Timestamp(times[idx]).strftime('%m/%d')
+            elif idx > 0:
+                lab = f'#{idx}'
+            x_labels.append((xs[idx], lab))
+
+    return {
+        'xs': xs,
+        'dds': dds,
+        'tips': tips,
+        'spans': spans,
+        'x_labels': x_labels,
+        'n_trades': int(len(df)),
+    }
+
+
 def _fmt_pct(x: Any, digits: int = 1) -> str:
     try:
         if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
@@ -198,6 +366,16 @@ def _fmt_num(x: Any, digits: int = 2) -> str:
 def _fmt_money(x: Any) -> str:
     try:
         return f"${float(x):,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_signed_money(x: Any) -> str:
+    try:
+        v = float(x)
+        if v >= 0:
+            return f"+${v:,.2f}"
+        return f"-${abs(v):,.2f}"
     except (TypeError, ValueError):
         return "—"
 
@@ -242,18 +420,8 @@ def _polyline(
     y_min: float,
     y_max: float,
 ) -> str:
-    n = len(xs)
-    if n == 0:
-        return ""
-    span = max(y_max - y_min, 1e-12)
-    pts = []
-    for i, (x, y) in enumerate(zip(xs, ys)):
-        if y is None or (isinstance(y, float) and np.isnan(y)):
-            continue
-        px = x0 + (i / max(n - 1, 1)) * w
-        py = y0 + h - ((float(y) - y_min) / span) * h
-        pts.append(f"{px:.2f},{py:.2f}")
-    return " ".join(pts)
+    pts = _xy_points(xs, ys, x0, y0, w, h, y_min, y_max)
+    return " ".join(f"{px:.2f},{py:.2f}" for px, py in pts)
 
 
 def _area_path(
@@ -267,20 +435,11 @@ def _area_path(
     y_max: float,
     baseline: float = 0.0,
 ) -> str:
-    n = len(xs)
-    if n == 0:
-        return ""
-    span = max(y_max - y_min, 1e-12)
-    coords = []
-    for i, y in enumerate(ys):
-        if y is None or (isinstance(y, float) and np.isnan(y)):
-            continue
-        px = x0 + (i / max(n - 1, 1)) * w
-        py = y0 + h - ((float(y) - y_min) / span) * h
-        coords.append((px, py))
+    coords = _xy_points(xs, ys, x0, y0, w, h, y_min, y_max)
     if not coords:
         return ""
-    by = y0 + h - ((baseline - y_min) / span) * h
+    yspan = max(y_max - y_min, 1e-12)
+    by = y0 + h - ((baseline - y_min) / yspan) * h
     d = [f"M {coords[0][0]:.2f} {by:.2f}"]
     for px, py in coords:
         d.append(f"L {px:.2f} {py:.2f}")
@@ -288,11 +447,117 @@ def _area_path(
     return " ".join(d)
 
 
+def _xy_points(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    x0: float,
+    y0: float,
+    w: float,
+    h: float,
+    y_min: float,
+    y_max: float,
+) -> list[tuple[float, float]]:
+    pairs = [
+        (float(x), float(y))
+        for x, y in zip(xs, ys)
+        if y is not None and not (isinstance(y, float) and np.isnan(y))
+    ]
+    if not pairs:
+        return []
+    x_min = min(p[0] for p in pairs)
+    x_max = max(p[0] for p in pairs)
+    xspan = max(x_max - x_min, 1e-12)
+    yspan = max(y_max - y_min, 1e-12)
+    out = []
+    for x, y in pairs:
+        px = x0 + (x - x_min) / xspan * w
+        py = y0 + h - ((y - y_min) / yspan) * h
+        out.append((px, py))
+    return out
+
+
 def _y_ticks(y_min: float, y_max: float, count: int = 5) -> list[float]:
     if y_max <= y_min:
         y_max = y_min + 1.0
     step = (y_max - y_min) / (count - 1)
     return [y_min + i * step for i in range(count)]
+
+
+def _chart_wrap(svg_inner: str, W: int, H: int, aria: str) -> str:
+    """包一层容器，供鼠标悬停浮层定位。"""
+    return (
+        f'<div class="chart-wrap">'
+        f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="{html.escape(aria)}">'
+        f'{svg_inner}'
+        f'</svg>'
+        f'<div class="chart-tooltip" hidden></div>'
+        f'</div>'
+    )
+
+
+def _hit_strips(
+    n: int,
+    x0: float,
+    y0: float,
+    w: float,
+    h: float,
+    tip_htmls: Sequence[str],
+    *,
+    centered: bool = False,
+) -> str:
+    """
+    每个交易日一条透明竖条，便于悬停取最近点。
+    tip_htmls[i] 为已转义的 HTML 片段（日期 + 数值）。
+    centered=True 时按柱状图中心对齐（日收益图）。
+    """
+    if n <= 0 or len(tip_htmls) != n:
+        return ""
+    strips = []
+    for i, tip in enumerate(tip_htmls):
+        if centered:
+            cx = x0 + (i + 0.5) / n * w
+            half = (w / n) * 0.5
+            rx = cx - half
+            rw = max(half * 2, 2.0)
+        else:
+            # 线型图：第 i 点在 x0 + i/(n-1)*w；条宽覆盖相邻中点
+            if n == 1:
+                rx, rw = x0, w
+            else:
+                left = 0.0 if i == 0 else (i - 0.5) / (n - 1)
+                right = 1.0 if i == n - 1 else (i + 0.5) / (n - 1)
+                rx = x0 + left * w
+                rw = max((right - left) * w, 2.0)
+        strips.append(
+            f'<rect class="hit" x="{rx:.2f}" y="{y0:.2f}" width="{rw:.2f}" height="{h:.2f}" '
+            f'data-tip="{html.escape(tip, quote=True)}"/>'
+        )
+    return "".join(strips)
+
+
+def _hit_strips_mapped(
+    x0: float,
+    y0: float,
+    w: float,
+    h: float,
+    x_min: float,
+    x_max: float,
+    spans: Sequence[tuple[float, float]],
+    tip_htmls: Sequence[str],
+) -> str:
+    """按数据 x 区间画悬停条（成交折线：每笔一条）。"""
+    if len(spans) != len(tip_htmls) or not spans:
+        return ""
+    xspan = max(float(x_max) - float(x_min), 1e-12)
+    strips = []
+    for (xa, xb), tip in zip(spans, tip_htmls):
+        rx = x0 + (float(xa) - x_min) / xspan * w
+        rw = max((float(xb) - float(xa)) / xspan * w, 2.0)
+        strips.append(
+            f'<rect class="hit" x="{rx:.2f}" y="{y0:.2f}" width="{rw:.2f}" height="{h:.2f}" '
+            f'data-tip="{html.escape(tip, quote=True)}"/>'
+        )
+    return "".join(strips)
 
 
 def _svg_equity_chart(
@@ -355,8 +620,22 @@ def _svg_equity_chart(
         if bh_pts else ""
     )
 
-    return f'''
-<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="Equity curve">
+    tips = []
+    for i, d in enumerate(dates):
+        lines = [
+            f'<div class="tip-date">{d.strftime("%Y-%m-%d")}</div>',
+            f'<div><span class="tip-k">策略</span> {_fmt_money(capital[i])}</div>',
+        ]
+        if bh_capital is not None and i < len(bh_capital):
+            bv = bh_capital[i]
+            if bv is not None and not (isinstance(bv, float) and np.isnan(bv)):
+                lines.append(
+                    f'<div><span class="tip-k">B&H</span> {_fmt_money(bv)}</div>'
+                )
+        tips.append("".join(lines))
+    hits = _hit_strips(len(dates), x0, y0, w, h, tips)
+
+    inner = f'''
   {''.join(legend)}
   {''.join(grid)}
   <line x1="{x0}" y1="{y0+h}" x2="{x0+w}" y2="{y0+h}" class="axis"/>
@@ -365,55 +644,90 @@ def _svg_equity_chart(
   <polyline points="{strat_pts}" fill="none" stroke="var(--accent)" stroke-width="2.4"
             stroke-linejoin="round" stroke-linecap="round"/>
   {''.join(x_labels)}
-</svg>
+  {hits}
 '''
+    return _chart_wrap(inner, W, H, "Equity curve")
 
 
-def _svg_drawdown_chart(dates: Sequence[datetime], drawdowns: Sequence[float]) -> str:
-    W, H = 920, 200
+def _svg_drawdown_chart(
+    dates: Sequence[datetime],
+    drawdowns: Sequence[float],
+    *,
+    path_xs: Optional[Sequence[float]] = None,
+    path_dds: Optional[Sequence[float]] = None,
+    day_tips: Optional[Sequence[str]] = None,
+    day_spans: Optional[Sequence[tuple[float, float]]] = None,
+    path_x_labels: Optional[Sequence[tuple[float, str]]] = None,
+) -> str:
+    W, H = 920, 230
     pad_l, pad_r, pad_t, pad_b = 64, 24, 20, 40
     x0, y0 = pad_l, pad_t
     w = W - pad_l - pad_r
     h = H - pad_t - pad_b
 
-    y_min = min(min(drawdowns), -0.01)
-    y_max = max(max(drawdowns), 0.0)
-    # 回撤为负值，上方留一点余量
-    if y_max < 0.5:
-        y_max = 0.5
-    xs = list(range(len(dates)))
-    area = _area_path(xs, drawdowns, x0, y0, w, h, y_min, y_max, baseline=0.0)
-    line = _polyline(xs, drawdowns, x0, y0, w, h, y_min, y_max)
+    xs = list(path_xs) if path_xs else list(range(len(dates)))
+    dds = list(path_dds) if path_dds is not None else list(drawdowns)
+    if not xs or not dds:
+        return ""
 
+    y_min = min(min(dds), -0.01)
+    y_max = 0.0
+    pad = max(abs(y_min) * 0.04, 0.15)
+    y_max_plot = y_max + pad
+    area = _area_path(xs, dds, x0, y0, w, h, y_min, y_max_plot, baseline=0.0)
+    line = _polyline(xs, dds, x0, y0, w, h, y_min, y_max_plot)
+
+    ticks = [y_min, y_min / 2.0, 0.0]
     grid = []
-    for ty in _y_ticks(y_min, y_max, 4):
-        py = y0 + h - ((ty - y_min) / max(y_max - y_min, 1e-12)) * h
+    for ty in ticks:
+        py = y0 + h - ((ty - y_min) / max(y_max_plot - y_min, 1e-12)) * h
         grid.append(
             f'<line x1="{x0}" y1="{py:.2f}" x2="{x0+w}" y2="{py:.2f}" class="grid"/>'
             f'<text x="{x0-10}" y="{py+4:.2f}" class="tick" text-anchor="end">{ty:.1f}%</text>'
         )
 
-    n = max(len(dates) - 1, 1)
+    x_min, x_max = float(min(xs)), float(max(xs))
+    xspan = max(x_max - x_min, 1e-12)
     x_labels = []
-    for i in np.linspace(0, len(dates) - 1, min(6, len(dates)), dtype=int):
-        px = x0 + (i / n) * w
-        x_labels.append(
-            f'<text x="{px:.2f}" y="{y0+h+22}" class="tick" text-anchor="middle">'
-            f'{dates[i].strftime("%m/%d")}</text>'
-        )
+    if path_x_labels:
+        for xv, lab in path_x_labels:
+            px = x0 + (float(xv) - x_min) / xspan * w
+            x_labels.append(
+                f'<text x="{px:.2f}" y="{y0+h+22}" class="tick" text-anchor="middle">'
+                f'{html.escape(lab)}</text>'
+            )
+    else:
+        for i in np.linspace(0, len(dates) - 1, min(6, len(dates)), dtype=int):
+            px = x0 + (float(i) - x_min) / xspan * w
+            x_labels.append(
+                f'<text x="{px:.2f}" y="{y0+h+22}" class="tick" text-anchor="middle">'
+                f'{dates[i].strftime("%m/%d")}</text>'
+            )
 
-    zero_y = y0 + h - ((0.0 - y_min) / max(y_max - y_min, 1e-12)) * h
+    zero_y = y0 + h - ((0.0 - y_min) / max(y_max_plot - y_min, 1e-12)) * h
 
-    return f'''
-<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="Drawdown">
+    if day_tips and day_spans:
+        hits = _hit_strips_mapped(x0, y0, w, h, x_min, x_max, day_spans, day_tips)
+    else:
+        tips = []
+        for i, d in enumerate(dates):
+            dd = drawdowns[i] if i < len(drawdowns) else 0.0
+            tips.append(
+                f'<div class="tip-date">{d.strftime("%Y-%m-%d")}</div>'
+                f'<div><span class="tip-k">日终回撤</span> {dd:.2f}%</div>'
+            )
+        hits = _hit_strips(len(dates), x0, y0, w, h, tips)
+
+    inner = f'''
   {''.join(grid)}
   <line x1="{x0}" y1="{zero_y:.2f}" x2="{x0+w}" y2="{zero_y:.2f}" class="axis"/>
   <path d="{area}" fill="var(--danger-soft)" opacity="0.9"/>
-  <polyline points="{line}" fill="none" stroke="var(--danger)" stroke-width="1.8"
-            stroke-linejoin="round"/>
+  <polyline points="{line}" fill="none" stroke="var(--danger)" stroke-width="1.6"
+            stroke-linejoin="round" stroke-linecap="round"/>
   {''.join(x_labels)}
-</svg>
+  {hits}
 '''
+    return _chart_wrap(inner, W, H, "Drawdown")
 
 
 def _svg_daily_bars(dates: Sequence[datetime], daily_ret: Sequence[float]) -> str:
@@ -433,6 +747,7 @@ def _svg_daily_bars(dates: Sequence[datetime], daily_ret: Sequence[float]) -> st
     bar_w = (w / max(n, 1)) * (1 - gap)
 
     bars = []
+    tips = []
     for i, r in enumerate(rets_pct):
         cx = x0 + (i + 0.5) / n * w
         py = y0 + h - ((r - y_min) / (y_max - y_min)) * h
@@ -443,6 +758,12 @@ def _svg_daily_bars(dates: Sequence[datetime], daily_ret: Sequence[float]) -> st
             f'<rect x="{cx - bar_w/2:.2f}" y="{top:.2f}" width="{bar_w:.2f}" '
             f'height="{max(height, 0.5):.2f}" fill="{color}" opacity="0.85" rx="1"/>'
         )
+        sign = "+" if r >= 0 else ""
+        tips.append(
+            f'<div class="tip-date">{dates[i].strftime("%Y-%m-%d")}</div>'
+            f'<div><span class="tip-k">日收益</span> {sign}{r:.2f}%</div>'
+        )
+    hits = _hit_strips(n, x0, y0, w, h, tips, centered=True)
 
     grid = []
     for ty in [-amp, 0.0, amp]:
@@ -460,13 +781,13 @@ def _svg_daily_bars(dates: Sequence[datetime], daily_ret: Sequence[float]) -> st
             f'{dates[i].strftime("%m/%d")}</text>'
         )
 
-    return f'''
-<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="Daily returns">
+    inner = f'''
   {''.join(grid)}
   {''.join(bars)}
   {''.join(x_labels)}
-</svg>
+  {hits}
 '''
+    return _chart_wrap(inner, W, H, "Daily returns")
 
 
 def _metric_cards(
@@ -515,6 +836,7 @@ def _metric_cards(
         ("波动率", _fmt_pct(vol), f"B&H {_fmt_pct(bh_vol)}" if bh_vol is not None else None, None),
         ("夏普", _fmt_num(sharpe), f"B&H {_fmt_num(bh_sharpe)}" if bh_sharpe is not None else None, sharpe),
         ("最大回撤", _fmt_pct(mdd), _mdd_card_sub(metrics, bh_mdd), -mdd if mdd else None),
+        ("当前回撤", *_current_dd_card(metrics)),
         ("Calmar", _fmt_num(calmar), f"B&H {_fmt_num(bh_calmar)}" if bh_calmar is not None else None, calmar),
     ]
     if mdd1d is not None:
@@ -537,6 +859,79 @@ def _metric_cards(
             ),
             -loss1d,
         ))
+
+    max_single_loss = _safe_metric(metrics, 'max_single_loss')
+    max_single_loss_pct = _safe_metric(metrics, 'max_single_loss_pct', 0.0)
+    if trades > 0 and max_single_loss is not None and float(max_single_loss) < 0:
+        msl_sub_parts = []
+        msl_date = _fmt_date(metrics.get('max_single_loss_date'))
+        msl_side = metrics.get('max_single_loss_side') or ''
+        if msl_date:
+            msl_sub_parts.append(f"{msl_side} {msl_date}".strip())
+        if max_single_loss_pct:
+            msl_sub_parts.append(f"逆向价差 {_fmt_pct(max_single_loss_pct, 2)}")
+        msl_reason = metrics.get('max_single_loss_exit_reason')
+        if msl_reason:
+            msl_sub_parts.append(str(msl_reason))
+        cards.append((
+            "单笔最大亏损",
+            f"${float(max_single_loss):,.2f}",
+            " · ".join(msl_sub_parts) if msl_sub_parts else None,
+            float(max_single_loss),
+        ))
+
+    liq = metrics.get('leverage_liquidation') or metrics.get('icmarkets_liquidation')
+    if isinstance(liq, Mapping) and liq.get('enabled') and liq.get('n_trades', 0) > 0:
+        so_rate = liq.get('stop_out_rate', 0.0)
+        so_cnt = liq.get('stop_out_count', 0)
+        n_tr = liq.get('n_trades', 0)
+        so_sub = f"{so_cnt}/{n_tr} 笔 · 阈值 {_fmt_pct(liq.get('stop_out_mae_thresh'), 2)}"
+        cards.append((
+            "Stop Out 触及率",
+            _fmt_pct(so_rate, 1),
+            so_sub,
+            -so_rate if so_rate else 0.0,
+        ))
+        max_mae = liq.get('max_mae_price_pct', 0.0)
+        max_mae_eq = liq.get('max_mae_equity_pct', max_mae * float(liq.get('leverage') or 1))
+        mae_date = _fmt_date(liq.get('max_mae_date'))
+        mae_side = liq.get('max_mae_side') or ''
+        mae_sub_parts = []
+        if mae_date:
+            mae_sub_parts.append(f"{mae_side} {mae_date}".strip())
+        mae_sub_parts.append(f"价格MAE {_fmt_pct(max_mae, 2)}")
+        wipe_n = liq.get('wipe_count', 0)
+        mae_sub_parts.append(f"打穿 {wipe_n}/{n_tr}")
+        cards.append((
+            "最大权益MAE",
+            _fmt_pct(max_mae_eq, 2),
+            " · ".join(mae_sub_parts),
+            -max_mae_eq if max_mae_eq else None,
+        ))
+        safe_L = liq.get('max_safe_leverage')
+        raw_L = liq.get('max_safe_leverage_raw')
+        buf = liq.get('safety_buffer', 0.9)
+        if safe_L is None and raw_L is None:
+            safe_val = "∞"
+            safe_sub = "历史无逆向 MAE"
+        else:
+            safe_val = "∞" if safe_L is None else f"{safe_L}x"
+            raw_s = f"{raw_L:.2f}x" if raw_L is not None else "∞"
+            safe_sub = f"原始 {raw_s} × {buf:.0%} 缓冲"
+        # 当前杠杆高于建议 → 标红
+        cur_L = float(liq.get('leverage') or 0)
+        signed_safe = None
+        if safe_L is not None and cur_L > safe_L:
+            signed_safe = -1.0
+        elif safe_L is not None:
+            signed_safe = 1.0
+        cards.append((
+            "建议最高安全杠杆",
+            safe_val,
+            safe_sub,
+            signed_safe,
+        ))
+
     cards.extend([
         ("日胜率", _fmt_pct(d_rate, 1) if d_rate is not None else "—", d_sub, d_rate),
         ("交易日占比", _fmt_pct(active_ratio, 1) if active_ratio is not None else "—", active_sub, None),
@@ -630,6 +1025,69 @@ def _single_day_card_sub(
     return "\n".join(lines) if lines else None
 
 
+def _current_dd_card(metrics: Mapping[str, Any]) -> tuple[str, Optional[str], float]:
+    """当前回撤卡片：(value, subtitle, signed)。"""
+    pct = float(_safe_metric(metrics, 'current_drawdown_pct', 0.0) or 0.0)
+    amt = float(_safe_metric(metrics, 'current_drawdown_amount', 0.0) or 0.0)
+    peak = _fmt_date(metrics.get('current_peak_date'))
+    days = int(_safe_metric(metrics, 'current_drawdown_trading_days', 0) or 0)
+    lines: list[str] = []
+    if peak:
+        if days <= 0:
+            lines.append(f"峰值即今日 {peak}")
+            lines.append("权益位于历史高点")
+        else:
+            lines.append(f"峰值 {peak}")
+            lines.append(f"距今 {days} 个交易日")
+            lines.append(_fmt_signed_money(amt))
+    signed = -pct if pct > 1e-8 else 0.0
+    return _fmt_pct(pct), "\n".join(lines) if lines else None, signed
+
+
+def _recent_trade_days_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    """近五个有成交日的盈亏表。"""
+    if not rows:
+        return ""
+    has_trades = any(r.get('trades') is not None for r in rows)
+    total_pnl = sum(float(r.get('pnl', 0) or 0) for r in rows)
+    body = []
+    for r in rows:
+        pnl = float(r.get('pnl', 0) or 0)
+        ret = float(r.get('ret', 0) or 0)
+        cls = "positive" if pnl >= 0 else "negative"
+        ntr = "—" if r.get('trades') is None else str(int(r['trades']))
+        trade_td = f"<td class='num'>{html.escape(ntr)}</td>" if has_trades else ""
+        body.append(
+            f"<tr>"
+            f"<td>{html.escape(_fmt_date(r.get('date')) or '?')}</td>"
+            f"{trade_td}"
+            f"<td class='num {cls}'>{html.escape(_fmt_signed_money(pnl))}</td>"
+            f"<td class='num {cls}'>{html.escape(_fmt_pct(ret, 2))}</td>"
+            f"</tr>"
+        )
+    trade_th = "<th>笔数</th>" if has_trades else ""
+    n = len(rows)
+    head_sub = f"合计 {_fmt_signed_money(total_pnl)} · 最近 {n} 个有成交日"
+    return f'''
+    <section class="panel">
+      <header class="panel-head">
+        <h2>近五个有交易日</h2>
+        <span>{html.escape(head_sub)}</span>
+      </header>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>日期</th>{trade_th}<th>盈亏</th><th>当日收益</th></tr>
+          </thead>
+          <tbody>
+            {''.join(body)}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    '''
+
+
 def _mdd_card_sub(metrics: Mapping[str, Any], bh_mdd: Any) -> Optional[str]:
     """最大回撤卡片副文案：谷底日期、口径、回撤最深三日。"""
     lines: list[str] = []
@@ -699,9 +1157,7 @@ def _drawdown_caption(
     dates: Sequence[datetime],
     drawdowns_pct: Sequence[float],
 ) -> str:
-    """
-    回撤图标题旁说明：本图为日终路径；主指标若含日内则单独注明。
-    """
+    """日终是否收复的说明；图本身按成交连线。"""
     eod = _eod_drawdown_period(dates, drawdowns_pct)
     parts: list[str] = []
     if eod:
@@ -733,6 +1189,18 @@ def _drawdown_caption(
     return " · ".join(parts) if parts else "相对历史峰值（日终）"
 
 
+def _drawdown_chart_subtitle(dd_path: Mapping[str, Any], dd_cap: str) -> str:
+    n = int(dd_path.get('n_trades') or 0)
+    parts: list[str] = []
+    if n:
+        parts.append(f"按每笔平仓后权益 · {n} 笔 · 横轴为成交顺序")
+    else:
+        parts.append("日终权益")
+    if dd_cap:
+        parts.append(dd_cap)
+    return " · ".join(parts)
+
+
 def _build_html(
     *,
     title: str,
@@ -748,13 +1216,25 @@ def _build_html(
     initial_capital: float,
     monthly: Sequence[Mapping[str, Any]],
     win_stats: Optional[Mapping[str, Any]] = None,
+    recent_days: Optional[Sequence[Mapping[str, Any]]] = None,
+    dd_path: Optional[Mapping[str, Any]] = None,
 ) -> str:
     win_stats = dict(win_stats or {})
+    dd_path = dict(dd_path or {})
     equity_svg = _svg_equity_chart(dates, capital, bh_capital, strategy_label, bh_label)
-    dd_svg = _svg_drawdown_chart(dates, drawdowns)
+    dd_svg = _svg_drawdown_chart(
+        dates,
+        drawdowns,
+        path_xs=dd_path.get('xs'),
+        path_dds=dd_path.get('dds'),
+        day_tips=dd_path.get('tips'),
+        day_spans=dd_path.get('spans'),
+        path_x_labels=dd_path.get('x_labels'),
+    )
     bars_svg = _svg_daily_bars(dates, daily_ret)
     cards = _metric_cards(metrics, initial_capital, capital[-1], win_stats=win_stats)
     monthly_html = _monthly_table(monthly, win_stats=win_stats)
+    recent_html = _recent_trade_days_table(recent_days or [])
     dd_cap = _drawdown_caption(metrics, dates, drawdowns)
     generated = datetime.now().strftime('%Y-%m-%d %H:%M')
 
@@ -895,10 +1375,44 @@ html, body {{
   color: var(--ink-soft);
   font-size: 0.8rem;
 }}
+.chart-wrap {{
+  position: relative;
+}}
 .chart {{
   width: 100%;
   height: auto;
   display: block;
+}}
+.hit {{
+  fill: transparent;
+  pointer-events: all;
+  cursor: crosshair;
+}}
+.chart-tooltip {{
+  position: absolute;
+  z-index: 5;
+  min-width: 132px;
+  max-width: 240px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.92);
+  color: #f4f6f8;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  box-shadow: 0 6px 18px rgba(20, 23, 28, 0.18);
+  transform: translate(-50%, calc(-100% - 10px));
+}}
+.chart-tooltip[hidden] {{ display: none; }}
+.chart-tooltip .tip-date {{
+  font-weight: 600;
+  margin-bottom: 4px;
+  letter-spacing: 0.01em;
+}}
+.chart-tooltip .tip-k {{
+  color: #aeb6c0;
+  margin-right: 6px;
 }}
 .grid {{ stroke: var(--line); stroke-width: 1; }}
 .axis {{ stroke: #b8c0ca; stroke-width: 1; }}
@@ -963,18 +1477,20 @@ td.num {{ text-align: right; }}
       {cards}
     </section>
 
+    {recent_html}
+
     <section class="panel">
       <header class="panel-head">
         <h2>权益曲线</h2>
-        <span>策略 vs Buy &amp; Hold · 日终资金</span>
+        <span>策略 vs Buy &amp; Hold · 日终资金 · 悬停查看当日</span>
       </header>
       {equity_svg}
     </section>
 
     <section class="panel">
       <header class="panel-head">
-        <h2>回撤（日终权益）</h2>
-        <span>{html.escape(dd_cap) if dd_cap else "相对历史峰值"}</span>
+        <h2>回撤</h2>
+        <span>{html.escape(_drawdown_chart_subtitle(dd_path, dd_cap))}</span>
       </header>
       {dd_svg}
     </section>
@@ -989,8 +1505,39 @@ td.num {{ text-align: right; }}
 
     {monthly_html}
 
-    <p class="footer">Quantra equity report · 纯 SVG 渲染，不依赖 matplotlib</p>
+    <p class="footer">Quantra equity report · SVG + 悬停提示，不依赖 matplotlib</p>
   </div>
+<script>
+(function () {{
+  document.querySelectorAll('.chart-wrap').forEach(function (wrap) {{
+    var tip = wrap.querySelector('.chart-tooltip');
+    var svg = wrap.querySelector('svg.chart');
+    if (!tip || !svg) return;
+
+    function place(evt) {{
+      var rect = wrap.getBoundingClientRect();
+      var x = evt.clientX - rect.left;
+      var y = evt.clientY - rect.top;
+      var maxX = rect.width - 8;
+      var minX = 8;
+      tip.style.left = Math.max(minX, Math.min(maxX, x)) + 'px';
+      tip.style.top = Math.max(8, y) + 'px';
+    }}
+
+    svg.querySelectorAll('rect.hit').forEach(function (hit) {{
+      hit.addEventListener('mouseenter', function (evt) {{
+        tip.innerHTML = hit.getAttribute('data-tip') || '';
+        tip.hidden = false;
+        place(evt);
+      }});
+      hit.addEventListener('mousemove', place);
+      hit.addEventListener('mouseleave', function () {{
+        tip.hidden = true;
+      }});
+    }});
+  }});
+}})();
+</script>
 </body>
 </html>
 '''

@@ -1869,7 +1869,6 @@ if __name__ == "__main__":
     if ENABLE_TRAILING_TAKE_PROFIT:
         print(f"  激活阈值: {TRAILING_TP_ACTIVATION_PCT*100:.1f}% (浮盈达到此比例后激活)")
         print(f"  保护比例: {TRAILING_TP_CALLBACK_PCT*100:.0f}% (保护最大浮盈的此比例)")
-        print("  触发后当日停止开仓: 是")
     
     print("\n--- 调试配置 ---")
     if DEBUG_MODE:

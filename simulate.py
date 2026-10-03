@@ -1600,7 +1600,6 @@ if __name__ == "__main__":
         print(f"🎯 动态追踪止盈: 已启用")
         print(f"   激活阈值: {TRAILING_TP_ACTIVATION_PCT*100:.1f}%")
         print(f"   保护比例: {TRAILING_TP_CALLBACK_PCT*100:.0f}%")
-        print(f"   触发后当日停止开仓: 是")
     else:
         print(f"🎯 动态追踪止盈: 未启用")
 
