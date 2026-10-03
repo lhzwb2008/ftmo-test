@@ -954,7 +954,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     # 🎯 动态追踪止盈状态变量
     max_profit_price = None         # 持仓期间的最优价格（多头：最高价，空头：最低价）
     trailing_tp_activated = False   # 追踪止盈是否已激活
-    trailing_tp_day_stop = False    # 当日是否已因追踪止盈平仓（触发后当日不再开仓）
     last_processed_trigger = None    # 已处理的触发点(date, k_h, k_m)，用于触发窗口内去重，避免空转刷屏
     
     while True:
@@ -1123,7 +1122,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # Funded 权益止盈是账户级永久停止，跨日不重置；挑战期百分比止盈沿用原跨日重置逻辑
             if not (ENABLE_EQUITY_TAKE_PROFIT and PROFIT_TARGET_TRIGGERED):
                 PROFIT_TARGET_TRIGGERED = False
-            trailing_tp_day_stop = False  # 🎯 重置追踪止盈当日停止开仓标志
             
             # 停止旧的监控线程
             if monitor_thread is not None and monitor_thread.is_alive():
@@ -1676,10 +1674,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     max_profit_price = None
                     trailing_tp_activated = False
                     
-                    # 🎯 追踪止盈触发后，当日不再开新仓
-                    if trailing_tp_exit:
-                        trailing_tp_day_stop = True
-                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 🎯 追踪止盈已触发，今日不再开新仓")
         else:
             # 检查是否已有持仓，如果有则不再开仓
             if position_quantity != 0:
@@ -1710,11 +1704,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已触发日内止损，今日不再开仓")
                 continue
             
-            # 🎯 追踪止盈当日已触发，不再开仓
-            if trailing_tp_day_stop:
-                if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已触发追踪止盈，跳过开仓检查")
-                continue
                 
             # 检查今日是否达到最大持仓数
             if positions_opened_today >= max_positions_per_day:

@@ -882,7 +882,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     # 🎯 动态追踪止盈状态变量
     max_profit_price = None         # 持仓期间的最优价格（多头：最高价，空头：最低价）
     trailing_tp_activated = False   # 追踪止盈是否已激活
-    trailing_tp_day_stop = False    # 追踪止盈触发后当日停止开仓
     force_close_done_date = None    # 当日 15:39 强平只提交一次，避免持仓查询滞后重复 Sell 被当成开空
     
     while True:
@@ -1169,7 +1168,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 检查是否是新交易日，如果是则重置今日开仓计数
         if last_date is not None and current_date != last_date:
             positions_opened_today = 0
-            trailing_tp_day_stop = False 
             # 打印前一日交易记录
             if DAILY_TRADES:
                 print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] ===== 前一日交易记录 ({last_date}) =====")
@@ -1448,10 +1446,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 平仓后增加交易次数计数器
                 positions_opened_today += 1
                 
-                # 🎯 追踪止盈触发后，当日不再开新仓
-                if exit_reason == "Trailing Take Profit":
-                    trailing_tp_day_stop = True
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 🎯 追踪止盈已触发，今日不再开新仓")
                 
                 position_quantity = live_symbol_qty(symbol)
                 entry_price = None
@@ -1465,11 +1459,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已有持仓，跳过开仓检查")
                 continue
             
-            # 🎯 追踪止盈当日已触发，不再开仓
-            if trailing_tp_day_stop:
-                if LOG_VERBOSE or DEBUG_MODE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已触发追踪止盈，跳过开仓检查")
-                continue
             
             # 检查是否是半交易日，如果是则不开新仓
             if is_half_day:

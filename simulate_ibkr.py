@@ -2189,7 +2189,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     # 🎯 动态追踪止盈状态变量
     max_profit_price = None         # 持仓期间的最优价格（多头：最高价，空头：最低价）
     trailing_tp_activated = False   # 追踪止盈是否已激活
-    trailing_tp_day_stop = False    # 当日是否已因追踪止盈平仓（触发后当日不再开仓）
     last_processed_trigger = None    # 已处理的触发点(date, k_h, k_m)，用于触发窗口内去重，避免空转刷屏
     pending_flatten = False          # 平仓信号已成立但 IB 尚未空仓，持续补平、不开新仓
     pending_flatten_meta = {}
@@ -2236,7 +2235,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
 
     def execute_flatten(action_label="平仓", exit_px_hint=None, count_round=False, trailing=False):
         """立刻市价平到 IB 仓位=0。失败则挂 pending，主循环短间隔补平，不等下一根 K。"""
-        nonlocal pending_flatten, pending_flatten_meta, position_quantity, trailing_tp_day_stop, positions_opened_today
+        nonlocal pending_flatten, pending_flatten_meta, position_quantity, positions_opened_today
         ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
         if pending_flatten and pending_flatten_meta.get('qty'):
             qty_for_pnl = pending_flatten_meta['qty']
@@ -2259,9 +2258,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             book_close_pnl(action_label, exit_px, qty_for_pnl, side, entry_for_book)
             if count_round:
                 positions_opened_today += 1
-            if trailing:
-                trailing_tp_day_stop = True
-                print(f"[{ts}] 追踪止盈已触发，今日不再开新仓")
             reset_local_after_flat()
             print(f"[{ts}] 平仓完成，ID: {close_order_id or 'IB_FLAT'}")
             return True
@@ -2420,7 +2416,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
             PROFIT_TARGET_TRIGGERED = False  # 重置止盈标志
-            trailing_tp_day_stop = False  # 🎯 重置追踪止盈当日停止开仓标志
             ensure_official_mnq_margin()
             
             # 停止旧的监控线程
@@ -2847,11 +2842,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
                 continue
             
-            # 🎯 追踪止盈当日已触发，不再开仓
-            if trailing_tp_day_stop:
-                if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日已触发追踪止盈，跳过开仓检查")
-                continue
                 
             # 检查今日是否达到最大持仓数
             if positions_opened_today >= max_positions_per_day:
