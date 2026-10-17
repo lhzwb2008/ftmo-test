@@ -25,7 +25,7 @@ Windows 运行前准备：
 断线：运行中自动心跳探活 + 无限重连（Gateway Auto Restart 窗口内会短暂拒连，脚本会等待恢复）。
 执行层对齐 Longport 实盘：每轮以 IB 仓位为唯一真相；下单看仓位变化不看 Filled；读仓失败不当成空仓。
 平仓：信号仍由完整 15m K 判定；一旦成立立刻市价平到仓位=0，不等当前分钟 K，失败则短间隔持续补平。
-风险：QQQ 信号 vs MNQ 存在基差；每季度需换月（更新 MNQ_EXPIRY 或依赖自动选月）；满仓保证金风险极高。
+风险：QQQ 信号 vs MNQ 存在基差；每个交易日自动选主力合约（到期前 8 天换到下一季，空仓时才切换）；满仓保证金风险极高。
 """
 
 import pandas as pd
@@ -51,7 +51,7 @@ from trend_er5_gate import history_days_back, apply_entry_gates_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
 
 try:
-    from ib_insync import IB, Future, ContFuture, MarketOrder
+    from ib_insync import IB, Future, MarketOrder
 except ImportError:
     print("请先安装 ib_insync: pip install ib_insync")
     sys.exit(1)
@@ -65,9 +65,11 @@ load_dotenv(override=True)
 # 信号品种（Longport 缓存）与执行合约（IBKR MNQ 期货）
 SYMBOL = 'QQQ.US'
 TRADE_SYMBOL = 'MNQ'
-# 合约月 YYYYMM；空字符串=自动选近月（ContFuture / reqContractDetails）
-# ⚠️ 每季度换月手动更新更稳妥（3/6/9/12 月），例如 202609 → 202612
-MNQ_EXPIRY = '202612'
+# 合约月 YYYYMM；空字符串=每个交易日自动选主力合约（推荐）
+# 自动规则：最近一个距最后交易日仍 > MNQ_ROLL_DAYS_BEFORE_EXPIRY 天的季月合约
+# CME 股指期货惯例换月日 = 到期前 8 天（周四），此后成交量与流动性转到下一季
+MNQ_EXPIRY = ''
+MNQ_ROLL_DAYS_BEFORE_EXPIRY = 8
 MNQ_POINT_VALUE = 2.0  # Micro NQ 每点 $2
 NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ≈QQQ×该比值（盈亏估算用）
 # IB Gateway（与 Configure → API → Socket port 保持一致；Paper 常见 4002，Live 常见 4001）
@@ -357,28 +359,60 @@ def ensure_market_data_service_available():
 # IBKR 执行层（MNQ 期货）
 # ============================================================================
 
-def make_mnq_contract():
-    """构造 MNQ 合约；指定 MNQ_EXPIRY 用 Future，否则用 ContFuture 自动近月。"""
-    if MNQ_EXPIRY:
-        return Future(
-            symbol=TRADE_SYMBOL,
-            lastTradeDateOrContractMonth=MNQ_EXPIRY,
-            exchange='CME',
-            currency='USD',
-        )
-    return ContFuture(symbol=TRADE_SYMBOL, exchange='CME', currency='USD')
+def _held_mnq_contract(ib):
+    """账户里仍有非零仓位的 MNQ 合约（换月时必须先管完它，不能切走）。"""
+    try:
+        for p in ib.positions():
+            if IB_ACCOUNT_ID and p.account and p.account != IB_ACCOUNT_ID:
+                continue
+            c = p.contract
+            if c.secType == 'FUT' and c.symbol == TRADE_SYMBOL and _normalize_qty(p.position) != 0:
+                return c
+    except Exception as e:
+        print(f"⚠️ 读取持仓以判断换月失败: {e}")
+    return None
+
+
+def _pick_front_mnq(details, today_str):
+    """按换月规则从 contractDetails 中选主力：最后交易日 - 换月天数 > 今天 的最近季月。"""
+    usable = []
+    for d in details:
+        c = d.contract
+        expiry = (c.lastTradeDateOrContractMonth or '')[:8]
+        if len(expiry) != 8:
+            continue
+        roll_day = (datetime.strptime(expiry, '%Y%m%d')
+                    - timedelta(days=MNQ_ROLL_DAYS_BEFORE_EXPIRY)).strftime('%Y%m%d')
+        if roll_day > today_str:
+            usable.append(c)
+    usable.sort(key=lambda c: c.lastTradeDateOrContractMonth)
+    return usable[0] if usable else None
 
 
 def resolve_mnq_contract(ib):
-    """qualify MNQ；失败时尝试 GLOBEX / 从 contractDetails 选近月。连接断开时抛出异常由上层重试。"""
+    """
+    确定当日交易的 MNQ 合约。连接断开时抛出异常由上层重试。
+    - 账户已有某月 MNQ 仓位：沿用该合约（先把仓位管完/平掉，下次空仓时再换月）
+    - MNQ_EXPIRY 指定：用指定月
+    - 否则按 MNQ_ROLL_DAYS_BEFORE_EXPIRY 自动选主力
+    """
     if ib is None or not ib.isConnected():
         raise ConnectionError('Not connected')
-    contract = make_mnq_contract()
-    qualified = ib.qualifyContracts(contract)
-    if qualified:
-        return qualified[0]
 
-    # ContFuture / 指定月失败时，拉全部 MNQ 细节选最近未到期合约
+    held = _held_mnq_contract(ib)
+    if held is not None:
+        q = ib.qualifyContracts(Future(conId=held.conId, exchange='CME'))
+        if q:
+            return q[0]
+
+    if MNQ_EXPIRY:
+        q = ib.qualifyContracts(Future(
+            symbol=TRADE_SYMBOL, lastTradeDateOrContractMonth=MNQ_EXPIRY,
+            exchange='CME', currency='USD',
+        ))
+        return q[0] if q else None
+
+    today_str = get_us_eastern_time().strftime('%Y%m%d')
     for exchange in ('CME', 'GLOBEX'):
         if not ib.isConnected():
             raise ConnectionError('Not connected')
@@ -390,23 +424,35 @@ def resolve_mnq_contract(ib):
             if 'Not connected' in str(e) or 'disconnect' in str(e).lower():
                 raise
             continue
-        if not details:
+        pick = _pick_front_mnq(details or [], today_str)
+        if pick is None:
             continue
-        today = datetime.utcnow().strftime('%Y%m%d')
-        candidates = []
-        for d in details:
-            c = d.contract
-            expiry = (c.lastTradeDateOrContractMonth or '')[:8]
-            if expiry and expiry >= today[:len(expiry)]:
-                candidates.append(c)
-        if not candidates:
-            candidates = [d.contract for d in details]
-        candidates.sort(key=lambda c: c.lastTradeDateOrContractMonth or '')
-        pick = candidates[0]
         q = ib.qualifyContracts(pick)
         if q:
             return q[0]
     return None
+
+
+def refresh_mnq_contract_for_today():
+    """每个交易日调用：空仓时按换月规则重新选合约，合约变化时打印换月日志。"""
+    global IB_CONTRACT
+    if IB_CONN is None or not IB_CONN.isConnected():
+        return
+    try:
+        new_contract = resolve_mnq_contract(IB_CONN)
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 每日合约检查失败（沿用当前合约）: {e}")
+        return
+    if new_contract is None:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 每日合约检查未选出合约（沿用当前合约）")
+        return
+    old = IB_CONTRACT
+    if old is None or old.conId != new_contract.conId:
+        old_label = (old.localSymbol or old.lastTradeDateOrContractMonth) if old else '无'
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 🔄 MNQ 换月: {old_label} → "
+              f"{new_contract.localSymbol} (expiry={new_contract.lastTradeDateOrContractMonth}, "
+              f"conId={new_contract.conId})")
+    IB_CONTRACT = new_contract
 
 
 def _safe_ib_disconnect(ib):
@@ -2417,6 +2463,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
             PROFIT_TARGET_TRIGGERED = False  # 重置止盈标志
             ensure_official_mnq_margin()
+            refresh_mnq_contract_for_today()
             
             # 停止旧的监控线程
             if monitor_thread is not None and monitor_thread.is_alive():
@@ -3053,7 +3100,7 @@ if __name__ == "__main__":
     print("-" * 60)
     print("风险提示:")
     print("  · QQQ 信号 vs MNQ 存在基差，实盘 PnL ≠ QQQ 回测")
-    print("  · 每季度换月：请更新 MNQ_EXPIRY（或设为空自动选近月）")
+    print(f"  · 换月：每个交易日自动选主力（到期前 {MNQ_ROLL_DAYS_BEFORE_EXPIRY} 天切下一季；MNQ_EXPIRY 非空则固定该月）")
     print("  · 无 CME/MNQ 期货权限时 qualify 失败即停")
     print("  · 满仓模式：按 IBKR 日内初始保证金 100% 净值估算张数（约 13x）；Error 201 减张重试；收盘前平仓")
     print("  · Gateway Lock and Exit 请用「自动重启」；脚本会心跳+自动重连，断线不退出")
