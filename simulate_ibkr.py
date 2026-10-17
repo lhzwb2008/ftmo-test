@@ -67,7 +67,7 @@ SYMBOL = 'QQQ.US'
 TRADE_SYMBOL = 'MNQ'
 # 合约月 YYYYMM；空字符串=自动选近月（ContFuture / reqContractDetails）
 # ⚠️ 每季度换月手动更新更稳妥（3/6/9/12 月），例如 202609 → 202612
-MNQ_EXPIRY = '202609'
+MNQ_EXPIRY = '202612'
 MNQ_POINT_VALUE = 2.0  # Micro NQ 每点 $2
 NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ≈QQQ×该比值（盈亏估算用）
 # IB Gateway（与 Configure → API → Socket port 保持一致；Paper 常见 4002，Live 常见 4001）
