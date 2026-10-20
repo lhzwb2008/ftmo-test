@@ -181,6 +181,15 @@ IB_CONN = None  # type: IB | None
 IB_CONTRACT = None
 IB_ACCOUNT_ID = None
 
+# 盘口估算成交：Paper 模拟器对超出盘口挂量的部分按约 0.1% 惩罚价成交，与真实 CME 不符。
+# 下单前读 IB 实时盘口（卖用 bid、买用 ask）作为估算成交价，开平配对后另记一份盈亏。
+BOOK_PNL_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)) or '.',
+    'ibkr_book_pnl.csv',
+)
+_BOOK_ENTRY = None  # {'time', 'action', 'qty', 'book_px', 'ib_px', 'commission'}
+BOOK_TOTAL_PNL = 0.0
+
 # 收益统计变量
 TOTAL_PNL = 0.0  # 总收益（累计）
 DAILY_PNL = 0.0  # 当日收益
@@ -1291,6 +1300,89 @@ def _trade_error_code(trade):
     return 0
 
 
+def snapshot_mnq_book(wait_sec=3.0):
+    """读 MNQ 实时最优买卖价 (bid, ask)。每次现订现取消：主循环阻塞 sleep 期间常驻订阅会给出旧值。"""
+    if IB_CONN is None or IB_CONTRACT is None or not IB_CONN.isConnected():
+        return None, None
+    ticker = None
+    try:
+        IB_CONN.reqMarketDataType(1)
+        ticker = IB_CONN.reqMktData(IB_CONTRACT, '', False, False)
+        deadline = time_module.time() + wait_sec
+        while time_module.time() < deadline:
+            IB_CONN.sleep(0.1)
+            bid, ask = ticker.bid, ticker.ask
+            if bid == bid and ask == ask and bid > 0 and ask > 0:
+                return float(bid), float(ask)
+        return None, None
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 读取 MNQ 盘口失败: {e}")
+        return None, None
+    finally:
+        if ticker is not None:
+            try:
+                IB_CONN.cancelMktData(IB_CONTRACT)
+            except Exception:
+                pass
+
+
+def _append_book_pnl_row(row):
+    new_file = not os.path.exists(BOOK_PNL_CSV_PATH)
+    try:
+        with open(BOOK_PNL_CSV_PATH, 'a', encoding='utf-8') as f:
+            if new_file:
+                f.write('entry_time,exit_time,side,qty,entry_book,exit_book,entry_ib,exit_ib,'
+                        'book_pnl,ib_pnl,commission\n')
+            f.write(','.join(str(row[k]) for k in (
+                'entry_time', 'exit_time', 'side', 'qty', 'entry_book', 'exit_book',
+                'entry_ib', 'exit_ib', 'book_pnl', 'ib_pnl', 'commission')) + '\n')
+    except Exception as e:
+        print(f"⚠️ 写入盘口盈亏记录失败: {e}")
+
+
+def record_book_fill(action, pos_before, pos_after, book_px, ib_px, commission):
+    """开仓记盘口入场价；平到 0 时按盘口价与 IB 成交价各算一份盈亏并落盘。"""
+    global _BOOK_ENTRY, BOOK_TOTAL_PNL
+    ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
+    if pos_before == 0 and pos_after:
+        _BOOK_ENTRY = {
+            'time': ts, 'action': action, 'qty': abs(pos_after),
+            'book_px': book_px, 'ib_px': ib_px, 'commission': commission or 0.0,
+        }
+        if book_px:
+            gap = f"，IB 成交与盘口差 {ib_px - book_px:+.2f} 点" if ib_px else ''
+            print(f"[{ts}] 盘口估算入场: {action} {abs(pos_after)} 张 @ {book_px:.2f}{gap}")
+        else:
+            print(f"[{ts}] 盘口估算入场: 未拿到实时盘口，本笔不计盘口盈亏")
+        return
+    if pos_after != 0 or not pos_before or _BOOK_ENTRY is None:
+        return
+    entry = _BOOK_ENTRY
+    _BOOK_ENTRY = None
+    direction = 1 if entry['action'] == 'BUY' else -1
+    qty = entry['qty']
+    commission_total = (entry['commission'] or 0.0) + (commission or 0.0)
+    ib_pnl = (ib_px - entry['ib_px']) * direction * qty * MNQ_POINT_VALUE - commission_total \
+        if ib_px and entry['ib_px'] else None
+    if not book_px or not entry['book_px']:
+        print(f"[{ts}] 盘口估算平仓: 缺少盘口价，本笔不计盘口盈亏")
+        return
+    book_pnl = (book_px - entry['book_px']) * direction * qty * MNQ_POINT_VALUE - commission_total
+    BOOK_TOTAL_PNL += book_pnl
+    ib_txt = f"，IB 模拟成交盈亏 ${ib_pnl:+,.2f}" if ib_pnl is not None else ''
+    print(f"[{ts}] 盘口估算盈亏: {entry['book_px']:.2f} → {book_px:.2f} × {qty} 张 = ${book_pnl:+,.2f}"
+          f"（含佣金 ${commission_total:.2f}）{ib_txt}；盘口累计 ${BOOK_TOTAL_PNL:+,.2f}")
+    _append_book_pnl_row({
+        'entry_time': entry['time'], 'exit_time': ts,
+        'side': 'LONG' if direction > 0 else 'SHORT', 'qty': qty,
+        'entry_book': entry['book_px'], 'exit_book': book_px,
+        'entry_ib': entry['ib_px'] or '', 'exit_ib': ib_px or '',
+        'book_pnl': round(book_pnl, 2),
+        'ib_pnl': round(ib_pnl, 2) if ib_pnl is not None else '',
+        'commission': round(commission_total, 2),
+    })
+
+
 def place_ib_market(action, quantity):
     """
     市价单。action: 'BUY' | 'SELL'；quantity > 0（张）。
@@ -1339,6 +1431,10 @@ def place_ib_market(action, quantity):
             continue
 
         local = (IB_CONTRACT.localSymbol or TRADE_SYMBOL) if IB_CONTRACT else TRADE_SYMBOL
+        book_bid, book_ask = snapshot_mnq_book()
+        book_px = book_ask if action == 'BUY' else book_bid
+        if book_px:
+            print(f"[{ts}] 下单前 MNQ 盘口: bid={book_bid:.2f} ask={book_ask:.2f}")
         try:
             order = _ib_market_order(action, quantity)
             trade = IB_CONN.placeOrder(IB_CONTRACT, order)
@@ -1387,6 +1483,8 @@ def place_ib_market(action, quantity):
                     print(f"[{ts}] 订单状态非 Filled（常为 10349/预设改 TIF），但仓位已变，按成交处理")
                 last['ok'] = True
                 last['error_code'] = 0
+                if pos is not None:
+                    record_book_fill(action, pos_before, pos, book_px, avg_fill, commission)
                 return last
 
             if err_code == 201:
