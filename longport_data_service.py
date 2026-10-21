@@ -311,7 +311,19 @@ def run_service():
         except Exception as e:
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 行情缓存更新失败: {str(e)}")
 
-        time_module.sleep(REFRESH_INTERVAL_SECONDS)
+        time_module.sleep(seconds_to_next_refresh())
+
+
+def seconds_to_next_refresh():
+    """对齐到每分钟第 2 秒起、每 REFRESH_INTERVAL_SECONDS 一次，保证分钟结束后几秒内即抓到定型 K 线。"""
+    now = time_module.time()
+    offset = 2
+    interval = max(1, REFRESH_INTERVAL_SECONDS)
+    pos = (now - offset) % 60
+    slots_left = (60 - pos) if interval >= 60 else (interval - pos % interval)
+    if pos + slots_left > 60:
+        slots_left = 60 - pos
+    return max(0.5, slots_left)
 
 
 if __name__ == "__main__":
