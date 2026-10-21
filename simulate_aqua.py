@@ -518,36 +518,6 @@ def calculate_pnl(entry_price, exit_price, direction):
     
     return pnl, pnl_pct
 
-def wait_for_final_candle(symbol, candle_date, candle_time, timeout_sec=40):
-    """
-    等缓存里 candle_time 这根 1 分钟 K 线在该分钟结束后被重新抓取过（定型），再做信号判断。
-    缓存服务约 20 秒刷新一次，整分时读到的可能是半截 K 线，多实例会因此读到不同收盘价。
-    """
-    eastern = pytz.timezone('US/Eastern')
-    minute_start = eastern.localize(datetime.combine(candle_date, datetime.strptime(candle_time, "%H:%M").time()))
-    final_after = (minute_start + timedelta(minutes=1, seconds=2)).strftime("%Y-%m-%d %H:%M:%S")
-    deadline = time_module.time() + timeout_sec
-    updated_at = None
-    while True:
-        try:
-            conn = sqlite3.connect(MARKET_DATA_DB_PATH)
-            row = conn.execute(
-                "SELECT updated_at FROM candles WHERE symbol = ? AND date = ? AND time = ?",
-                (symbol, candle_date.isoformat(), candle_time),
-            ).fetchone()
-            conn.close()
-            updated_at = row[0] if row else None
-        except Exception as e:
-            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 检查K线定型失败: {e}")
-        if updated_at and updated_at >= final_after:
-            return True
-        if time_module.time() >= deadline:
-            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ {candle_time} K线等待 {timeout_sec}s 仍未定型"
-                  f"（缓存更新于 {updated_at or '无'}），按现有数据判断")
-            return False
-        time_module.sleep(1)
-
-
 def get_historical_data(symbol, days_back=None):
     if days_back is None:
         days_back = history_days_back(LOOKBACK_DAYS)
@@ -1440,8 +1410,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 last_processed_trigger = (now.date(), k_h, k_m)
                 check_time_str = f"{k_h:02d}:{k_m:02d}"
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发检查，使用 {check_time_str} 的K线数据")
-                if not DEBUG_MODE:
-                    wait_for_final_candle(symbol, now.date(), check_time_str)
             else:
                 # 如果没有找到合适的触发时间，跳过本次检查
                 continue
