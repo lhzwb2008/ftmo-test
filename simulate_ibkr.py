@@ -28,6 +28,7 @@ Windows 运行前准备：
 风险：QQQ 信号 vs MNQ 存在基差；每个交易日自动选主力合约（到期前 8 天换到下一季，空仓时才切换）；满仓保证金风险极高。
 """
 
+import asyncio
 import pandas as pd
 from datetime import datetime, time, timedelta, date as date_type
 import time as time_module
@@ -74,8 +75,10 @@ MNQ_POINT_VALUE = 2.0  # Micro NQ 每点 $2
 NQ_QQQ_RATIO = float(os.environ.get('NQ_QQQ_RATIO', '41.45'))  # NQ≈QQQ×该比值（盈亏估算用）
 # IB Gateway（与 Configure → API → Socket port 保持一致；Paper 常见 4002，Live 常见 4001）
 IB_HOST = '127.0.0.1'
-IB_PORT = 4002
+IB_PORT = 4001
 IB_CLIENT_ID = 1
+# 同步请求（reqPositions/心跳/qualify 等）超时秒数；0=无限等，Gateway 23:45 自动重启时会永久卡死
+IB_REQUEST_TIMEOUT_SEC = 15
 IB_ACCOUNT = ''  # 空=自动取 managedAccounts[0]
 # Gateway 每日强制 Auto Logoff/Auto Restart；断线后自动重试，避免进程退出
 IB_RECONNECT_INTERVAL_SEC = 45       # 重连间隔（秒）；Gateway 自动重启常需数分钟
@@ -133,10 +136,10 @@ MAX_MNQ_CONTRACTS = 0
 _ACCOUNT_SUMMARY_SUBSCRIBED = False
 
 # 资金和风控设置（仓位按 IB 实时净值满仓；日志/盈亏% 用固定初始资金）
-# Paper 已重置为 $100,000；进程重启后累计盈亏仍相对此基数，不改用当时净值
-PAPER_INITIAL_CAPITAL = 100_000.0
+# 实盘入金 $4,500；进程重启后累计盈亏仍相对此基数，不改用当时净值
+START_CAPITAL = 4_500.0
 ACCOUNT_START_BALANCE = None
-INITIAL_CAPITAL = PAPER_INITIAL_CAPITAL
+INITIAL_CAPITAL = START_CAPITAL
 LEVERAGE = None  # 兼容旧日志字段；期货满仓模式下不再使用
 
 # 可选账户级止盈/日内止损（自营默认关闭；设正数启用）
@@ -268,7 +271,7 @@ def apply_ib_account_capital():
         time_module.sleep(IB_RECONNECT_INTERVAL_SEC)
 
     ACCOUNT_START_BALANCE = balance
-    INITIAL_CAPITAL = PAPER_INITIAL_CAPITAL
+    INITIAL_CAPITAL = START_CAPITAL
     avail = get_ib_buying_power()
     print(f"IB 账户净值(NetLiquidation): ${balance:,.2f}")
     print(f"初始资金(盈亏基数): ${INITIAL_CAPITAL:,.2f}")
@@ -277,7 +280,7 @@ def apply_ib_account_capital():
         if drift > 0.15:
             print(f"⚠️ IB 净值与初始资金相差 {drift:.0%}；"
                   f"仓位仍按实时净值满仓，累计盈亏% 按 ${INITIAL_CAPITAL:,.0f} 计。"
-                  f"若刚提交 Paper 重置，需等下一工作日到账后再启动。")
+                  f"若入金未到账，请确认后再交易。")
     if avail > 0:
         print(f"可用保证金/购买力: ${avail:,.2f} → 开仓按满仓估算张数（使用 {MARGIN_USAGE_PCT*100:.0f}%）")
     else:
@@ -525,6 +528,7 @@ def _ib_try_connect(verbose=True):
         print("-" * 60)
 
     ib = IB()
+    ib.RequestTimeout = IB_REQUEST_TIMEOUT_SEC
     try:
         ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, readonly=False, timeout=20)
     except Exception as e:
@@ -1240,9 +1244,11 @@ def get_ib_position_qty(refresh=True):
                 total += float(p.position)
         return _normalize_qty(total)
     except Exception as e:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 读取 IB 仓位失败: {e}")
+        timed_out = isinstance(e, (TimeoutError, asyncio.TimeoutError))
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 读取 IB 仓位失败: "
+              f"{'请求超时' if timed_out else e}")
         err = str(e).lower()
-        if 'socket' in err or 'disconnect' in err or '10053' in err or '10054' in err:
+        if timed_out or 'socket' in err or 'disconnect' in err or '10053' in err or '10054' in err:
             ib_disconnect()
         return None
 
