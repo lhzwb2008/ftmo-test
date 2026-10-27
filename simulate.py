@@ -25,6 +25,7 @@ from k_side_adjust import effective_k1_for_time, format_k_strategy_params
 from strategy_params import (
     LOOKBACK_DAYS, K1, K2, ENABLE_K_SIDE_ADJUSTMENT, USE_VWAP,
     ENABLE_TRAILING_TAKE_PROFIT, TRAILING_TP_ACTIVATION_PCT, TRAILING_TP_CALLBACK_PCT,
+    STRATEGY_VERSION,
 )
 import quiet_open
 
@@ -1590,6 +1591,7 @@ if __name__ == "__main__":
         print("调试模式已开启")
     prompt_leverage()
     print(f"策略参数: {format_k_strategy_params(K1, K2, LOOKBACK_DAYS, ENABLE_K_SIDE_ADJUSTMENT)}")
+    print(f"策略版本: {STRATEGY_VERSION}")
     print(quiet_open.describe())
     # 🎯 显示动态追踪止盈配置
     if ENABLE_TRAILING_TAKE_PROFIT:

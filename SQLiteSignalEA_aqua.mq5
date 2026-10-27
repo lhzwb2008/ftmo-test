@@ -5,7 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.04"
+#property version   "1.05"
+#define   EA_BUILD   "2026-10-27 R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -64,6 +65,8 @@ double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type)
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    Print("🏷️ EA 版本 ", EA_BUILD, " | 文件 ", __FILE__,
+          " | 编译于 ", TimeToString(__DATETIME__, TIME_DATE | TIME_MINUTES));
     if(!ResolveInstanceSettings())
         return(INIT_PARAMETERS_INCORRECT);
 

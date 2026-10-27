@@ -7,7 +7,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.02"
+#property version   "1.03"
+#define   EA_BUILD   "2026-10-27 R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 #property script_show_inputs
@@ -83,6 +84,8 @@ void   DailyProfitCapCheck();
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    Print("🏷️ EA 版本 ", EA_BUILD, " | 文件 ", __FILE__,
+          " | 编译于 ", TimeToString(__DATETIME__, TIME_DATE | TIME_MINUTES));
     if(!ResolveInstanceSettings())
         return(INIT_PARAMETERS_INCORRECT);
 

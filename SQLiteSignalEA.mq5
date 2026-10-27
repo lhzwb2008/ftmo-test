@@ -4,7 +4,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.01"
+#property version   "1.02"
+#define   EA_BUILD   "2026-10-27 R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -32,6 +33,8 @@ double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.s
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    Print("🏷️ EA 版本 ", EA_BUILD, " | 文件 ", __FILE__,
+          " | 编译于 ", TimeToString(__DATETIME__, TIME_DATE | TIME_MINUTES));
     // 设置魔术数字
     trade.SetExpertMagicNumber(MagicNumber);
     
