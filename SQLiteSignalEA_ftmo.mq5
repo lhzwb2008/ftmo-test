@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.03"
-#define   EA_BUILD   "2026-10-27 R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-10-27b R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -48,6 +48,7 @@ datetime last_status_write = 0;       // 上次写 ea_daily_status 状态表的�
 
 //--- 权益止盈状态（通过 GlobalVariables 持久化；触发后永久停止开仓，直到 ForceResetEquityTP）
 bool     equity_tp_halted = false;
+bool     tp_halted_column_checked = false;  // ea_daily_status 的 tp_halted 列本次运行已确认存在
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -811,8 +812,21 @@ void WriteDailyStatus(string reason)
                         "anchor REAL, equity REAL, loss_floor REAL, updated_at TEXT, "
                         "tp_halted INTEGER DEFAULT 0)";
     DatabaseExecute(db_handle, create_sql);
-    // 兼容旧库：若无 tp_halted 列则补充（已存在时 SQLite 会报错，忽略即可）
-    DatabaseExecute(db_handle, "ALTER TABLE ea_daily_status ADD COLUMN tp_halted INTEGER DEFAULT 0");
+    // 兼容旧库：先查列是否存在，避免重复 ALTER 时 MT5 打印 duplicate column 错误
+    if(!tp_halted_column_checked)
+    {
+        int req = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM pragma_table_info('ea_daily_status') WHERE name = 'tp_halted'");
+        long has_col = 0;
+        if(req != INVALID_HANDLE)
+        {
+            if(DatabaseRead(req))
+                DatabaseColumnLong(req, 0, has_col);
+            DatabaseFinalize(req);
+        }
+        if(has_col == 0)
+            DatabaseExecute(db_handle, "ALTER TABLE ea_daily_status ADD COLUMN tp_halted INTEGER DEFAULT 0");
+        tp_halted_column_checked = true;
+    }
     
     string sql = StringFormat(
         "INSERT INTO ea_daily_status (id, server_day, halted, reason, anchor, equity, loss_floor, updated_at, tp_halted) "
