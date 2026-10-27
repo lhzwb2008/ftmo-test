@@ -1896,7 +1896,9 @@ def run_backtest(config):
         buy_hold_df['capital'] = initial_capital * (1 + buy_hold_df['daily_return']).cumprod().fillna(1)
     
     # 计算月度回报
-    monthly = daily_df.resample('ME').first()[['capital']].rename(columns={'capital': 'month_start'})
+    # capital 是当日收盘后资金，月初资金需扣掉当月第一天的收益
+    day_start_capital = daily_df['capital'] / (1 + daily_df['daily_return'])
+    monthly = day_start_capital.resample('ME').first().to_frame('month_start')
     monthly['month_end'] = daily_df.resample('ME').last()['capital']
     monthly['monthly_return'] = monthly['month_end'] / monthly['month_start'] - 1
     
