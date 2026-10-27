@@ -5,3 +5,4 @@ __pycache__
 *.backup
 *.csv
 ibkr_mnq_margin.json
+reports/*.txt
