@@ -8,7 +8,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.03"
-#define   EA_BUILD   "2026-10-27 R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-10-27c 初始资金读 simulate"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 #property script_show_inputs
@@ -45,6 +45,7 @@ input double   DailyProfitCapUSD = 1100.0;             // Funded 日盈上限 US
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到，回退 input）
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 string   g_db_path = "";              // 运行时: trading_signals_aqua_paylater_{InstanceId}.db
 int      g_magic = 0;                 // 运行时魔术号 = 20260818 + InstanceId
@@ -100,6 +101,7 @@ int OnInit()
         Print("❌ 无法打开SQLite数据库");
         return(INIT_FAILED);
     }
+    LoadSimInitialBalance(true);
     
     Print("✅ EA初始化成功 — Aqua Pay Later");
     Print("🧩 编译版本: 1.02（开仓前校验止损；服务器 Invalid stops 只拒绝一次，不再重试）");
@@ -109,7 +111,7 @@ int OnInit()
     Print("🪄 Magic: ", g_magic);
     Print("💰 杠杆: ", Leverage, "倍");
     Print("📊 使用余额: ", RiskPercent, "%");
-    Print("💵 InitialBalance: $", DoubleToString(InitialBalance, 2));
+    Print("💵 EffInitialBalance(): $", DoubleToString(EffInitialBalance(), 2));
     
     if(g_daily_loss_pct > 0)
     {
@@ -123,7 +125,7 @@ int OnInit()
     
     if(g_hard_sl_pct > 0)
         Print("🛡️ 单笔硬止损(浮亏封号兜底): 初始资金 × ", g_hard_sl_pct,
-              "% = $", DoubleToString(InitialBalance * g_hard_sl_pct / 100.0, 2));
+              "% = $", DoubleToString(EffInitialBalance() * g_hard_sl_pct / 100.0, 2));
     else
         Print("🛡️ 单笔硬止损: 已禁用");
 
@@ -222,7 +224,7 @@ double CalcHardSLDistance(double lots)
     
     // 每1.0手每1个价格单位的亏损金额
     double loss_per_unit = tick_value / tick_size;
-    double risk_amount = InitialBalance * (g_hard_sl_pct / 100.0);
+    double risk_amount = EffInitialBalance() * (g_hard_sl_pct / 100.0);
     
     double distance = risk_amount / (loss_per_unit * lots);
     
@@ -570,12 +572,59 @@ bool OpenDatabase()
 }
 
 //+------------------------------------------------------------------+
+//| 账户初始资金：优先用 simulate 写入 sim_config 的起始资金，
+//| 读不到时用 input InitialBalance
+//+------------------------------------------------------------------+
+double EffInitialBalance()
+{
+    return (g_sim_initial_balance > 0) ? g_sim_initial_balance : InitialBalance;
+}
+
+void LoadSimInitialBalance(bool force)
+{
+    static datetime last_load = 0;
+    if(db_handle == INVALID_HANDLE)
+        return;
+    if(!force && TimeLocal() - last_load < 30)
+        return;
+    last_load = TimeLocal();
+
+    long has_table = 0;
+    int req = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sim_config'");
+    if(req == INVALID_HANDLE)
+        return;
+    if(DatabaseRead(req))
+        DatabaseColumnLong(req, 0, has_table);
+    DatabaseFinalize(req);
+    if(has_table == 0)
+    {
+        if(force)
+            Print("⚠️ 未找到 simulate 写入的起始资金，暂用 EA input InitialBalance=$", DoubleToString(InitialBalance, 2));
+        return;
+    }
+
+    double value = 0;
+    req = DatabasePrepare(db_handle, "SELECT value FROM sim_config WHERE key = 'account_start_balance'");
+    if(req == INVALID_HANDLE)
+        return;
+    if(DatabaseRead(req))
+        DatabaseColumnDouble(req, 0, value);
+    DatabaseFinalize(req);
+    if(value <= 0 || MathAbs(value - g_sim_initial_balance) < 0.005)
+        return;
+    g_sim_initial_balance = value;
+    Print("🔗 账户初始资金已从 simulate 同步: $", DoubleToString(value, 2),
+          "（EA input InitialBalance=$", DoubleToString(InitialBalance, 2), " 不再使用）");
+}
+
+//+------------------------------------------------------------------+
 //| 检查数据库信号                                                    |
 //+------------------------------------------------------------------+
 void CheckDatabaseSignals()
 {
     if(db_handle == INVALID_HANDLE)
         return;
+    LoadSimInitialBalance(false);
     
     // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
     string query = "SELECT id, action, size_mult FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
@@ -1008,7 +1057,7 @@ double CalculateLotSize()
 //|    触及触发线的换算价）。SL 挂在服务器上，即使 EA/终端/VPS 全部     |
 //|    失联，broker 服务器也会自动执行                                 |
 //| 3) 状态写回 ea_daily_status 表，Python 模拟端镜像记账              |
-//| 注意：本文件限额基于 InitialBalance                                  |
+//| 注意：本文件限额基于账户初始资金                                |
 //+------------------------------------------------------------------+
 
 string DailyGVName(string suffix)
@@ -1018,7 +1067,7 @@ string DailyGVName(string suffix)
 
 double DailyLossLimitUSD()
 {
-    return InitialBalance * g_daily_loss_pct / 100.0;
+    return EffInitialBalance() * g_daily_loss_pct / 100.0;
 }
 
 double DailyTriggerFloor()

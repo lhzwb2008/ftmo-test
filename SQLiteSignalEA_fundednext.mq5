@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-10-27 R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-10-27c 初始资金读 simulate"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -24,7 +24,7 @@ input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 input double   InitialBalance = 6000.0;                // 账户初始资金（FundedNext风控按初始资金计算）
 input double   HardSLRiskPercent = 2.5;                // 单笔硬止损(%)（Funded 账户必填，官方上限3%留0.5%；Challenge 请设 0 禁用）
 
-//--- 日内亏损风控参数（EA端基于真实权益逐tick监控，Python端不再负责日内止损；限额基于 InitialBalance）
+//--- 日内亏损风控参数（EA端基于真实权益逐tick监控，Python端不再负责日内止损；限额基于账户初始资金，见 EffInitialBalance）
 input double   DailyLossPercent = 5.0;                 // 官方日内最大亏损比例(%)（FundedNext 官方 5；0=禁用）
 input double   DailyLossBufferPercent = 5.0;           // 触发缓冲(%，占日亏限额比例)（覆盖滑点/跳空，重大数据日建议调大）
 input int      DailyResetServerHour = 0;               // 日亏锚点重置时间（服务器小时，0=服务器午夜，需与考试商日重置一致）
@@ -34,6 +34,7 @@ input bool     ForceResetDailyRisk = false;            // 强制重置日内锚�
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到，回退 input）
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 
 //--- 日内亏损风控状态（通过 GlobalVariables 持久化，EA 重启不丢失）
@@ -73,6 +74,7 @@ int OnInit()
         Print("❌ 无法打开SQLite数据库");
         return(INIT_FAILED);
     }
+    LoadSimInitialBalance(true);
     
     Print("✅ EA初始化成功");
     Print("🧩 编译版本: 1.03（开仓前校验止损；服务器 Invalid stops 只拒绝一次，不再重试）");
@@ -84,15 +86,15 @@ int OnInit()
     {
         DailyRiskLoadOrReset();
         Print("🛡️ 日内止损(EA端): 限额=$", DoubleToString(DailyLossLimitUSD(), 2),
-              " (初始资金 $", DoubleToString(InitialBalance, 2), " × ", DailyLossPercent, "%)",
+              " (初始资金 $", DoubleToString(EffInitialBalance(), 2), " × ", DailyLossPercent, "%)",
               " 缓冲=", DailyLossBufferPercent, "% 触发线权益=$", DoubleToString(DailyTriggerFloor(), 2));
     }
     else
         Print("🛡️ 日内止损(EA端): 已禁用");
     
     if(HardSLRiskPercent > 0)
-        Print("🛡️ 单笔硬止损: 初始资金 $", DoubleToString(InitialBalance, 2), " × ", HardSLRiskPercent,
-              "% = $", DoubleToString(InitialBalance * HardSLRiskPercent / 100.0, 2),
+        Print("🛡️ 单笔硬止损: 初始资金 $", DoubleToString(EffInitialBalance(), 2), " × ", HardSLRiskPercent,
+              "% = $", DoubleToString(EffInitialBalance() * HardSLRiskPercent / 100.0, 2),
               " （与日亏线SL取更紧者；Challenge 请将 HardSLRiskPercent 设为 0）");
     else
         Print("🛡️ 单笔硬止损: 已禁用（Challenge 模式）");
@@ -158,7 +160,7 @@ double CalcHardSLDistance(double lots)
     
     // 每1.0手每1个价格单位的亏损金额
     double loss_per_unit = tick_value / tick_size;
-    double risk_amount = InitialBalance * (HardSLRiskPercent / 100.0);
+    double risk_amount = EffInitialBalance() * (HardSLRiskPercent / 100.0);
     
     double distance = risk_amount / (loss_per_unit * lots);
     
@@ -487,12 +489,59 @@ bool OpenDatabase()
 }
 
 //+------------------------------------------------------------------+
+//| 账户初始资金：优先用 simulate 写入 sim_config 的起始资金，
+//| 读不到时用 input InitialBalance
+//+------------------------------------------------------------------+
+double EffInitialBalance()
+{
+    return (g_sim_initial_balance > 0) ? g_sim_initial_balance : InitialBalance;
+}
+
+void LoadSimInitialBalance(bool force)
+{
+    static datetime last_load = 0;
+    if(db_handle == INVALID_HANDLE)
+        return;
+    if(!force && TimeLocal() - last_load < 30)
+        return;
+    last_load = TimeLocal();
+
+    long has_table = 0;
+    int req = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sim_config'");
+    if(req == INVALID_HANDLE)
+        return;
+    if(DatabaseRead(req))
+        DatabaseColumnLong(req, 0, has_table);
+    DatabaseFinalize(req);
+    if(has_table == 0)
+    {
+        if(force)
+            Print("⚠️ 未找到 simulate 写入的起始资金，暂用 EA input InitialBalance=$", DoubleToString(InitialBalance, 2));
+        return;
+    }
+
+    double value = 0;
+    req = DatabasePrepare(db_handle, "SELECT value FROM sim_config WHERE key = 'account_start_balance'");
+    if(req == INVALID_HANDLE)
+        return;
+    if(DatabaseRead(req))
+        DatabaseColumnDouble(req, 0, value);
+    DatabaseFinalize(req);
+    if(value <= 0 || MathAbs(value - g_sim_initial_balance) < 0.005)
+        return;
+    g_sim_initial_balance = value;
+    Print("🔗 账户初始资金已从 simulate 同步: $", DoubleToString(value, 2),
+          "（EA input InitialBalance=$", DoubleToString(InitialBalance, 2), " 不再使用）");
+}
+
+//+------------------------------------------------------------------+
 //| 检查数据库信号                                                    |
 //+------------------------------------------------------------------+
 void CheckDatabaseSignals()
 {
     if(db_handle == INVALID_HANDLE)
         return;
+    LoadSimInitialBalance(false);
     
     // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
     string query = "SELECT id, action, size_mult FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
@@ -924,7 +973,7 @@ double CalculateLotSize()
 //|    触及触发线的换算价）。SL 挂在服务器上，即使 EA/终端/VPS 全部     |
 //|    失联，broker 服务器也会自动执行                                 |
 //| 3) 状态写回 ea_daily_status 表，Python 模拟端镜像记账              |
-//| 注意：本文件限额基于 InitialBalance                                  |
+//| 注意：本文件限额基于账户初始资金                                |
 //+------------------------------------------------------------------+
 
 string DailyGVName(string suffix)
@@ -934,7 +983,7 @@ string DailyGVName(string suffix)
 
 double DailyLossLimitUSD()
 {
-    return InitialBalance * DailyLossPercent / 100.0;
+    return EffInitialBalance() * DailyLossPercent / 100.0;
 }
 
 double DailyTriggerFloor()

@@ -39,6 +39,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 - 上一版实盘（K2=1.04、午后 K1=0.9、range1<=0.029、无冷清半仓）见 git tag `live-G-20260718`。
 - 开盘冷清半仓（`quiet_open.py`）：当日 09:30–09:39 成交量 / 前 20 个交易日同窗口均值 < 0.65 时，当日开仓手数 ×0.5。MT5 路径写入 `signals.size_mult`，EA 在 `CalculateLotSize()` 结果上乘系数并按步长向下取整（不低于最小手数）；`simulate.py` / `simulate_ibkr.py` / `simulate_futures_core.py` 在 Python 端缩小数量（期货 1 张时保持 1 张）。
 - 分钟历史窗口 35 个自然日（`history_days_back`），`longport_data_service.py` 每天首轮及每 30 分钟拉一次完整窗口，其余轮次只拉当日。
+- 账户初始资金：simulate 启动时把输入的"账户起始资金"写入信号库 `sim_config` 表（key=`account_start_balance`），EA 在 OnInit 及之后每 30 秒读取，用于日亏限额 / 硬止损 / 静态回撤；读不到时回退 EA input `InitialBalance` / `AccountInitialBalance`。启动日志出现"🔗 账户初始资金已从 simulate 同步"即生效。已开仓位的保护性 SL 只收紧不放松，初始资金调大后对当前持仓不会放宽。
 - 部署顺序：`longport_data_service.py` → `simulate_*.py`（启动时重建 signals 表，带 `size_mult` 列）→ 在 MetaEditor 重新编译并重载 EA（Leverage 等 inputs 不变）。新 EA 读旧表时自动回退为满仓，旧 EA 读新表忽略 `size_mult`，顺序颠倒不会出错，只是冷清减仓不生效。
 
 ### Key gotchas

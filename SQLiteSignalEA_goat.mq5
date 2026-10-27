@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.02"
-#define   EA_BUILD   "2026-10-27 R+开盘冷清半仓(size_mult)"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-10-27c 初始资金读 simulate"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -33,6 +33,7 @@ input bool     ForceResetDailyRisk = false;            // 强制重置日内锚�
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到，回退 input）
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 bool last_terminal_connected = true;
 
@@ -58,6 +59,7 @@ int OnInit()
         Print("❌ 无法打开SQLite数据库");
         return(INIT_FAILED);
     }
+    LoadSimInitialBalance(true);
     
     // 启动定时器：Goat 原生 MT5 长时间挂机易断线，断线后 OnTick 不触发，定时器兜底轮询 DB
     EventSetTimer(CheckIntervalSeconds);
@@ -71,7 +73,7 @@ int OnInit()
     {
         DailyRiskLoadOrReset();
         Print("🛡️ 日内止损(EA端): 限额=$", DoubleToString(DailyLossLimitUSD(), 2),
-              " (初始资金 $", DoubleToString(AccountInitialBalance, 2), " × ", DailyLossPercent, "%)",
+              " (初始资金 $", DoubleToString(EffInitialBalance(), 2), " × ", DailyLossPercent, "%)",
               " 缓冲=", DailyLossBufferPercent, "% 触发线权益=$", DoubleToString(DailyTriggerFloor(), 2));
     }
     else
@@ -204,12 +206,59 @@ bool OpenDatabase()
 }
 
 //+------------------------------------------------------------------+
+//| 账户初始资金：优先用 simulate 写入 sim_config 的起始资金，
+//| 读不到时用 input AccountInitialBalance
+//+------------------------------------------------------------------+
+double EffInitialBalance()
+{
+    return (g_sim_initial_balance > 0) ? g_sim_initial_balance : AccountInitialBalance;
+}
+
+void LoadSimInitialBalance(bool force)
+{
+    static datetime last_load = 0;
+    if(db_handle == INVALID_HANDLE)
+        return;
+    if(!force && TimeLocal() - last_load < 30)
+        return;
+    last_load = TimeLocal();
+
+    long has_table = 0;
+    int req = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sim_config'");
+    if(req == INVALID_HANDLE)
+        return;
+    if(DatabaseRead(req))
+        DatabaseColumnLong(req, 0, has_table);
+    DatabaseFinalize(req);
+    if(has_table == 0)
+    {
+        if(force)
+            Print("⚠️ 未找到 simulate 写入的起始资金，暂用 EA input AccountInitialBalance=$", DoubleToString(AccountInitialBalance, 2));
+        return;
+    }
+
+    double value = 0;
+    req = DatabasePrepare(db_handle, "SELECT value FROM sim_config WHERE key = 'account_start_balance'");
+    if(req == INVALID_HANDLE)
+        return;
+    if(DatabaseRead(req))
+        DatabaseColumnDouble(req, 0, value);
+    DatabaseFinalize(req);
+    if(value <= 0 || MathAbs(value - g_sim_initial_balance) < 0.005)
+        return;
+    g_sim_initial_balance = value;
+    Print("🔗 账户初始资金已从 simulate 同步: $", DoubleToString(value, 2),
+          "（EA input AccountInitialBalance=$", DoubleToString(AccountInitialBalance, 2), " 不再使用）");
+}
+
+//+------------------------------------------------------------------+
 //| 检查数据库信号                                                    |
 //+------------------------------------------------------------------+
 void CheckDatabaseSignals()
 {
     if(db_handle == INVALID_HANDLE)
         return;
+    LoadSimInitialBalance(false);
     
     // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
     string query = "SELECT id, action, size_mult FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
@@ -625,7 +674,7 @@ string DailyGVName(string suffix)
 
 double DailyLossLimitUSD()
 {
-    return AccountInitialBalance * DailyLossPercent / 100.0;
+    return EffInitialBalance() * DailyLossPercent / 100.0;
 }
 
 double DailyTriggerFloor()

@@ -271,6 +271,21 @@ def init_sqlite_database():
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
 
+def write_sim_config():
+    """把启动时输入的账户起始资金写入 sim_config，EA 据此计算日亏限额/硬止损，无需在 EA inputs 里手动同步。"""
+    if not ACCOUNT_START_BALANCE or ACCOUNT_START_BALANCE <= 0:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS sim_config (key TEXT PRIMARY KEY, value REAL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES ('account_start_balance', ?, CURRENT_TIMESTAMP)",
+                     (float(ACCOUNT_START_BALANCE),))
+        conn.commit()
+        conn.close()
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户起始资金 ${ACCOUNT_START_BALANCE:,.2f}")
+    except Exception as e:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入 EA 共享配置失败: {str(e)}")
+
 def write_signal_to_sqlite(action, size_mult=1.0):
     """将交易信号写入SQLite数据库"""
     try:
@@ -1839,6 +1854,7 @@ if __name__ == "__main__":
 
     # 初始化SQLite数据库
     init_sqlite_database()
+    write_sim_config()
         
     run_trading_strategy(
         symbol=SYMBOL,
