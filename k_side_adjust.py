@@ -1,7 +1,7 @@
 """
 与 Quantra/backtest.py 午后收紧多头 K 一致：
 开盘满 120 分钟后 K1=0.9，此前 K1=1.0（仅多头上边界，K2 不变）。
-供各 simulate_*.py 在 calculate_noise_area 中调用；开关由各 simulate 的 ENABLE_K_SIDE_ADJUSTMENT 传入。
+供各 simulate_*.py 在 calculate_noise_area 中调用；开关为 strategy_params.ENABLE_K_SIDE_ADJUSTMENT（当前关闭）。
 """
 SESSION_OPEN_TIME = "09:30"  # 与 backtest minutes_from_open（日首根 K）对齐
 K_LONG_AFTER_MINUTES = 120

@@ -22,6 +22,11 @@ from longport.openapi import Config, TradeContext, OrderSide, OrderType, TimeInF
 
 from trend_er5_gate import history_days_back, apply_entry_gates_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
+from strategy_params import (
+    LOOKBACK_DAYS, K1, K2, ENABLE_K_SIDE_ADJUSTMENT, USE_VWAP,
+    ENABLE_TRAILING_TAKE_PROFIT, TRAILING_TP_ACTIVATION_PCT, TRAILING_TP_CALLBACK_PCT,
+)
+import quiet_open
 
 load_dotenv(override=True)
 
@@ -32,20 +37,8 @@ TRADING_END_TIME = (15, 40)   # 策略时段上沿（与回测对齐）；实盘
 # Longport 10x 日内融资约 15:40 自动清仓降杠杆；实盘提前到 15:39 强平避开冲突
 FORCE_CLOSE_TIME = (15, 39)
 MAX_POSITIONS_PER_DAY = 10
-LOOKBACK_DAYS = 1
+# 策略参数（K1/K2/回看天数/VWAP/追踪止盈/开仓门控/开盘冷清半仓）统一在 strategy_params.py，与 Quantra/backtest.py 对齐
 LEVERAGE = None  # 启动时指定：交互输入 / --leverage / 环境变量 LEVERAGE
-K1 = 1  # 上边界sigma乘数（多头基准）
-K2 = 1.04  # 下边界sigma乘数（空头）
-ENABLE_K_SIDE_ADJUSTMENT = True  # 午后收紧多头 K（午前1.0/午后0.9）；False=全天固定 K1
-
-# VWAP开关：False=不使用VWAP作为入场/止损条件，True=使用VWAP
-USE_VWAP = False
-# er5/range1/sigma 开仓门控（与 Quantra/backtest 一致）：开关与阈值见 trend_er5_gate.py
-
-# 🎯 动态追踪止盈配置（单笔浮盈回撤止盈；触发后当日不再开仓）
-ENABLE_TRAILING_TAKE_PROFIT = True   # 是否启用动态追踪止盈
-TRAILING_TP_ACTIVATION_PCT = 0.006   # 激活追踪止盈的最低浮盈百分比（0.6%）
-TRAILING_TP_CALLBACK_PCT = 0.65      # 保护的利润比例（65%），即从最大浮盈回撤35%时触发止盈
 
 # 默认交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
@@ -1519,6 +1512,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     if DEBUG_MODE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
+            quiet_open.update(df, now)
             signal = apply_entry_gates_to_signal(
                 signal, df, LOG_VERBOSE or DEBUG_MODE, now.strftime('%Y-%m-%d %H:%M:%S'),
                 current_sigma=latest_row.get('sigma'),
@@ -1529,15 +1523,16 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: {price}, VWAP: {latest_row['VWAP']:.4f}, 上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
                 
                 available_capital = get_account_balance()
+                size_mult = quiet_open.current_multiplier(now.date())
                 # 应用杠杆比例；顶格 10x 市价单会触发购买力风控，多空都减 1 股留余量
-                adjusted_capital = available_capital * LEVERAGE
+                adjusted_capital = available_capital * LEVERAGE * size_mult
                 position_size = floor(adjusted_capital / latest_price)
                 if position_size > 0:
                     position_size -= 1
                 if position_size <= 0:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: 资金不足（10x 减1股后为 0），跳过本根K")
                     continue
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 调整后资金: ${adjusted_capital:.2f}")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 仓位系数: {size_mult}, 调整后资金: ${adjusted_capital:.2f}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股（10x 计算结果减 1 股）")
                 side = "Buy" if signal > 0 else "Sell"
                 order_id, live_qty = open_if_flat(symbol, side, position_size, outside_rth=outside_rth_setting)
@@ -1595,6 +1590,7 @@ if __name__ == "__main__":
         print("调试模式已开启")
     prompt_leverage()
     print(f"策略参数: {format_k_strategy_params(K1, K2, LOOKBACK_DAYS, ENABLE_K_SIDE_ADJUSTMENT)}")
+    print(quiet_open.describe())
     # 🎯 显示动态追踪止盈配置
     if ENABLE_TRAILING_TAKE_PROFIT:
         print(f"🎯 动态追踪止盈: 已启用")

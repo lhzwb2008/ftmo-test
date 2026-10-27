@@ -33,6 +33,14 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 - **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `MNQ`（Micro Nasdaq-100 期货，非 IBUST100 CFD）；开仓按 IBKR **日内**初始保证金满仓（名义×7.71%、使用 100% 净值，有效杠杆约 13x；Error 201 则按 90%/85%/70% 减张重试；收盘前平仓，不要按隔夜 12% 估）。已切实盘（Live 端口 4001），盈亏基数写死 `$4,500`（`START_CAPITAL`）；仓位仍按 Gateway 实时净值。同步请求设 `IB_REQUEST_TIMEOUT_SEC=15`，避免 Gateway 23:45 自动重启时 `reqPositions` 永久卡死。需本机已登录 IB Gateway 且有 CME/MNQ 权限。合约月默认每个交易日自动选主力（`MNQ_EXPIRY=''`，到期前 `MNQ_ROLL_DAYS_BEFORE_EXPIRY=8` 天切下一季，账户仍持有旧月仓位时不切换）；`MNQ_EXPIRY` 填 YYYYMM 则固定该月。IB 连接参数写死在脚本常量（当前 `127.0.0.1:4001` Live；Paper 用 `4002`）；`.env` 仅需 Longport 凭证。不写 SQLite、不跑 MT5。
 - **Data fetcher** (`data_fetch_from_longport.py`) also requires Longport credentials.
 
+### Strategy parameters
+
+- 策略参数（K1/K2、回看天数、VWAP、追踪止盈、er5/range1/sigma 门控、开盘冷清半仓）统一在 `strategy_params.py`，所有 `simulate_*.py` 与 `trend_er5_gate.py` 从这里读取；与 Quantra `backtest.py` 默认 config 一致。账户相关参数（杠杆、资金、风控比例、交易时间）仍在各 simulate 中。
+- 上一版实盘（K2=1.04、午后 K1=0.9、range1<=0.029、无冷清半仓）见 git tag `live-G-20260718`。
+- 开盘冷清半仓（`quiet_open.py`）：当日 09:30–09:39 成交量 / 前 20 个交易日同窗口均值 < 0.65 时，当日开仓手数 ×0.5。MT5 路径写入 `signals.size_mult`，EA 在 `CalculateLotSize()` 结果上乘系数并按步长向下取整（不低于最小手数）；`simulate.py` / `simulate_ibkr.py` / `simulate_futures_core.py` 在 Python 端缩小数量（期货 1 张时保持 1 张）。
+- 分钟历史窗口 35 个自然日（`history_days_back`），`longport_data_service.py` 每天首轮及每 30 分钟拉一次完整窗口，其余轮次只拉当日。
+- 部署顺序：`longport_data_service.py` → `simulate_*.py`（启动时重建 signals 表，带 `size_mult` 列）→ 在 MetaEditor 重新编译并重载 EA（Leverage 等 inputs 不变）。新 EA 读旧表时自动回退为满仓，旧 EA 读新表忽略 `size_mult`，顺序颠倒不会出错，只是冷清减仓不生效。
+
 ### Key gotchas
 
 - The `.mq5` files are MetaTrader 5 Expert Advisors and **cannot be compiled or run on Linux**. They require a Windows machine with MT5 installed.

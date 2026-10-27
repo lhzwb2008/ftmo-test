@@ -5,22 +5,29 @@
 import numpy as np
 import pandas as pd
 
-ENABLE_ENTRY_TREND_FILTER = True
-ENTRY_TREND_ER5_MIN = 0.1
-# 昨日振幅上限门控（与 Quantra/backtest.py entry_trend_filter range1 一致）
-ENABLE_RANGE1_FILTER = True
-ENTRY_TREND_RANGE1_MAX = 0.029
-# 时段 sigma 下限门控（与 Quantra/backtest.py entry_trend_filter sigma 一致）
-ENABLE_SIGMA_FILTER = True
-ENTRY_TREND_SIGMA_MIN = 0.0003
+from strategy_params import (  # noqa: F401  开关与阈值统一在 strategy_params.py
+    ENABLE_ENTRY_TREND_FILTER,
+    ENTRY_TREND_ER5_MIN,
+    ENABLE_RANGE1_FILTER,
+    ENTRY_TREND_RANGE1_MAX,
+    ENABLE_SIGMA_FILTER,
+    ENTRY_TREND_SIGMA_MIN,
+    QUIET_OPEN_HALF_POSITION,
+    QUIET_OPEN_LOOKBACK_DAYS,
+)
+
 MINUTE_HISTORY_CALENDAR_DAYS_FOR_ER5 = 20
+# 开盘冷清半仓需前 20 个交易日，35 个自然日可覆盖节假日
+MINUTE_HISTORY_CALENDAR_DAYS_FOR_QUIET_OPEN = 35
 
 
 def history_days_back(lookback_days: int) -> int:
-    """启用 er5 时拉长分钟 K 拉取窗口，保证足够交易日。"""
+    """启用 er5 / 开盘冷清半仓时拉长分钟 K 拉取窗口，保证足够交易日。"""
     b = lookback_days + 5
     if ENABLE_ENTRY_TREND_FILTER:
-        return max(b, MINUTE_HISTORY_CALENDAR_DAYS_FOR_ER5)
+        b = max(b, MINUTE_HISTORY_CALENDAR_DAYS_FOR_ER5)
+    if QUIET_OPEN_HALF_POSITION:
+        b = max(b, MINUTE_HISTORY_CALENDAR_DAYS_FOR_QUIET_OPEN, QUIET_OPEN_LOOKBACK_DAYS * 7 // 5 + 7)
     return b
 
 
@@ -73,7 +80,7 @@ def compute_trend_range1_latest(minute_df):
 def apply_entry_gates_to_signal(signal, minute_df, log_verbose, now_str, current_sigma=None):
     """
     er5 + 昨日振幅上限 + 时段 sigma 下限（AND）。与 Quantra/backtest.py 默认
-    entry_trend_filter [er5>=0.1, range1<=0.029, sigma>=0.0003] 对齐。
+    entry_trend_filter [er5>=0.1, range1<=0.04, sigma>=0.0003] 对齐。
     特征为 nan 时不拦截。
     current_sigma: 当前检查 K 线的噪声 sigma（由 calculate_noise_area 写入）。
     """

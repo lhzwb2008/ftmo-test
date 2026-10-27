@@ -50,6 +50,11 @@ from longport.openapi import OutsideRTH
 
 from trend_er5_gate import history_days_back, apply_entry_gates_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
+from strategy_params import (
+    LOOKBACK_DAYS, K1, K2, ENABLE_K_SIDE_ADJUSTMENT, USE_VWAP,
+    ENABLE_TRAILING_TAKE_PROFIT, TRAILING_TP_ACTIVATION_PCT, TRAILING_TP_CALLBACK_PCT,
+)
+import quiet_open
 
 try:
     from ib_insync import IB, Future, MarketOrder
@@ -156,17 +161,7 @@ TRADING_END_TIME = (15, 40)
 CHECK_INTERVAL_MINUTES = 15
 MAX_POSITIONS_PER_DAY = 10
 
-# 策略参数（与 backtest / FTMO / IC 对齐）
-LOOKBACK_DAYS = 1
-K1 = 1
-K2 = 1.04
-ENABLE_K_SIDE_ADJUSTMENT = True
-
-USE_VWAP = False
-
-ENABLE_TRAILING_TAKE_PROFIT = True
-TRAILING_TP_ACTIVATION_PCT = 0.006
-TRAILING_TP_CALLBACK_PCT = 0.65
+# 策略参数（K1/K2/回看天数/VWAP/追踪止盈/开仓门控/开盘冷清半仓）统一在 strategy_params.py，与 Quantra/backtest.py 对齐
 
 DEBUG_MODE = False
 DEBUG_TIME = "2025-07-10 10:25:00"
@@ -3048,6 +3043,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
+            quiet_open.update(df, now)
             signal = apply_entry_gates_to_signal(signal, df, LOG_VERBOSE, now.strftime('%Y-%m-%d %H:%M:%S'), current_sigma=latest_row.get('sigma'))
             if signal != 0:
                 global _LAST_OPEN_SIGNAL_KEY
@@ -3079,11 +3075,17 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 qty = calc_ib_order_quantity(qqq_px=latest_price, side=side)
                 if qty < 1:
                     continue
+                size_mult = quiet_open.current_multiplier(now.date())
+                if size_mult < 1.0:
+                    # 1 张时无法再减，保持 1 张
+                    reduced = max(1, int(floor(qty * size_mult)))
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开盘冷清减仓: {qty} → {reduced} 张（系数 {size_mult}）")
+                    qty = reduced
 
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 信号价(QQQ): {price}, VWAP: {latest_row['VWAP']:.4f}, "
                       f"上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 执行: {TRADE_SYMBOL} × {qty} 张（满仓）")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 执行: {TRADE_SYMBOL} × {qty} 张")
 
                 order_id = submit_order(symbol, side, qty, outside_rth=outside_rth_setting, qqq_px=latest_price)
                 ib_pos = get_ib_position_qty()
@@ -3257,6 +3259,7 @@ if __name__ == "__main__":
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")
     print(f"策略参数: {format_k_strategy_params(K1, K2, LOOKBACK_DAYS, ENABLE_K_SIDE_ADJUSTMENT)}")
+    print(quiet_open.describe())
 
     print("\n--- 动态追踪止盈配置 ---")
     print(f"动态追踪止盈: {'已启用' if ENABLE_TRAILING_TAKE_PROFIT else '已禁用'}")

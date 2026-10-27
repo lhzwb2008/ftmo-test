@@ -430,6 +430,37 @@ def find_half_day_skip_dates(minute_df):
     return half | after_half
 
 
+def quiet_open_multipliers(minute_df, config):
+    """
+    开盘冷清日的当日杠杆系数。
+
+    09:30–09:39 成交量 / 过去 quiet_open_lookback_days 个交易日同一窗口均值
+    < quiet_open_rel_threshold 时，当天杠杆再乘 quiet_open_position_mult。
+    比值用截断回测窗口之前的全样本计算，避免起点丢掉 20 日历史。
+    历史不足 20 日的日期系数为 1。
+
+    返回 (date -> 系数, 参数说明)。开关关闭或没有 Volume 时系数为 None。
+    """
+    if not config.get('quiet_open_half_position', False):
+        return None, "quiet_open=off"
+    if 'Volume' not in minute_df.columns:
+        print("警告: 数据没有 Volume 列，开盘冷清半仓未生效")
+        return None, "quiet_open=off(no Volume)"
+    lookback = int(config.get('quiet_open_lookback_days', 20))
+    threshold = float(config.get('quiet_open_rel_threshold', 0.65))
+    half_mult = float(config.get('quiet_open_position_mult', 0.5))
+    open_bars = minute_df[(minute_df['Time'] >= '09:30') & (minute_df['Time'] <= '09:39')]
+    vol = open_bars.groupby('Date')['Volume'].sum().sort_index()
+    baseline = vol.rolling(lookback, min_periods=lookback).mean().shift(1)
+    rel = vol / baseline.replace(0, np.nan)
+    mult = {
+        d: (half_mult if pd.notna(r) and float(r) < threshold else 1.0)
+        for d, r in rel.items()
+    }
+    desc = f"quiet_open=on(<{threshold:g}→×{half_mult:g}, {lookback}d)"
+    return mult, desc
+
+
 def compute_weekly_trend_strength_by_date(minute_df):
     """兼容旧名：仅返回 weekly_trend_strength。"""
     d = compute_daily_trend_features(minute_df)
@@ -1364,6 +1395,9 @@ def run_backtest(config):
     price_df['Date'] = price_df['DateTime'].dt.date
     price_df['Time'] = price_df['DateTime'].dt.strftime('%H:%M')
 
+    # 冷清日系数必须在日期过滤前算，20 日均值才能用到窗口开始之前的成交量
+    quiet_open_mult, quiet_open_desc = quiet_open_multipliers(price_df, config)
+
     # 用全样本日收盘计算日频趋势特征（不修改 CSV）；回测窗口截断后再按 Date 合并
     trend_feat_df = compute_daily_trend_features(price_df)
     today = datetime.now().date()
@@ -1568,7 +1602,7 @@ def run_backtest(config):
     ttp_info = f"TTP={ttp_act*100:.2f}%/{ttp_cb*100:.0f}%" if enable_ttp else "TTP=off"
     print(
         f"参数: interval={check_interval_minutes}m, {k_info}, leverage={leverage}x, "
-        f"{ttp_info}, filter={entry_filter}, slip={slip}"
+        f"{ttp_info}, filter={entry_filter}, slip={slip}, {quiet_open_desc}"
     )
     
     # 初始化回测变量
@@ -1580,6 +1614,7 @@ def run_backtest(config):
     # 添加交易日期统计变量
     trading_days = set()       # 有交易的日期集合
     non_trading_days = set()   # 无交易的日期集合
+    quiet_half_day_count = 0   # 开盘冷清、当天杠杆被调低的交易日
     
     # 追踪最大日内回撤
     max_intraday_mdd_pct = 0   # 最大日内峰谷回撤（相对日初）
@@ -1709,8 +1744,11 @@ def run_backtest(config):
         # 获取当天的开盘价
         day_open_price = day_data['day_open'].iloc[0]
         
-        # 计算仓位大小（应用杠杆）
-        leveraged_capital = capital * leverage  # 应用杠杆倍数
+        # 计算仓位大小（应用杠杆；冷清日再乘当日系数）
+        day_lev_mult = quiet_open_mult.get(trade_date, 1.0) if quiet_open_mult is not None else 1.0
+        if day_lev_mult < 1.0:
+            quiet_half_day_count += 1
+        leveraged_capital = capital * leverage * day_lev_mult
         position_size = floor(leveraged_capital / day_open_price)
         # 硬止损按初始资金的固定美元（与 EA InitialBalance × HardSLRiskPercent 一致），
         # 再换成相对开仓价的百分比，供 simulate_day 的单笔止损使用。
@@ -1997,6 +2035,10 @@ def run_backtest(config):
     print(f"\n{'='*50}")
     print(f"策略回测总结 - {strategy_name}")
     print(f"{'='*50}")
+    if quiet_open_mult is not None:
+        print(f"开盘冷清半仓: {quiet_open_desc} | 调低杠杆 {quiet_half_day_count} 天")
+    else:
+        print(f"开盘冷清半仓: {quiet_open_desc}")
     
     # 资金信息
     final_capital = daily_df['capital'].iloc[-1]
@@ -2598,9 +2640,10 @@ if __name__ == "__main__":
         # 'equity_report_dir': 'reports',
         # 'equity_report_open_browser': True,
         # 'equity_report_path': 'reports/equity_report.html',
-        'K1': 1,  # 上边界sigma乘数（多头）基准；午后动态见 k_side_adjustment
-        'K2': 1.04,  # 下边界sigma乘数（空头），本规则不调整空头
-        'enable_k_side_adjustment': True,  # 动态 K 总开关；False 时忽略下方 k_side_adjustment，退化为固定 K1/K2
+        # 策略参数与 strategy_params.py（实盘）及 Quantra/backtest.py 一致
+        'K1': 1,  # 上边界sigma乘数（多头）
+        'K2': 1,  # 下边界sigma乘数（空头）
+        'enable_k_side_adjustment': False,  # 动态 K 总开关；False 时忽略下方 k_side_adjustment，退化为固定 K1/K2
         # 午后收紧多头 K：开盘满 120 分钟后 K1=0.9（更易触发多），此前 K1=1
         'k_side_adjustment': {
             'long': {
@@ -2611,6 +2654,11 @@ if __name__ == "__main__":
             },
         },
         'leverage':2,  # 资金杠杆倍数，与simulate一致
+        # 开盘冷清半仓：09:30–09:39 成交量 / 过去 20 日同窗口均值 < 0.65，当天杠杆减半（实盘见 quiet_open.py）
+        'quiet_open_half_position': True,
+        'quiet_open_rel_threshold': 0.65,
+        'quiet_open_lookback_days': 20,
+        'quiet_open_position_mult': 0.5,
         'use_vwap': False,  # VWAP开关，True为使用VWAP，False为不使用
         'enable_intraday_stop_loss': True,  # 是否启用日内止损（与 simulate 的 MAX_DAILY_LOSS_AMOUNT>0 对应）
         'intraday_stop_loss_pct': 0.04,  # 仅在未指定 max_daily_loss_amount 时用于换算美元限额
@@ -2627,7 +2675,7 @@ if __name__ == "__main__":
         # er5 + 昨日振幅上限 + 时段sigma下限；2年/5年双窗口验证
         'entry_trend_filter': [
             {'metric': 'er5', 'min': 0.1},
-            {'metric': 'range1', 'max': 0.029},
+            {'metric': 'range1', 'max': 0.04},
             {'metric': 'sigma', 'min': 0.0003},
         ],
         # 例：'entry_trend_filter': {'metric': 'weekly_sn', 'min': 0.65}

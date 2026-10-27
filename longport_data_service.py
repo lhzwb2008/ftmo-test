@@ -20,6 +20,8 @@ load_dotenv(override=True)
 SYMBOL = os.environ.get("SYMBOL", "QQQ.US")
 LOOKBACK_DAYS = 1
 REFRESH_INTERVAL_SECONDS = int(os.environ.get("MARKET_DATA_REFRESH_SECONDS", "20"))
+# 完整历史窗口（history_days_back，约 35 个自然日）每天首轮及每隔该秒数重拉一次，其余轮次只拉当日
+FULL_HISTORY_REFRESH_SECONDS = int(os.environ.get("MARKET_DATA_FULL_REFRESH_SECONDS", "1800"))
 LOG_FILE = "longport_data_service.log"
 
 
@@ -289,7 +291,9 @@ def run_service():
     init_market_data_db()
     quote_ctx = create_quote_context()
     print(f"交易品种: {SYMBOL}")
-    print(f"刷新间隔: {REFRESH_INTERVAL_SECONDS} 秒")
+    print(f"刷新间隔: {REFRESH_INTERVAL_SECONDS} 秒（完整历史 {history_days_back(LOOKBACK_DAYS)} 天，每 {FULL_HISTORY_REFRESH_SECONDS} 秒重拉）")
+    last_full_fetch_date = None
+    last_full_fetch_at = 0.0
 
     while True:
         # 交易日历优先更新，避免 K 线拉取失败导致 calendar_date 滞留
@@ -300,11 +304,17 @@ def run_service():
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存更新失败: {str(e)}")
 
         try:
-            rows = fetch_historical_candles(quote_ctx, SYMBOL)
+            today = get_us_eastern_time().date()
+            full_fetch = (last_full_fetch_date != today
+                          or time_module.time() - last_full_fetch_at >= FULL_HISTORY_REFRESH_SECONDS)
+            rows = fetch_historical_candles(quote_ctx, SYMBOL, None if full_fetch else 0)
             if rows:
                 upsert_candles(rows)
-                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] K线缓存更新完成: {len(rows)} 条")
-            else:
+                if full_fetch:
+                    last_full_fetch_date = today
+                    last_full_fetch_at = time_module.time()
+                print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] K线缓存更新完成: {len(rows)} 条{'（完整历史）' if full_fetch else ''}")
+            elif full_fetch:
                 print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 警告: 本轮没有获取到K线")
             upsert_quote(quote_ctx, SYMBOL)
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 报价缓存更新完成")

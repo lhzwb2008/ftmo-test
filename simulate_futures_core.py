@@ -14,6 +14,11 @@ from dataclasses import dataclass
 
 from trend_er5_gate import history_days_back, apply_entry_gates_to_signal
 from k_side_adjust import effective_k1_for_time, format_k_strategy_params
+from strategy_params import (
+    LOOKBACK_DAYS, K1, K2, ENABLE_K_SIDE_ADJUSTMENT, USE_VWAP,
+    ENABLE_TRAILING_TAKE_PROFIT, TRAILING_TP_ACTIVATION_PCT, TRAILING_TP_CALLBACK_PCT,
+)
+import quiet_open
 from ninjatrader_client import create_client_or_none, sanitize_file_tag
 
 load_dotenv(override=True)
@@ -119,20 +124,7 @@ TRADING_END_TIME = (15, 40)   # 交易结束时间：15点40分
 CHECK_INTERVAL_MINUTES = 15   # 检查间隔（分钟）
 MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 
-# 策略参数
-LOOKBACK_DAYS = 1  # 回看天数（用于计算噪声区域）
-K1 = 1  # 上边界sigma乘数（多头基准）
-K2 = 1.04  # 下边界sigma乘数（空头）
-ENABLE_K_SIDE_ADJUSTMENT = True  # 午后收紧多头 K（午前1.0/午后0.9）；False=全天固定 K1
-
-# VWAP开关：False=不使用VWAP作为入场/止损条件，True=使用VWAP
-USE_VWAP = False
-# er5/range1/sigma 开仓门控（与 Quantra/backtest 一致）：开关与阈值见 trend_er5_gate.py
-
-# 🎯 动态追踪止盈配置（单笔浮盈回撤止盈，与 simulate_icmarkets 一致；触发后当日不再开仓）
-ENABLE_TRAILING_TAKE_PROFIT = True   # 是否启用动态追踪止盈
-TRAILING_TP_ACTIVATION_PCT = 0.006   # 激活追踪止盈的最低浮盈百分比（0.6%），追踪的是qqq
-TRAILING_TP_CALLBACK_PCT = 0.65      # 保护的利润比例（65%），即从最大浮盈回撤35%时触发止盈
+# 策略参数（K1/K2/回看天数/VWAP/追踪止盈/开仓门控/开盘冷清半仓）统一在 strategy_params.py，与 Quantra/backtest.py 对齐
 
 # 调试模式配置
 DEBUG_MODE = False   # 设置为True开启调试模式（使用固定时间）
@@ -1958,6 +1950,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 else:
                     if LOG_VERBOSE:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 不满足入场条件: 多头({long_price_above_upper} & {long_price_above_vwap}), 空头({short_price_below_lower} & {short_price_below_vwap})")
+            quiet_open.update(df, now)
             signal = apply_entry_gates_to_signal(signal, df, LOG_VERBOSE, now.strftime('%Y-%m-%d %H:%M:%S'), current_sigma=latest_row.get('sigma'))
             if signal != 0:
                 # 保留交易信号日志，并添加VWAP和上下界信息
@@ -1970,6 +1963,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 if contract_qty <= 0:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 手数计算为 0，跳过本次开仓")
                     continue
+                size_mult = quiet_open.current_multiplier(now.date())
+                if size_mult < 1.0:
+                    # 1 张时无法再减，保持 1 张
+                    reduced = max(1, int(contract_qty * size_mult))
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开盘冷清减仓: {contract_qty} → {reduced} 张（系数 {size_mult}）")
+                    contract_qty = reduced
                 order_id = submit_order(symbol, side, contract_qty, outside_rth=outside_rth_setting)
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 信号已发送，ID: {order_id}")
                 
@@ -2113,6 +2112,7 @@ def run_application(program):
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")
     print(f"策略参数: {format_k_strategy_params(K1, K2, LOOKBACK_DAYS, ENABLE_K_SIDE_ADJUSTMENT)}")
+    print(quiet_open.describe())
 
     print("\n--- 动态追踪止盈配置 ---")
     print(f"动态追踪止盈: {'已启用' if ENABLE_TRAILING_TAKE_PROFIT else '已禁用'}")

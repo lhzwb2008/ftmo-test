@@ -44,6 +44,7 @@ input double   DailyProfitCapUSD = 1100.0;             // Funded 日盈上限 US
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
+double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 string   g_db_path = "";              // 运行时: trading_signals_aqua_paylater_{InstanceId}.db
 int      g_magic = 0;                 // 运行时魔术号 = 20260818 + InstanceId
 
@@ -574,9 +575,16 @@ void CheckDatabaseSignals()
         return;
     
     // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
-    string query = "SELECT id, action FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
+    string query = "SELECT id, action, size_mult FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
     
     int request = DatabasePrepare(db_handle, query);
+    bool has_size_mult = true;
+    if(request == INVALID_HANDLE)
+    {
+        // 旧版 simulate 建的表没有 size_mult 列，按满仓处理
+        has_size_mult = false;
+        request = DatabasePrepare(db_handle, "SELECT id, action FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1");
+    }
     if(request == INVALID_HANDLE)
     {
         Print("❌ 查询失败");
@@ -591,6 +599,11 @@ void CheckDatabaseSignals()
         
         DatabaseColumnLong(request, 0, latest_signal_id);
         DatabaseColumnText(request, 1, latest_action);
+        signal_size_mult = 1.0;
+        if(has_size_mult)
+            DatabaseColumnDouble(request, 2, signal_size_mult);
+        if(signal_size_mult <= 0 || signal_size_mult > 1.0)
+            signal_size_mult = 1.0;
         
         Print("📊 检测到未消费信号，只执行最新的: ", latest_action, " (ID: ", latest_signal_id, ")");
         
@@ -646,7 +659,7 @@ void ProcessSignal(long signal_id, string action)
         else
         {
             // 无持仓，开多仓
-            lots = CalculateLotSize();
+            lots = ApplySizeMult(CalculateLotSize());
             if(lots <= 0)
             {
                 Print("❌ 计算手数失败，余额不足");
@@ -688,7 +701,7 @@ void ProcessSignal(long signal_id, string action)
         else
         {
             // 无持仓，开空仓
-            lots = CalculateLotSize();
+            lots = ApplySizeMult(CalculateLotSize());
             if(lots <= 0)
             {
                 Print("❌ 计算手数失败，余额不足");
@@ -822,6 +835,24 @@ void MarkSignalConsumed(long signal_id)
     {
         Print("✅ 信号已标记为已消费");
     }
+}
+
+//+------------------------------------------------------------------+
+//| 按信号的 size_mult 缩小手数（开盘冷清半仓）                        |
+//+------------------------------------------------------------------+
+double ApplySizeMult(double lots)
+{
+    if(lots <= 0 || signal_size_mult >= 1.0)
+        return lots;
+    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    double scaled = lots * signal_size_mult;
+    if(lot_step > 0)
+        scaled = MathFloor(scaled / lot_step + 1e-9) * lot_step;
+    scaled = NormalizeDouble(MathMax(scaled, min_lot), 8);
+    Print("📉 开盘冷清半仓: 手数 ", DoubleToString(lots, 2), " × ", DoubleToString(signal_size_mult, 2),
+          " → ", DoubleToString(scaled, 2));
+    return scaled;
 }
 
 //+------------------------------------------------------------------+
