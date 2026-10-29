@@ -1095,9 +1095,57 @@ def _fallback_margin_per_contract(mnq_px):
     return max(MNQ_INIT_MARGIN_FLOOR_USD, by_notional)
 
 
+def mnq_affordable_qty(usable, margin_1):
+    """净值必须高于保证金才能开。IB 拒单条件是 Net Liq 未超过初始保证金，等于也不行。"""
+    if usable <= 0 or not margin_1 or margin_1 <= 0:
+        return 0
+    qty = int(floor(usable / margin_1))
+    if MAX_MNQ_CONTRACTS and MAX_MNQ_CONTRACTS > 0:
+        qty = min(qty, int(MAX_MNQ_CONTRACTS))
+    while qty >= 1 and usable <= margin_1 * qty:
+        qty -= 1
+    return qty
+
+
+_LAST_MARGIN_STATUS_DATE = None
+
+
+def log_daily_open_capacity():
+    """每个美东交易日打一行：净值对比官表日内初始，说明今天开不开仓。盘中入金后仍按每次信号重算。"""
+    global _LAST_MARGIN_STATUS_DATE
+    now = get_us_eastern_time()
+    today = now.date()
+    if _LAST_MARGIN_STATUS_DATE == today:
+        return
+    ts = now.strftime('%Y-%m-%d %H:%M:%S')
+    if not ib_ensure_connected():
+        print(f"[{ts}] 今日开仓检查: IB 未连接，稍后重试")
+        return
+    refresh_ib_account_data(wait_sec=0.8)
+    nlv = get_ib_account_tag('NetLiquidation')
+    available = get_ib_buying_power()
+    if nlv > 0 and (available <= 0 or available > nlv):
+        available = nlv
+    if available <= 0:
+        print(f"[{ts}] 今日开仓检查: 尚未读到净值，稍后重试")
+        return
+    ensure_official_mnq_margin()
+    official = official_mnq_intraday_initial()
+    if not official:
+        print(f"[{ts}] 今日开仓检查: 没有 IBKR 官表日内初始保证金，今天不开仓")
+        _LAST_MARGIN_STATUS_DATE = today
+        return
+    qty = mnq_affordable_qty(available * MARGIN_USAGE_PCT, official)
+    if qty >= 1:
+        print(f"[{ts}] 今日开仓检查: 净值 ${nlv:,.2f} 高于日内初始 ${official:,.2f}，今天最多开 {qty} 张")
+    else:
+        print(f"[{ts}] 今日开仓检查: 净值 ${nlv:,.2f} 未超过日内初始 ${official:,.2f}，今天不开仓")
+    _LAST_MARGIN_STATUS_DATE = today
+
+
 def calc_ib_order_quantity(mnq_px=None, qqq_px=None, side='Buy'):
     """
-    按净值预算满仓：floor(NLV × 缓冲 / 单张日内初始保证金)。
+    按净值预算满仓：净值必须高于单张日内初始保证金才开，否则返回 0。
     默认不订 IB 行情、不做 whatIf；市价单直接下。
     """
     ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
@@ -1133,20 +1181,17 @@ def calc_ib_order_quantity(mnq_px=None, qqq_px=None, side='Buy'):
             margin_1 = official
             margin_source = 'IBKR官表日内初始'
         else:
-            margin_1 = _fallback_margin_per_contract(mnq_px)
-            margin_source = 'intraday%'
+            print(f"[{ts}] 没有 IBKR 官表日内初始保证金，跳过开仓（不用估算值下单）")
+            return 0
         asof = (_MNQ_OFFICIAL_MARGIN or {}).get('asof', '')
         extra = f'，官表日期 {asof}' if official and asof else ''
-        print(f"[{ts}] 仓位估算用{margin_source} ≈ ${margin_1:,.0f}/张{extra}"
-              f"（下限仅用于百分比回退 ${MNQ_INIT_MARGIN_FLOOR_USD:,.0f}；不订 IB 行情）")
+        print(f"[{ts}] 仓位估算用{margin_source} ≈ ${margin_1:,.0f}/张{extra}（不订 IB 行情）")
 
     if usable <= 0:
         print(f"[{ts}] 无法计算手数：可用保证金/购买力为 0")
         return 0
 
-    qty = int(floor(usable / margin_1))
-    if MAX_MNQ_CONTRACTS and MAX_MNQ_CONTRACTS > 0:
-        qty = min(qty, int(MAX_MNQ_CONTRACTS))
+    qty = mnq_affordable_qty(usable, margin_1)
 
     # 仅当显式开启 whatIf 时做整单二次校验
     if qty >= 1 and IB_USE_WHATIF_MARGIN:
@@ -2611,6 +2656,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
         last_date = current_date
         LAST_STATS_DATE = current_date
+        log_daily_open_capacity()
         
         # 在每天9:30之后启动日内止损监控线程（只启动一次）
         # 判断当前时间是否在9:30之后且监控线程未启动
@@ -3216,11 +3262,11 @@ if __name__ == "__main__":
     print("\n--- 风控设置 ---")
     apply_optional_risk_settings()
 
-    print("版本: 2.1.7")
+    print("版本: 2.1.8")
     print("执行: 每轮以 IB 仓位为准；下单看仓位不看 Filled；读仓失败不当空仓")
     print("平仓: 信号用完整 15m K；一旦成立立刻市价平到仓位=0，失败持续补平")
     print("等待: 非交易日睡到下一开盘；Gateway 未登录（含 IB Key）会一直重连，不退出")
-    print("保证金: 每个美东自然日拉一次 IBKR 官表；盘中不刷；201 时强制再拉一次重算")
+    print("保证金: 每个交易日对比净值与官表日内初始，未超过则全天跳过开仓；201 时强制再拉一次重算")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
     print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")

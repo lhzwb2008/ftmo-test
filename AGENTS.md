@@ -30,7 +30,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
   - `LONGPORT_APP_KEY`
   - `LONGPORT_APP_SECRET`
   - `LONGPORT_ACCESS_TOKEN`
-- **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `MNQ`（Micro Nasdaq-100 期货，非 IBUST100 CFD）；开仓按 IBKR **日内**初始保证金满仓（名义×7.71%、使用 100% 净值，有效杠杆约 13x；Error 201 则按 90%/85%/70% 减张重试；收盘前平仓，不要按隔夜 12% 估）。已切实盘（Live 端口 4001），盈亏基数写死 `$4,500`（`START_CAPITAL`）；仓位仍按 Gateway 实时净值。同步请求设 `IB_REQUEST_TIMEOUT_SEC=15`，避免 Gateway 23:45 自动重启时 `reqPositions` 永久卡死。需本机已登录 IB Gateway 且有 CME/MNQ 权限。合约月默认每个交易日自动选主力（`MNQ_EXPIRY=''`，到期前 `MNQ_ROLL_DAYS_BEFORE_EXPIRY=8` 天切下一季，账户仍持有旧月仓位时不切换）；`MNQ_EXPIRY` 填 YYYYMM 则固定该月。IB 连接参数写死在脚本常量（当前 `127.0.0.1:4001` Live；Paper 用 `4002`）；`.env` 仅需 Longport 凭证。不写 SQLite、不跑 MT5。
+- **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `MNQ`（Micro Nasdaq-100 期货，非 IBUST100 CFD）；开仓按 IBKR **日内**初始保证金满仓（使用 100% 净值；净值必须高于当日官表日内初始才开，否则跳过，每个交易日开盘打一行；Error 201 则按 90%/85%/70% 减张重试；官表拉不到不用估算值下单；收盘前平仓，不要按隔夜 12% 估）。已切实盘（Live 端口 4001），盈亏基数写死 `$4,500`（`START_CAPITAL`）；仓位仍按 Gateway 实时净值。同步请求设 `IB_REQUEST_TIMEOUT_SEC=15`，避免 Gateway 23:45 自动重启时 `reqPositions` 永久卡死。需本机已登录 IB Gateway 且有 CME/MNQ 权限。合约月默认每个交易日自动选主力（`MNQ_EXPIRY=''`，到期前 `MNQ_ROLL_DAYS_BEFORE_EXPIRY=8` 天切下一季，账户仍持有旧月仓位时不切换）；`MNQ_EXPIRY` 填 YYYYMM 则固定该月。IB 连接参数写死在脚本常量（当前 `127.0.0.1:4001` Live；Paper 用 `4002`）；`.env` 仅需 Longport 凭证。不写 SQLite、不跑 MT5。
 - **Data fetcher** (`data_fetch_from_longport.py`) also requires Longport credentials.
 
 ### Strategy parameters
