@@ -2669,8 +2669,11 @@ if __name__ == "__main__":
 
         # 🎯 动态追踪止盈配置
         'enable_trailing_take_profit': True,  # 是否启用动态追踪止盈
-        'trailing_tp_activation_pct': 0.006,  # 激活追踪止盈的最低浮盈百分比（1%），追踪的是qqq
-        'trailing_tp_callback_pct': 0.65,  # 保护的利润比例（70%），即从最大浮盈回撤30%时触发止盈
+        'trailing_tp_activation_pct': 0.006,  # 激活追踪止盈的最低浮盈（相对本笔开仓价 0.6%），追踪的是qqq
+        'trailing_tp_callback_pct': 0.65,  # 保护的利润比例（65%），即从最大浮盈回撤35%时触发止盈
+        # 止盈平仓后当日仍可再开仓（与全部实盘 simulate*.py 一致）。
+        # 2021-11~2026-11 回测：继续开仓 年化106%/夏普2.50 > 不止盈 100%/2.38 > 止盈后停开 90%/2.43
+        'stop_entries_after_trailing_tp': False,
         # 开仓趋势门控：None=关闭。单 dict 或 [dict,...]（AND）。特征见 compute_daily_trend_features。
         # er5 + 昨日振幅上限 + 时段sigma下限；2年/5年双窗口验证
         'entry_trend_filter': [

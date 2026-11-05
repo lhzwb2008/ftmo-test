@@ -13,7 +13,7 @@ K2 = 1  # 下边界sigma乘数（空头）
 ENABLE_K_SIDE_ADJUSTMENT = False  # 午后收紧多头 K（午前1.0/午后0.9）；False=全天固定 K1
 USE_VWAP = False  # False=不使用VWAP作为入场/止损条件
 
-# 动态追踪止盈（单笔浮盈回撤止盈，触发后当日不再开仓）
+# 动态追踪止盈（单笔浮盈回撤止盈；止盈平仓后当日仍按信号继续开仓，见 backtest.py stop_entries_after_trailing_tp）
 ENABLE_TRAILING_TAKE_PROFIT = True
 TRAILING_TP_ACTIVATION_PCT = 0.006  # 激活追踪止盈的最低浮盈百分比（0.6%），追踪的是qqq
 TRAILING_TP_CALLBACK_PCT = 0.65     # 保护的利润比例（65%），即从最大浮盈回撤35%时触发止盈
