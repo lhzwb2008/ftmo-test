@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
 //|                                      SQLiteSignalEA_aqua.mq5      |
 //|                        AquaFunded 2-Step Standard 信号执行EA      |
-//| 杠杆/单笔硬止损/初始资金由 simulate 写入 sim_config 自动同步       |
-//| inputs 仅作读不到时的回退；Funded 硬止损 0.9（Wave Stop 1%）       |
+//| 杠杆/单笔硬止损/初始资金只从 simulate 写入的 sim_config 读取       |
+//| 读不到则 EA 拒绝启动（先启动 simulate_aqua.py 再加载 EA）          |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.07"
-#define   EA_BUILD   "2026-11-06b 杠杆/硬止损读 simulate，日内锚点按账号"  // 每次改 EA 逻辑时同步更新日期和说明
+#property version   "1.08"
+#define   EA_BUILD   "2026-11-06c 杠杆/硬止损/初始资金只读 simulate"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -19,11 +19,8 @@
 //--- 输入参数（多账户只需改 InstanceId=1/2/3/4，DB与Magic自动）
 input int      InstanceId = 1;                         // 实例编号 1/2/3/4（与 Python 启动输入一致）
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
-input double   Leverage = 2;                        // 杠杆倍数（回退值；simulate 写入后以 simulate 为准）
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
-input double   InitialBalance = 100000.0;              // 账户初始资金（Aqua 风控按初始资金计算）
-input double   HardSLRiskPercent = 0;                  // 单笔硬止损(%)（回退值；simulate 按轮次写入：Challenge=0 / Funded=0.9）
 
 //--- 日内亏损风控参数（EA端基于真实权益逐tick监控，Python端不再负责日内止损；限额基于账户初始资金，见 EffInitialBalance）
 input double   DailyLossPercent = 5.0;                 // 官方日内最大亏损比例(%)（Aqua Standard 官方 5；0=禁用）
@@ -35,9 +32,9 @@ input bool     ForceResetDailyRisk = false;            // 强制重置日内锚�
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
-double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到，回退 input）
-double g_sim_leverage = 0;         // simulate 写入的杠杆（0=未读到，回退 input）
-double g_sim_hard_sl_pct = -1;     // simulate 写入的单笔硬止损%（<0=未读到，回退 input；0=禁用）
+double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到）
+double g_sim_leverage = 0;         // simulate 写入的杠杆（0=未读到）
+double g_sim_hard_sl_pct = -1;     // simulate 写入的单笔硬止损%（<0=未读到；0=禁用）
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 string   g_db_path = "";              // 运行时: trading_signals_aqua_{InstanceId}.db
 int      g_magic = 0;                 // 运行时魔术号
@@ -84,13 +81,19 @@ int OnInit()
         return(INIT_FAILED);
     }
     LoadSimConfig(true);
+    if(g_sim_initial_balance <= 0 || g_sim_leverage <= 0 || g_sim_hard_sl_pct < 0)
+    {
+        Print("❌ 未读到 simulate 共享配置（起始资金/杠杆/单笔硬止损），请先启动 simulate_aqua.py（实例 ", InstanceId,
+              "）完成轮次与杠杆输入，再重新加载 EA");
+        return(INIT_FAILED);
+    }
     
     Print("✅ EA初始化成功");
     Print("🧩 编译版本: 1.04（开仓前校验止损；服务器 Invalid stops 只拒绝一次，不再重试）");
     Print("🔢 Aqua 实例编号: ", InstanceId);
     Print("🗄 信号库: ", g_db_path);
     Print("🪄 Magic: ", g_magic);
-    Print("💰 杠杆: ", EffLeverage(), "倍", g_sim_leverage > 0 ? "（simulate 同步）" : "（EA input）");
+    Print("💰 杠杆: ", EffLeverage(), "倍（simulate 同步）");
     Print("📊 使用余额: ", RiskPercent, "%");
     
     // 初始化日内亏损风控（恢复或重置当日锚点/halted 状态）
@@ -104,13 +107,12 @@ int OnInit()
     else
         Print("🛡️ 日内止损(EA端): 已禁用");
     
-    string sl_src = g_sim_hard_sl_pct >= 0 ? "simulate 同步" : "EA input";
     if(EffHardSLPct() > 0)
         Print("🛡️ 单笔硬止损(Wave Stop兜底): 初始资金 $", DoubleToString(EffInitialBalance(), 2), " × ", EffHardSLPct(),
               "% = $", DoubleToString(EffInitialBalance() * EffHardSLPct() / 100.0, 2),
-              " （", sl_src, "；与日亏线SL取更紧者）");
+              " （simulate 同步；与日亏线SL取更紧者）");
     else
-        Print("🛡️ 单笔硬止损: 已禁用（", sl_src, "；Challenge 模式）");
+        Print("🛡️ 单笔硬止损: 已禁用（simulate 同步；Challenge 模式）");
     
     // 恢复外部平仓序号，避免 EA 重启后 simulate 漏同步
     if(GlobalVariableCheck(CloseSeqGVName()))
@@ -522,22 +524,21 @@ bool OpenDatabase()
 }
 
 //+------------------------------------------------------------------+
-//| 账户初始资金：优先用 simulate 写入 sim_config 的起始资金，
-//| 读不到时用 input InitialBalance
+//| 账户初始资金 / 杠杆 / 单笔硬止损：全部来自 simulate 写入的 sim_config
 //+------------------------------------------------------------------+
 double EffInitialBalance()
 {
-    return (g_sim_initial_balance > 0) ? g_sim_initial_balance : InitialBalance;
+    return g_sim_initial_balance;
 }
 
 double EffLeverage()
 {
-    return (g_sim_leverage > 0) ? g_sim_leverage : Leverage;
+    return g_sim_leverage;
 }
 
 double EffHardSLPct()
 {
-    return (g_sim_hard_sl_pct >= 0) ? g_sim_hard_sl_pct : HardSLRiskPercent;
+    return MathMax(g_sim_hard_sl_pct, 0.0);
 }
 
 bool ReadSimConfig(string key, double &value)
@@ -552,7 +553,7 @@ bool ReadSimConfig(string key, double &value)
 
 //+------------------------------------------------------------------+
 //| 每 30 秒读 simulate 写入的 sim_config：起始资金 / 杠杆 / 单笔硬止损 |
-//| 某项不存在（旧版 simulate）时保留 EA input                         |
+//| 某项读不到时保留上次读到的值（OnInit 时缺任一项则拒绝启动）        |
 //+------------------------------------------------------------------+
 void LoadSimConfig(bool force)
 {
@@ -571,33 +572,26 @@ void LoadSimConfig(bool force)
         DatabaseColumnLong(req, 0, has_table);
     DatabaseFinalize(req);
     if(has_table == 0)
-    {
-        if(force)
-            Print("⚠️ 未找到 simulate 共享配置，暂用 EA inputs：InitialBalance=$", DoubleToString(InitialBalance, 2),
-                  " Leverage=", Leverage, " HardSLRiskPercent=", HardSLRiskPercent);
         return;
-    }
 
     double value = 0;
     if(ReadSimConfig("account_start_balance", value) && value > 0 && MathAbs(value - g_sim_initial_balance) >= 0.005)
     {
         g_sim_initial_balance = value;
-        Print("🔗 账户初始资金已从 simulate 同步: $", DoubleToString(value, 2),
-              "（EA input InitialBalance=$", DoubleToString(InitialBalance, 2), " 不再使用）");
+        Print("🔗 账户初始资金已从 simulate 同步: $", DoubleToString(value, 2));
     }
     value = 0;
     if(ReadSimConfig("leverage", value) && value > 0 && MathAbs(value - g_sim_leverage) >= 0.0001)
     {
         g_sim_leverage = value;
-        Print("🔗 杠杆已从 simulate 同步: ", DoubleToString(value, 2), "倍（EA input Leverage=", Leverage, " 不再使用）");
+        Print("🔗 杠杆已从 simulate 同步: ", DoubleToString(value, 2), "倍");
     }
     value = -1;
     if(ReadSimConfig("hard_sl_risk_percent", value) && value >= 0 && MathAbs(value - g_sim_hard_sl_pct) >= 0.0001)
     {
         g_sim_hard_sl_pct = value;
         Print("🔗 单笔硬止损已从 simulate 同步: ", DoubleToString(value, 2), "%",
-              value > 0 ? StringFormat(" = $%.2f", EffInitialBalance() * value / 100.0) : "（禁用）",
-              "（EA input HardSLRiskPercent=", HardSLRiskPercent, " 不再使用）");
+              value > 0 ? StringFormat(" = $%.2f", EffInitialBalance() * value / 100.0) : "（禁用）");
     }
 }
 

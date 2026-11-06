@@ -39,7 +39,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 - 上一版实盘（K2=1.04、午后 K1=0.9、range1<=0.029、无冷清半仓）见 git tag `live-G-20260718`。
 - 开盘冷清半仓（`quiet_open.py`）：当日 09:30–09:39 成交量 / 前 20 个交易日同窗口均值 < 0.65 时，当日开仓手数 ×0.5。MT5 路径写入 `signals.size_mult`，EA 在 `CalculateLotSize()` 结果上乘系数并按步长向下取整（不低于最小手数）；`simulate.py` / `simulate_ibkr.py` / `simulate_futures_core.py` 在 Python 端缩小数量（期货 1 张时保持 1 张）。
 - 分钟历史窗口 35 个自然日（`history_days_back`），`longport_data_service.py` 每天首轮及每 30 分钟拉一次完整窗口，其余轮次只拉当日。
-- 账户初始资金：simulate 启动时把输入的"账户起始资金"写入信号库 `sim_config` 表（key=`account_start_balance`），EA 在 OnInit 及之后每 30 秒读取，用于日亏限额 / 硬止损 / 静态回撤；读不到时回退 EA input `InitialBalance` / `AccountInitialBalance`。启动日志出现"🔗 账户初始资金已从 simulate 同步"即生效。已开仓位的保护性 SL 只收紧不放松，初始资金调大后对当前持仓不会放宽。
+- 账户初始资金：simulate 启动时把输入的"账户起始资金"写入信号库 `sim_config` 表（key=`account_start_balance`），EA 在 OnInit 及之后每 30 秒读取，用于日亏限额 / 硬止损 / 静态回撤；读不到时回退 EA input `InitialBalance` / `AccountInitialBalance`（Aqua 2-Step EA 除外，见下）。启动日志出现"🔗 账户初始资金已从 simulate 同步"即生效。已开仓位的保护性 SL 只收紧不放松，初始资金调大后对当前持仓不会放宽。
 - 部署顺序：`longport_data_service.py` → `simulate_*.py`（启动时重建 signals 表，带 `size_mult` 列）→ 在 MetaEditor 重新编译并重载 EA（Leverage 等 inputs 不变）。新 EA 读旧表时自动回退为满仓，旧 EA 读新表忽略 `size_mult`，顺序颠倒不会出错，只是冷清减仓不生效。
 
 ### Key gotchas
@@ -50,7 +50,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 - SQLite database files (`*.db`) are gitignored.
 - All comments and log messages are in Chinese (Simplified Chinese).
 - On Linux, SQLite DBs are created in the current working directory. On Windows, they go to the MT5 common files directory.
-- **Aqua Standard vs Pay Later**: `simulate_aqua.py` / `SQLiteSignalEA_aqua.mq5` = 2-Step Standard（`trading_signals_aqua_{n}.db`, Magic `20260808+n`）。`simulate_aqua_paylater.py` / `SQLiteSignalEA_aqua_paylater.mq5` = One-Step Pay Later（`trading_signals_aqua_paylater_{n}.db`, Magic `20260818+n`）。两套不可混用；Pay Later 启动时选 `challenge` 或 `funded`，EA 用 `AccountPhase` 对齐。Aqua 风控已将本账号 2-Step funded 的 Wave Stop 下调为 1%（合计浮亏占当前余额），`simulate_aqua.py` 按轮次把单笔硬止损（funded=0.9 / challenge=0，`FUNDED_HARD_SL_PCT`）和启动输入的杠杆写入 `sim_config`（key=`hard_sl_risk_percent` / `leverage`），`SQLiteSignalEA_aqua.mq5` 读到即覆盖 inputs `HardSLRiskPercent` / `Leverage`（读不到才回退 inputs）。该 EA 的日内锚点 GlobalVariable 按 MT5 登录号区分，换账号无需勾 `ForceResetDailyRisk`。
+- **Aqua Standard vs Pay Later**: `simulate_aqua.py` / `SQLiteSignalEA_aqua.mq5` = 2-Step Standard（`trading_signals_aqua_{n}.db`, Magic `20260808+n`）。`simulate_aqua_paylater.py` / `SQLiteSignalEA_aqua_paylater.mq5` = One-Step Pay Later（`trading_signals_aqua_paylater_{n}.db`, Magic `20260818+n`）。两套不可混用；Pay Later 启动时选 `challenge` 或 `funded`，EA 用 `AccountPhase` 对齐。Aqua 风控已将本账号 2-Step funded 的 Wave Stop 下调为 1%（合计浮亏占当前余额），`simulate_aqua.py` 按轮次把单笔硬止损（funded=0.9 / challenge=0，`FUNDED_HARD_SL_PCT`）和启动输入的杠杆写入 `sim_config`（key=`hard_sl_risk_percent` / `leverage`），`SQLiteSignalEA_aqua.mq5` 已删除 `Leverage` / `InitialBalance` / `HardSLRiskPercent` inputs，三项只从 `sim_config` 读取，OnInit 时缺任一项则 INIT_FAILED（须先启动 simulate 再加载 EA）。该 EA 的日内锚点 GlobalVariable 按 MT5 登录号区分，换账号无需勾 `ForceResetDailyRisk`。
 - The MQ5 EAs rely on `OnTick()` to poll the database. If a broker (e.g. IC Markets) delivers ticks late at market open, signals may be delayed. A potential fix is adding `OnTimer()` as a fallback.
 - IC Markets EA has a known issue: it frequently stops and restarts (visible in MT5 logs as repeated "EA已停止" → reinitialization cycles). Root cause is under investigation.
 
