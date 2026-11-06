@@ -36,6 +36,8 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
 INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
 LEVERAGE = None  # 杠杆倍数（启动时手动输入）
+ACCOUNT_PHASE = None  # "1" | "2" | "funded"（启动时输入）
+FUNDED_HARD_SL_PCT = 0.9  # Funded 单笔硬止损(%)，Wave Stop 1%（按当前余额）；总亏 8% 下余额≥92K，0.9%×100K 始终先触发
 
 # 风控比例（AquaFunded 2-Step Standard 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏 5%；最大回撤 8% static）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
@@ -179,7 +181,7 @@ def prompt_trading_time():
 def prompt_capital_settings():
     """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈金额"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
-    global PROFIT_TARGET_PCT, LEVERAGE
+    global PROFIT_TARGET_PCT, LEVERAGE, ACCOUNT_PHASE
     
     while True:
         try:
@@ -204,6 +206,7 @@ def prompt_capital_settings():
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
+    ACCOUNT_PHASE = phase
 
     while True:
         try:
@@ -223,8 +226,8 @@ def prompt_capital_settings():
 
     phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
-    print(f"杠杆倍数: {LEVERAGE}x (手动指定)")
-    print(f"⚠️ 提醒: 杠杆不会自动同步到 MT5。请在 EA 输入参数中将 Leverage 手动改为 {LEVERAGE}，否则实盘手数与模拟不一致")
+    print(f"杠杆倍数: {LEVERAGE}x (手动指定，启动后自动同步到 EA)")
+    print(f"单笔硬止损: {sim_hard_sl_pct()}%（{'Funded Wave Stop 1%' if phase == 'funded' else 'Challenge 不启用'}，启动后自动同步到 EA）")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
@@ -240,7 +243,6 @@ def prompt_capital_settings():
     else:
         MAX_PROFIT_AMOUNT = -1
         print("账户止盈: 已禁用（Funded 账户无利润目标，日内止损由 EA 执行）")
-        print("⚠️ Aqua Funded Wave Stop: 请在 EA 将 HardSLRiskPercent 设为 1.8~2.0（Challenge 保持 0）")
     
     print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
 
@@ -374,18 +376,28 @@ def init_sqlite_database():
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
 
+def sim_hard_sl_pct():
+    return FUNDED_HARD_SL_PCT if ACCOUNT_PHASE == "funded" else 0.0
+
+
 def write_sim_config():
-    """把启动时输入的账户起始资金写入 sim_config，EA 据此计算日亏限额/硬止损，无需在 EA inputs 里手动同步。"""
+    """把启动时输入的起始资金、杠杆、单笔硬止损写入 sim_config，EA 每 30 秒读取并覆盖对应 inputs，无需在 MT5 手动同步。"""
     if not ACCOUNT_START_BALANCE or ACCOUNT_START_BALANCE <= 0:
         return
+    values = {
+        'account_start_balance': float(ACCOUNT_START_BALANCE),
+        'leverage': float(LEVERAGE),
+        'hard_sl_risk_percent': float(sim_hard_sl_pct()),
+    }
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("CREATE TABLE IF NOT EXISTS sim_config (key TEXT PRIMARY KEY, value REAL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        conn.execute("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES ('account_start_balance', ?, CURRENT_TIMESTAMP)",
-                     (float(ACCOUNT_START_BALANCE),))
+        conn.executemany("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                         list(values.items()))
         conn.commit()
         conn.close()
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户起始资金 ${ACCOUNT_START_BALANCE:,.2f}")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户起始资金 ${ACCOUNT_START_BALANCE:,.2f}"
+              f" | 杠杆 {LEVERAGE}x | 单笔硬止损 {sim_hard_sl_pct()}%")
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入 EA 共享配置失败: {str(e)}")
 
@@ -455,7 +467,7 @@ def init_ea_close_seq():
 def check_ea_external_close():
     """读取 EA 写回的 ea_position.close_seq。
 
-    Aqua Funded 账户：Wave Stop≈合计浮亏 2% 强平；EA 用单笔硬止损(~2%)挂在 broker 兜底：触及时 MT5 持仓被打掉，
+    Aqua Funded 账户：Wave Stop＝合计浮亏 1% 记 strike；EA 用单笔硬止损(0.9%)挂在 broker 兜底：触及时 MT5 持仓被打掉，
     不会经过 Python 信号。EA 检测到仓位消失后递增 close_seq；此处发现新序号则返回 True，
     调用方应镜像平掉模拟仓（但不禁止当日再开仓，硬止损≠日亏 halt）。
 

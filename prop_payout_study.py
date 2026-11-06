@@ -7,7 +7,7 @@
 
   FTMO 2-Step：P1 +10% / P2 +5%（目标+1% 盘中触及或收盘达标），最少 4 天；日亏 5%（EA 4.75%）；总亏 10% 静态
   Aqua Standard 2-Step 100K：P1 +8% / P2 +5%；日亏 5%（EA 4.75%）；总亏 8% 静态；
-      funded 单笔硬止损 1.8%；满 14 天且余额 > 初始即提走超出部分，90% 分润再扣 3% 手续费
+      funded 单笔硬止损 0.9%（Wave Stop 1%）；满 14 天且余额 > 初始即提走超出部分，90% 分润再扣 3% 手续费
   Aqua Pay Later 200K：Challenge +3%、5% trailing、硬止损 0.95%、单笔浮亏 1% 封号；
       funded 规则同 backtest_aqua_paylater_funded.py（日亏 2.85%、5% trailing、日盈帽、15% 一致性、5 个 ≥0.5% 盈利日）
 
@@ -268,7 +268,7 @@ def job(spec):
             out.append((i, st, j))
     elif kind == 'aqua_std':
         ch = Engine(lev, 100_000.0, slip, daily_stop=100_000 * 0.05 * 0.95)
-        fd = Engine(lev, 100_000.0, slip, daily_stop=100_000 * 0.05 * 0.95, hard_sl=0.018)
+        fd = Engine(lev, 100_000.0, slip, daily_stop=100_000 * 0.05 * 0.95, hard_sl=0.009)
         for i in starts():
             st, j = phase(ch, i, 0.08, 0.05, 0.08, min_days=3)
             if st == 'pass' and j + 1 < len(DAYS):
