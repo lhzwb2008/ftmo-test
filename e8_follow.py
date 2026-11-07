@@ -24,11 +24,12 @@ SYMBOL = "HL_HIP3_XYZ_XYZ100"
 LOG_PATH = os.environ.get("SIMULATE_LOG", "/root/ftmo-test/simulate.log")
 STATE_PATH = os.environ.get("E8_STATE", "/root/ftmo-test/e8_follow_state.json")
 
-# $5,000、日亏 $125、总亏 $400、单日计入上限 $100。0.5x 名义约 $2,500，
-# 指数逆向 1% 大约亏 $25，离日亏线还剩四倍。
-NOTIONAL_MULT = 0.5
+# $5,000、日亏 $125、总亏 $400、单日计入上限 $100。
+# 近一年（2025-10-10 ~ 2026-10-16）4x 通过率最高、也够快：约 3 个月内 62% 的起点能过，
+# 中位 26 个交易日。再加大杠杆只增加爆仓，因为单日计入被 $100 封顶，亏的一边却放大。
+NOTIONAL_MULT = 4.0
 LOT_STEP = 0.01
-MAX_LOTS = 0.20
+MAX_LOTS = 1.5
 MIN_PRICE = 5_000.0
 MAX_PRICE = 80_000.0
 # 官方日亏 2.5%（$125）之前先平；总亏 8%（底线 $4,600）留 $100。
@@ -36,7 +37,7 @@ DAILY_LOSS_HALT = 100.0
 DAILY_ROOM_HALT = 0.5          # room.dailyPct，剩余百分点；0.5 = 还剩 $25
 STATIC_ROOM_HALT = 2.0         # 剩余 2 个百分点 = 离 $4,600 还有 $100
 PROFIT_CAP_HALT = 90.0         # 官方单日计入上限 $100，到 $90 就停
-STOP_LOSS_USD = 80.0           # 保护性止损，进程失联时由交易所挂单兜底
+STOP_LOSS_USD = 110.0          # 略宽于脚本的 $100 日亏停手，只兜进程失联；再紧会切掉策略自己的出场
 CROSS_PCT = 0.0015             # 限价穿过最新价 0.15%，相当于立刻成交的市价单
 SESSION_OPEN = dtime(9, 40)
 SESSION_CLOSE = dtime(15, 39)
