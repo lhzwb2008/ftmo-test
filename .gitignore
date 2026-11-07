@@ -1,6 +1,7 @@
 *.db
 __pycache__
 .env
+.env.e8
 *.log
 *.backup
 *.csv
