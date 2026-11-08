@@ -49,7 +49,7 @@ def main():
     print("  - 如 30 秒后仍有持仓, 请手动平掉并把 NT8 Log 面板截图发回排查")
 
     input("\n确认持仓清零后, 按回车结束...")
-    print("\n🎉 ATI 链路验证完成! 可以启动 simulate_futures_fundednext.py 或 simulate_futures_tradeify.py")
+    print("\n🎉 ATI 链路验证完成! 可以启动 simulate_futures_fundednext.py 或 simulate_futures_lucid.py")
 
 
 if __name__ == "__main__":

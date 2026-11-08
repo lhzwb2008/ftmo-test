@@ -63,19 +63,6 @@ FUNDEDNEXT_FLEX = FuturesProgram(
     },
 )
 
-TRADEIFY_SELECT_FLEX = FuturesProgram(
-    key="tradeify",
-    display_name="Tradeify",
-    model_name="Select Flex",
-    account_prefix="TDFY",
-    rules={
-        25_000: AccountRule(25_000, 1_500, 1_000, 10, 1, 3, ((0, 10),)),
-        50_000: AccountRule(50_000, 3_000, 2_000, 40, 1, 3, ((0, 20), (1_500, 30), (2_000, 40))),
-        100_000: AccountRule(100_000, 6_000, 3_000, 80, 2, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80))),
-        150_000: AccountRule(150_000, 9_000, 4_500, 120, 3, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80), (4_500, 120))),
-    },
-)
-
 # 购买时选定日亏开/关，之后不可改；EOD 回撤到 52,100 后锁在 50,100；funded 0~999 利润时上限 2 mini = 20 MNQ
 LUCID_FLEX = FuturesProgram(
     key="lucid",
@@ -825,7 +812,7 @@ def calculate_noise_area(df, lookback_days=LOOKBACK_DAYS, K1=1, K2=1):
     return df
 
 def current_max_contracts():
-    """返回当前阶段允许的 MNQ(Micro) 上限；Tradeify funded 按 EOD 权益阶梯扩容。"""
+    """返回当前阶段允许的 MNQ(Micro) 上限；funded 按 EOD 利润阶梯（funded_micro_scaling）取上限。"""
     if CURRENT_PHASE != "funded" or not ACTIVE_RULE.funded_micro_scaling:
         return ACTIVE_RULE.max_micro_contracts
 
