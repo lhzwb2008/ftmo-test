@@ -20,7 +20,7 @@ from strategy_params import (
     STRATEGY_VERSION,
 )
 import quiet_open
-from ninjatrader_client import create_client_or_none, sanitize_file_tag
+from ninjatrader_client import NinjaTraderError, choose_nt8_account, create_client_or_none, sanitize_file_tag
 
 load_dotenv(override=True)
 
@@ -226,27 +226,14 @@ def apply_instance_paths(tag):
 
 
 def prompt_instance_identity():
-    """交互输入 NT8 账户名; tag 由账户名自动生成。"""
+    """从 NinjaTrader 日志自动领取账户名; 领不到时再手填。tag 由账户名生成。"""
     global NT8_ACCOUNT
 
-    account = ""
-    while not account:
-        try:
-            account = input("请输入 NT8 账户名（Accounts 标签页 Name 列, 必填）: ").strip()
-        except EOFError:
-            print("错误: 无法读取输入，程序退出")
-            sys.exit(1)
-        if not account:
-            print("错误: 账户名不能为空")
-
-    if ACTIVE_PROGRAM.account_prefix and not account.upper().startswith(ACTIVE_PROGRAM.account_prefix):
-        confirm = input(
-            f"警告: 该账户名不像 {ACTIVE_PROGRAM.display_name} 账户"
-            f"（通常以 {ACTIVE_PROGRAM.account_prefix} 开头）。仍要继续? (yes/no): "
-        ).strip().lower()
-        if confirm not in ("y", "yes"):
-            print("已取消，请用正确的平台启动脚本和账户名重新启动")
-            sys.exit(1)
+    try:
+        account = choose_nt8_account(ACTIVE_PROGRAM.account_prefix)
+    except NinjaTraderError as exc:
+        print(f"错误: {exc}")
+        sys.exit(1)
 
     NT8_ACCOUNT = account
     apply_instance_paths(account)

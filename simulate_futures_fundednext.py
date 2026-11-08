@@ -39,7 +39,8 @@
 
 运行：Windows + NinjaTrader 8（开启 ATI）+ longport_data_service.py
   启动顺序：longport_data_service.py → NinjaTrader 连好账户并开 ATI → 本程序
-  启动后输入 NT8 账户名、规模、轮次（1 / funded）、当前余额。ATI 查不到持仓，只能空仓时重启。
+  启动后自动从 NinjaTrader 日志领取一个还没被占用的 FNFT 账户（两个窗口会各领一个），
+  再输入规模、轮次（1 / funded）、当前余额。ATI 查不到持仓，只能空仓时重启。
   通过挑战后以 funded 轮次重启；出金在官网手动申请，出金后重启时输入新的当前余额。
 """
 

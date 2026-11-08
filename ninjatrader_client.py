@@ -116,6 +116,204 @@ class NinjaTraderClient:
         return os.path.basename(path)
 
 
+def nt8_data_dir():
+    """NinjaTrader 8 用户目录。中文 Windows 的“文档”实际路径仍是 Documents。"""
+    home = os.path.expanduser("~")
+    for rel in (
+        ("Documents", "NinjaTrader 8"),
+        ("OneDrive", "Documents", "NinjaTrader 8"),
+        ("My Documents", "NinjaTrader 8"),
+    ):
+        path = os.path.join(home, *rel)
+        if os.path.isdir(path):
+            return path
+    return os.path.join(home, "Documents", "NinjaTrader 8")
+
+
+def _scan_bytes_for_accounts(data, prefix):
+    """从文本或 UTF-16 字节里抽出以 prefix 开头的账户名。"""
+    prefix = prefix.upper()
+    found = []
+    for encoding, step in (("ascii", 1), ("utf-16le", 2)):
+        needle = prefix.encode(encoding)
+        start = 0
+        while True:
+            index = data.find(needle, start)
+            if index < 0:
+                break
+            chars = [prefix]
+            pos = index + len(needle)
+            while pos + step <= len(data):
+                chunk = data[pos:pos + step]
+                if encoding == "utf-16le" and chunk[1] != 0:
+                    break
+                char = chr(chunk[0])
+                if not char.isalnum():
+                    break
+                chars.append(char.upper())
+                pos += step
+            name = "".join(chars)
+            if len(name) > len(prefix):
+                found.append(name)
+            start = index + max(len(needle), 1)
+    return found
+
+
+def discover_nt8_accounts(prefix, max_age_hours=36, root=None):
+    """读 NinjaTrader 最近的 log/trace，找出当前登录过的账户名。
+
+    ATI 文件接口不能列举账户。账户一连上，名字会出现在当天日志里。
+    只看最近 max_age_hours 内改过的文件，避免把以前用过、现在已不在列表里的旧账户也选上。
+    数据库里有全部历史账户，故意不扫。
+    """
+    if not prefix:
+        return []
+    root = root or nt8_data_dir()
+    cutoff = time.time() - max_age_hours * 3600
+    paths = []
+    for folder in ("log", "trace", "outgoing"):
+        directory = os.path.join(root, folder)
+        if not os.path.isdir(directory):
+            continue
+        for name in os.listdir(directory):
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                if os.path.getmtime(path) >= cutoff and os.path.getsize(path) <= 80 * 1024 * 1024:
+                    paths.append(path)
+            except OSError:
+                continue
+    found = []
+    seen = set()
+    for path in sorted(paths, key=lambda item: os.path.getmtime(item), reverse=True):
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as handle:
+                if size > 4 * 1024 * 1024:
+                    handle.seek(size - 4 * 1024 * 1024)
+                data = handle.read()
+        except OSError:
+            continue
+        for account in _scan_bytes_for_accounts(data, prefix):
+            if account not in seen:
+                seen.add(account)
+                found.append(account)
+    return sorted(found)
+
+
+def _process_alive(pid):
+    if pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _account_lock_path(account):
+    os.makedirs("logs", exist_ok=True)
+    return os.path.join("logs", "nt8_%s.pid" % sanitize_file_tag(account))
+
+
+def _locked_by_other(account):
+    path = _account_lock_path(account)
+    if not os.path.exists(path):
+        return None
+    try:
+        pid = int(open(path, encoding="ascii").read().strip())
+    except (OSError, ValueError):
+        return None
+    if pid == os.getpid() or not _process_alive(pid):
+        return None
+    return pid
+
+
+def claim_nt8_account(account):
+    """占住这个账户，避免同一台机器上两个进程下同一个账户。进程退出时释放。"""
+    import atexit
+    path = _account_lock_path(account)
+    fd = None
+    for _ in range(2):
+        other = _locked_by_other(account)
+        if other:
+            raise NinjaTraderError("账户 %s 已有程序在跑（pid %s）" % (account, other))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            fd = None
+    if fd is None:
+        raise NinjaTraderError("账户 %s 刚被另一个窗口领走，请再启动一次" % account)
+    os.write(fd, str(os.getpid()).encode("ascii"))
+    os.close(fd)
+
+    def _release():
+        try:
+            if int(open(path, encoding="ascii").read().strip()) == os.getpid():
+                os.remove(path)
+        except (OSError, ValueError):
+            pass
+
+    atexit.register(_release)
+    return path
+
+
+def choose_nt8_account(prefix):
+    """有账户前缀时，从 NinjaTrader 日志自动领一个还没被占用的账户。领不到再手填。"""
+    if prefix:
+        found = discover_nt8_accounts(prefix)
+        if found:
+            free = [name for name in found if not _locked_by_other(name)]
+            busy = [(name, _locked_by_other(name)) for name in found if _locked_by_other(name)]
+            if free:
+                chosen = free[0]
+                others = "、".join(free[1:])
+                print("从 NinjaTrader 读到 %d 个 %s 账户，本窗口自动使用 %s" % (len(found), prefix, chosen))
+                if others:
+                    print("再开一个窗口会自动用剩下的: %s" % others)
+                if busy:
+                    print("已在跑、跳过: " + "、".join("%s（pid %s）" % (name, pid) for name, pid in busy))
+                claim_nt8_account(chosen)
+                return chosen
+            print("读到的账户都已有程序在跑: " + "、".join(
+                "%s（pid %s）" % (name, pid) for name, pid in busy))
+        else:
+            print("没有在 %s 最近的日志里找到 %s 开头的账户（请先在 NinjaTrader 连上账户）。" % (nt8_data_dir(), prefix))
+            print("改为手动输入。")
+
+    while True:
+        try:
+            account = input("请输入 NT8 账户名（Accounts 标签页 Name 列）: ").strip()
+        except EOFError:
+            raise NinjaTraderError("无法读取输入")
+        if not account:
+            print("错误: 账户名不能为空")
+            continue
+        if prefix and not account.upper().startswith(prefix.upper()):
+            confirm = input("警告: 该账户名不以 %s 开头。仍要继续? (yes/no): " % prefix).strip().lower()
+            if confirm not in ("y", "yes"):
+                continue
+        other = _locked_by_other(account)
+        if other:
+            print("账户 %s 已有程序在跑（pid %s），请换一个" % (account, other))
+            continue
+        claim_nt8_account(account)
+        return account
+
+
 def create_client_or_none(account, instrument, incoming_dir=None, file_tag=None, logger_print=print):
     """尝试创建客户端; 缺少配置或 incoming 目录不可用时返回 None(仅记录信号模式)。"""
     try:
