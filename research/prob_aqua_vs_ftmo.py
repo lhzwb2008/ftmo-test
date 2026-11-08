@@ -14,10 +14,16 @@
     Funded（参考）：首次出金 = 满 14 日历日且收盘余额 > 初始
 
 数据：2024 年前 Quantra/qqq_market_hours_with_indicators.csv，之后 qqq_longport.csv
-用法：python prob_aqua_vs_ftmo.py [--step N] [--from YYYY-MM-DD] [--lev-aqua X] [--lev-ftmo X]
+用法：python research/prob_aqua_vs_ftmo.py [--step N] [--from YYYY-MM-DD] [--lev-aqua X] [--lev-ftmo X]
 """
 
 from __future__ import annotations
+
+import os as _os
+import sys as _sys
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
+_os.chdir(ROOT)  # 数据与输出路径均相对仓库根目录
 
 import argparse
 import multiprocessing as mp
@@ -32,8 +38,8 @@ from backtest import simulate_day
 import ftmo_ibkr_combo_backtest as combo
 
 LONG_HIST = '/Users/wenbozhang/workspace/Quantra/qqq_market_hours_with_indicators.csv'
-LONGPORT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qqq_longport.csv')
-MERGED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports', 'qqq_merged_minutes.csv')
+LONGPORT = os.path.join(ROOT, 'qqq_longport.csv')
+MERGED = os.path.join(ROOT, 'reports', 'qqq_merged_minutes.csv')
 SPLIT_DATE = pd.Timestamp('2024-01-01')
 
 AQUA_SIZE = 200_000.0

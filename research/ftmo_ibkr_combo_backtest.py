@@ -19,17 +19,23 @@ FTMO 10×100K（challenge 2x / funded 1.5x）+ IBKR MNQ 逐日联合回测。
   2) 2022-07-01 ~ 2024-08-07  同上
   3) 2024-07-01 ~ 2026-08-07  quantra/qqq_longport_2year.csv
 
-最差起点（python ftmo_ibkr_combo_backtest.py --worst）:
+最差起点（python research/ftmo_ibkr_combo_backtest.py --worst）:
   从多起点抽样里，挑两个「进入 funded 最慢、且之后仍有满两年数据」的开考日。
   2020-11-13 / 2020-10-19 几乎同一段慢行情，故第二段改用另一窗口最差的 2023-02-08。
 
 用法:
   conda activate quantra
-  python ftmo_ibkr_combo_backtest.py
-  python ftmo_ibkr_combo_backtest.py --worst
+  python research/ftmo_ibkr_combo_backtest.py
+  python research/ftmo_ibkr_combo_backtest.py --worst
 """
 
 from __future__ import annotations
+
+import os as _os
+import sys as _sys
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
+_os.chdir(ROOT)  # 数据与输出路径均相对仓库根目录
 
 import json
 import os
@@ -86,7 +92,7 @@ IBKR_INTRADAY_MM_PCT = 2904.80 / (_REF_MNQ_PX * MNQ_POINT_VALUE)
 QUANTRA_DIR = '/Users/Wezhang/workspace/quantra'
 HIST_DATA = os.path.join(QUANTRA_DIR, 'qqq_market_hours_with_indicators.csv')
 LONGPORT_2Y = os.path.join(QUANTRA_DIR, 'qqq_longport_2year.csv')
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports', 'ftmo_ibkr_combo')
+OUTPUT_DIR = os.path.join(ROOT, 'reports', 'ftmo_ibkr_combo')
 
 # 与 2024-07-01 ~ 2026-08-07 对齐的两段「两年」窗口 + 原窗口
 WINDOWS = [

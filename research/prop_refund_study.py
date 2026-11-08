@@ -13,10 +13,16 @@
   Aqua 100K 2-Step Standard：日亏 5% / 总亏 8% 静态；EA 单笔硬止损 0.9%（Wave Stop 1%）；首次出金前 3 个盈利日（≥ 0.5%）、
       14 天周期，前两次出金上限 $10,000；第 4 次出金退费
 
-用法：python prop_refund_study.py [extra_slip]   （默认 0.035，对应 prop_payout_study 的「实盘7折」）
+用法：python research/prop_refund_study.py [extra_slip]   （默认 0.035，对应 prop_payout_study 的「实盘7折」）
 """
 
 from __future__ import annotations
+
+import os as _os
+import sys as _sys
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
+_os.chdir(ROOT)  # 数据与输出路径均相对仓库根目录
 
 import multiprocessing as mp
 import pickle

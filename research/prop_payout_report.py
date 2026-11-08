@@ -2,6 +2,12 @@
 # -*- coding: utf-8 -*-
 """汇总 prop_payout_study.py 的结果。"""
 
+import os as _os
+import sys as _sys
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
+_os.chdir(ROOT)  # 数据与输出路径均相对仓库根目录
+
 import pickle
 import sys
 

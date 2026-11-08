@@ -32,6 +32,8 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
   - `LONGPORT_ACCESS_TOKEN`
 - **IBKR Gateway 直连** (`simulate_ibkr.py`)：Longport QQQ 信号 + `ib_insync` 交易 `MNQ`（Micro Nasdaq-100 期货，非 IBUST100 CFD）；开仓按 IBKR **日内**初始保证金满仓（使用 100% 净值；净值必须高于当日官表日内初始才开，否则跳过，每个交易日开盘打一行；Error 201 则按 90%/85%/70% 减张重试；官表拉不到不用估算值下单；收盘前平仓，不要按隔夜 12% 估）。已切实盘（Live 端口 4001），盈亏基数写死 `$4,500`（`START_CAPITAL`）；仓位仍按 Gateway 实时净值。同步请求设 `IB_REQUEST_TIMEOUT_SEC=15`，避免 Gateway 23:45 自动重启时 `reqPositions` 永久卡死。需本机已登录 IB Gateway 且有 CME/MNQ 权限。合约月默认每个交易日自动选主力（`MNQ_EXPIRY=''`，到期前 `MNQ_ROLL_DAYS_BEFORE_EXPIRY=8` 天切下一季，账户仍持有旧月仓位时不切换）；`MNQ_EXPIRY` 填 YYYYMM 则固定该月。IB 连接参数写死在脚本常量（当前 `127.0.0.1:4001` Live；Paper 用 `4002`）；`.env` 仅需 Longport 凭证。不写 SQLite、不跑 MT5。
 - **Data fetcher** (`data_fetch_from_longport.py`) also requires Longport credentials.
+- **期货 prop（Windows + NinjaTrader 8 ATI）**：共用 `simulate_futures_core.py`（`NT8_INSTRUMENT` 每季度换月手改）。`simulate_futures_fundednext.py` = FundedNext Flex（挑战/funded 张数：50K 2/2 + 挑战日盈帽 $900，100K 3/3，150K 3/2）；`simulate_futures_lucid.py` = LucidFlex 50K（启动时选日亏关=3 张 / 开=1 张，挑战日盈帽 $1,080）；`simulate_futures_tradeify.py` = Tradeify Select Flex 旧账户（Tradeify 禁止同一 bot 跨公司使用，不再新开）。测算结果与要买的产品写在各入口文件顶部注释。
+- **测算 / 研究脚本**在 `research/`（prop 出金测算、期货 prop 测算、FTMO+IBKR 组合回测等），从仓库根目录运行 `python3 research/xxx.py`；脚本会自动把工作目录切到仓库根目录，数据和输出仍在 `reports/`。
 
 ### Strategy parameters
 

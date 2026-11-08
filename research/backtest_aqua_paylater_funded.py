@@ -15,6 +15,12 @@
 
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
+_os.chdir(ROOT)  # 数据与输出路径均相对仓库根目录
+
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime

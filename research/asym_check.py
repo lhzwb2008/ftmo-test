@@ -1,7 +1,11 @@
-import os
-import sys
+import os as _os
+import sys as _sys
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
+_os.chdir(ROOT)  # 数据与输出路径均相对仓库根目录
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -16,7 +20,7 @@ for i in range(len(m.DAYS)):
     raw, *_ = m.run_day(i, m.AQUA_SIZE, 2.0, m.AQUA_SIZE, 0.0, 0.0, 0.0)
     rows.append((m.DAYS[i][0], capped, free, raw))
 df = pd.DataFrame(rows, columns=['date', 'capped', 'no_cap', 'raw'])
-df.to_csv(os.path.join(os.path.dirname(__file__), 'asym_daily.csv'), index=False)
+df.to_csv(os.path.join(ROOT, 'reports', 'asym_daily.csv'), index=False)
 for col in ['capped', 'no_cap', 'raw']:
     s = df[col]
     win, loss = s[s > 0], s[s < 0]

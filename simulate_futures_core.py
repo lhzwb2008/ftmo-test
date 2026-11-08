@@ -33,6 +33,11 @@ class AccountRule:
     trade_contracts: int       # 策略固定开仓手数（约合 1~1.5x 名义；不随行情/杠杆重算）
     minimum_trading_days: int = 0
     funded_micro_scaling: tuple = ()
+    eval_contracts: int = 0             # 挑战阶段手数（0 = 用 trade_contracts）
+    funded_contracts: int = 0           # funded 阶段手数（0 = 用 trade_contracts）
+    eval_daily_profit_cap: float = 0.0  # 挑战阶段单日盈利帽（含浮盈，触及即平仓并停到次日；0 = 不启用）
+    eval_daily_loss_limit: float = 0.0    # 平台软性日亏（挑战阶段；触及即平仓并停到次日；0 = 无）
+    funded_daily_loss_limit: float = 0.0  # 平台软性日亏（funded 阶段）
 
 
 @dataclass(frozen=True)
@@ -43,7 +48,6 @@ class FuturesProgram:
     account_prefix: str
     rules: dict
     consistency_pct: float = 0.40
-    no_daily_loss_limit: bool = True
     drawdown_lock_buffer: float = 100.0
 
 
@@ -53,9 +57,9 @@ FUNDEDNEXT_FLEX = FuturesProgram(
     model_name="Flex",
     account_prefix="FNFT",
     rules={
-        50_000: AccountRule(50_000, 2_500, 1_500, 30, 1),
-        100_000: AccountRule(100_000, 5_000, 2_500, 50, 2),
-        150_000: AccountRule(150_000, 8_000, 4_000, 80, 3),
+        50_000: AccountRule(50_000, 2_500, 1_500, 30, 2, eval_contracts=2, funded_contracts=2, eval_daily_profit_cap=900),
+        100_000: AccountRule(100_000, 5_000, 2_500, 50, 3, eval_contracts=3, funded_contracts=3),
+        150_000: AccountRule(150_000, 8_000, 4_000, 80, 3, eval_contracts=3, funded_contracts=2),
     },
 )
 
@@ -69,6 +73,34 @@ TRADEIFY_SELECT_FLEX = FuturesProgram(
         50_000: AccountRule(50_000, 3_000, 2_000, 40, 1, 3, ((0, 20), (1_500, 30), (2_000, 40))),
         100_000: AccountRule(100_000, 6_000, 3_000, 80, 2, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80))),
         150_000: AccountRule(150_000, 9_000, 4_500, 120, 3, 3, ((0, 30), (1_500, 40), (2_000, 50), (3_000, 80), (4_500, 120))),
+    },
+)
+
+# 购买时选定日亏开/关，之后不可改；EOD 回撤到 52,100 后锁在 50,100；funded 0~999 利润时上限 2 mini = 20 MNQ
+LUCID_FLEX = FuturesProgram(
+    key="lucid",
+    display_name="Lucid Trading",
+    model_name="LucidFlex(关日亏)",
+    account_prefix="",
+    rules={
+        50_000: AccountRule(
+            50_000, 3_000, 2_000, 40, 3, 3, ((0, 20),),
+            eval_contracts=3, funded_contracts=3, eval_daily_profit_cap=1_080,
+        ),
+    },
+)
+
+LUCID_FLEX_DLL = FuturesProgram(
+    key="lucid",
+    display_name="Lucid Trading",
+    model_name="LucidFlex(带日亏)",
+    account_prefix="",
+    rules={
+        50_000: AccountRule(
+            50_000, 3_000, 2_000, 40, 1, 3, ((0, 20),),
+            eval_contracts=1, funded_contracts=1, eval_daily_profit_cap=1_080,
+            eval_daily_loss_limit=1_200, funded_daily_loss_limit=1_200,
+        ),
     },
 )
 
@@ -97,7 +129,7 @@ SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
 # NinjaTrader 8 ATI（账户在启动时交互输入; 合约写在此处, 换月时改）
 NT8_ACCOUNT = ""  # 启动时交互输入: NT8 Accounts 标签页 Name 列（非 Display Name）
-NT8_INSTRUMENT = "MNQ 09-26"  # ⚠️ 每季度换月手动更新（3/6/9/12 月）
+NT8_INSTRUMENT = "MNQ 12-26"  # ⚠️ 每季度换月手动更新（3/6/9/12 月；12-26 于 2026-12-18 到期，约 12-10 前改 MNQ 03-27）
 NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming
 INSTANCE_TAG = None  # 由账户名自动生成, 用于日志/DB/OIF 隔离
 
@@ -116,8 +148,8 @@ TP_BUFFER_PCT = 0.005      # 止盈余量比例（按起始资金 0.5% 上调止
 
 # 止盈止损设置（金额）——启动时按上述比例自动计算，请勿手动修改
 MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
-MAX_DAILY_LOSS_AMOUNT = -1  # 日内止损: Flex 无日损限制且回测证明日内止损有害, 固定禁用
-MAX_DAILY_PROFIT_AMOUNT = -1  # 单日利润上限: Flex 无此规则, 固定禁用
+MAX_DAILY_LOSS_AMOUNT = -1  # 日内止损: 仅镜像平台软性日亏（AccountRule *_daily_loss_limit），策略本身不加日损
+MAX_DAILY_PROFIT_AMOUNT = -1  # 单日盈利帽: 仅挑战阶段（AccountRule.eval_daily_profit_cap），启动时按轮次设置
 
 # 交易时间设置（写死; 多开时各进程策略相同, 靠不同 NT8 账户隔离）
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
@@ -150,8 +182,8 @@ DAILY_PNL_HISTORY = {}  # 每日已实现盈亏历史 {date: pnl}，用于 consi
 EOD_HIGH_WATER = None  # EOD 追踪高水位（每日收盘后用账户净值更新, 启动时=max(起始资金, 当前金额)）
 
 # 止盈止损状态标志
-DAILY_STOP_TRIGGERED = False  # 当日是否触发了日内止损（Flex 禁用, 保留字段兼容主循环）
-DAILY_PROFIT_CAP_TRIGGERED = False  # 单日利润上限（Flex 禁用, 保留字段兼容主循环）
+DAILY_STOP_TRIGGERED = False  # 当日是否触发了平台日亏（触发后当日不再开仓）
+DAILY_PROFIT_CAP_TRIGGERED = False  # 当日是否触发了挑战期单日盈利帽（触发后当日不再开仓）
 PROFIT_TARGET_TRIGGERED = False  # 挑战止盈是否触发；触发后永久停止开仓，需重启并切换 funded
 DAILY_LOSS_MONITOR_ACTIVE = False  # 风控监控线程是否激活
 FORCE_CLOSE_POSITION = False  # 强制平仓标志（监控线程设置）
@@ -241,7 +273,7 @@ def prompt_capital_settings():
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
     global PROFIT_TARGET_PCT, EOD_HIGH_WATER, MAX_CONTRACTS
     global MAX_LOSS_AMOUNT, ACTIVE_RULE, CURRENT_PHASE, COMPLETED_TRADING_DAYS
-    global HISTORICAL_BEST_DAY_PROFIT
+    global HISTORICAL_BEST_DAY_PROFIT, MAX_DAILY_LOSS_AMOUNT, MAX_DAILY_PROFIT_AMOUNT
 
     while True:
         try:
@@ -305,23 +337,28 @@ def prompt_capital_settings():
     lock_high_water = start_balance + MAX_LOSS_AMOUNT + ACTIVE_PROGRAM.drawdown_lock_buffer
     EOD_HIGH_WATER = min(high_water, lock_high_water)
     PROFIT_TARGET_PCT = ACTIVE_RULE.profit_target / start_balance if phase == "1" else -1
+    daily_loss_limit = ACTIVE_RULE.eval_daily_loss_limit if phase == "1" else ACTIVE_RULE.funded_daily_loss_limit
+    MAX_DAILY_LOSS_AMOUNT = daily_loss_limit if daily_loss_limit > 0 else -1
+    daily_profit_cap = ACTIVE_RULE.eval_daily_profit_cap if phase == "1" else 0.0
+    MAX_DAILY_PROFIT_AMOUNT = daily_profit_cap if daily_profit_cap > 0 else -1
 
     phase_label = {"1": f"挑战阶段({ACTIVE_PROGRAM.model_name})", "funded": "Funded(已通过)"}[phase]
     print(f"当前轮次: {phase_label}")
     print(
-        f"固定开仓手数: {ACTIVE_RULE.trade_contracts} 张 MNQ"
+        f"固定开仓手数: {phase_contracts()} 张 MNQ"
         f"（账户规模 ${account_size:,.0f}；平台上限 {current_max_contracts()} 张）"
     )
     print(
         f"ℹ️ {ACTIVE_PROGRAM.model_name} 最大亏损 ${MAX_LOSS_AMOUNT:.0f}"
         f"（EOD 追踪，锁定底线 ${start_balance + ACTIVE_PROGRAM.drawdown_lock_buffer:.0f}）"
-        f" | {'无' if ACTIVE_PROGRAM.no_daily_loss_limit else '有'}日内亏损限制"
+        f" | 日内亏损限制: {f'${MAX_DAILY_LOSS_AMOUNT:.0f}（软性，触及平仓停手到次日）' if MAX_DAILY_LOSS_AMOUNT > 0 else '无'}"
         f" | 当前合约上限 {current_max_contracts()} 张 MNQ"
     )
     if phase == "1":
         print(
             f"ℹ️ 挑战期 Consistency: 最佳单日利润 ≤ 总利润 {CONSISTENCY_PCT*100:.0f}%"
             f" | 最少交易日 {ACTIVE_RULE.minimum_trading_days}"
+            f" | 单日盈利帽: {f'${MAX_DAILY_PROFIT_AMOUNT:.0f}（含浮盈，触及平仓停手到次日）' if MAX_DAILY_PROFIT_AMOUNT > 0 else '无'}"
         )
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
@@ -502,7 +539,7 @@ def calculate_pnl(entry_price, exit_price, direction, quantity=None):
         return 0.0, 0.0
 
     price_change_pct = (exit_price - entry_price) / entry_price
-    qty = abs(quantity) if quantity else ACTIVE_RULE.trade_contracts
+    qty = abs(quantity) if quantity else phase_contracts()
     exposure = qty * entry_price * NQ_QQQ_RATIO * MNQ_POINT_VALUE
 
     pnl = exposure * price_change_pct * direction
@@ -800,13 +837,16 @@ def current_max_contracts():
     return limit
 
 
-def calculate_contract_qty(qqq_price=None):
-    """按账户规模返回固定 MNQ 手数，不超过平台当前上限。
+def phase_contracts():
+    """当前轮次的固定 MNQ 手数（挑战 / funded 可分别配置，未配置则用 trade_contracts）。"""
+    if CURRENT_PHASE == "funded":
+        return ACTIVE_RULE.funded_contracts or ACTIVE_RULE.trade_contracts
+    return ACTIVE_RULE.eval_contracts or ACTIVE_RULE.trade_contracts
 
-    50K→1 / 100K→2 / 150K→3（约合 1~1.5x 名义）；不再按杠杆连续折算。
-    """
-    qty = ACTIVE_RULE.trade_contracts
-    return min(qty, current_max_contracts())
+
+def calculate_contract_qty(qqq_price=None):
+    """按账户规模与轮次返回固定 MNQ 手数，不超过平台当前上限；不按杠杆连续折算。"""
+    return min(phase_contracts(), current_max_contracts())
 
 def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rth=None, is_close=False):
     """下单: 写 ATI 指令文件由 NinjaTrader 8 执行; 同时把信号写入 SQLite 留痕。
@@ -915,7 +955,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     注意：盈亏按实际 MNQ 手数名义计算
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
-    global DAILY_PNL, PROFIT_TARGET_TRIGGERED
+    global DAILY_PNL, PROFIT_TARGET_TRIGGERED, DAILY_PROFIT_CAP_TRIGGERED
     
     print(
         f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -927,7 +967,10 @@ def daily_loss_monitor_thread(symbol, position_data):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
     print(
         f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] "
-        f"追踪回撤保险丝: 已禁用 | 日内止损: 已禁用 | 固定手数: {ACTIVE_RULE.trade_contracts} 张 MNQ | 平台上限: {current_max_contracts()}"
+        f"追踪回撤保险丝: 已禁用"
+        f" | 日内止损: {f'${MAX_DAILY_LOSS_AMOUNT:.0f}（镜像平台软性日亏）' if MAX_DAILY_LOSS_AMOUNT > 0 else '已禁用'}"
+        f" | 单日盈利帽: {f'${MAX_DAILY_PROFIT_AMOUNT:.0f}' if MAX_DAILY_PROFIT_AMOUNT > 0 else '已禁用'}"
+        f" | 固定手数: {phase_contracts()} 张 MNQ | 平台上限: {current_max_contracts()}"
     )
     
     while DAILY_LOSS_MONITOR_ACTIVE:
@@ -1007,6 +1050,25 @@ def daily_loss_monitor_thread(symbol, position_data):
                             f"（要求 ≤ {CONSISTENCY_PCT*100:.0f}%），交易日 "
                             f"{days_at_check}/{ACTIVE_RULE.minimum_trading_days}"
                         )
+
+                # ===== 挑战期单日盈利帽 / 平台软性日亏：触及即平仓，当日不再开仓 =====
+                if not (DAILY_PROFIT_CAP_TRIGGERED or DAILY_STOP_TRIGGERED):
+                    if MAX_DAILY_PROFIT_AMOUNT > 0 and current_daily_pnl >= MAX_DAILY_PROFIT_AMOUNT:
+                        print(
+                            f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 当日盈亏 ${current_daily_pnl:+.2f}"
+                            f" 达到挑战期单日盈利帽 ${MAX_DAILY_PROFIT_AMOUNT:.0f}，平仓并停手到次日 !!!!!"
+                        )
+                        with pnl_lock:
+                            FORCE_CLOSE_POSITION = True
+                            DAILY_PROFIT_CAP_TRIGGERED = True
+                    elif MAX_DAILY_LOSS_AMOUNT > 0 and current_daily_pnl <= -MAX_DAILY_LOSS_AMOUNT:
+                        print(
+                            f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 当日盈亏 ${current_daily_pnl:+.2f}"
+                            f" 触及平台日亏 ${MAX_DAILY_LOSS_AMOUNT:.0f}，平仓并停手到次日 !!!!!"
+                        )
+                        with pnl_lock:
+                            FORCE_CLOSE_POSITION = True
+                            DAILY_STOP_TRIGGERED = True
                 
                 status_parts = [f"当日盈亏: ${current_daily_pnl:+.2f}", f"累计盈亏: ${current_total_pnl:+.2f}"]
                 
@@ -1172,6 +1234,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 记录平仓交易（根据是止盈还是止损区分）
                 if PROFIT_TARGET_TRIGGERED:
                     action_type = "平仓(止盈)"
+                elif DAILY_PROFIT_CAP_TRIGGERED:
+                    action_type = "平仓(单日盈利帽)"
                 else:
                     action_type = "平仓(止损)"
                 DAILY_TRADES.append({
@@ -1299,7 +1363,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if last_date is not None and current_date != last_date:
             positions_opened_today = 0
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
-            DAILY_PROFIT_CAP_TRIGGERED = False  # 保留字段, Flex 不使用
+            DAILY_PROFIT_CAP_TRIGGERED = False  # 重置单日盈利帽标志
             # ⚠️ 挑战止盈不重置：需切换到 funded 后重启。
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
             
@@ -1382,7 +1446,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 初始资金: ${INITIAL_CAPITAL:.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日盈亏: ${DAILY_PNL:+.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 累计盈亏: ${TOTAL_PNL:+.2f}")
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 固定手数: {ACTIVE_RULE.trade_contracts} 张 MNQ")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 固定手数: {phase_contracts()} 张 MNQ")
             if MAX_DAILY_LOSS_AMOUNT > 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内最大亏损限额: ${MAX_DAILY_LOSS_AMOUNT:.2f}")
             else:
@@ -1895,6 +1959,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 if LOG_VERBOSE:
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
                 continue
+
+            if DAILY_PROFIT_CAP_TRIGGERED:
+                if LOG_VERBOSE:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发单日盈利帽，跳过开仓检查")
+                continue
             
                 
             # 检查今日是否达到最大持仓数
@@ -2103,12 +2172,17 @@ def run_application(program):
     print(f"账户起始资金: ${ACCOUNT_START_BALANCE:.2f}")
     print(f"账户当前金额(仓位基准): ${INITIAL_CAPITAL:.2f}")
     print(
-        f"固定开仓手数: {ACTIVE_RULE.trade_contracts} 张 MNQ "
+        f"固定开仓手数: {phase_contracts()} 张 MNQ "
         f"(规模 ${ACTIVE_RULE.account_size:,.0f}; 平台上限 {current_max_contracts()} 手)"
     )
     print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用, 需 consistency 达标'})")
     print(f"官方最大回撤: ${MAX_LOSS_AMOUNT:.2f}（EOD，交由平台处理；simulate 不做回撤保险丝）")
-    print("日内止损: 已禁用（当前模型无 DLL）")
+    if MAX_DAILY_LOSS_AMOUNT > 0:
+        print(f"日内止损: ${MAX_DAILY_LOSS_AMOUNT:.0f}（镜像平台软性日亏，触及平仓停手到次日）")
+    else:
+        print("日内止损: 已禁用（当前模型无 DLL）")
+    if MAX_DAILY_PROFIT_AMOUNT > 0:
+        print(f"单日盈利帽: ${MAX_DAILY_PROFIT_AMOUNT:.0f}（仅挑战期，含浮盈，触及平仓停手到次日）")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")

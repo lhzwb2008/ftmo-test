@@ -11,10 +11,16 @@
   Aqua Pay Later 200K：Challenge +3%、5% trailing、硬止损 0.95%、单笔浮亏 1% 封号；
       funded 规则同 backtest_aqua_paylater_funded.py（日亏 2.85%、5% trailing、日盈帽、15% 一致性、5 个 ≥0.5% 盈利日）
 
-用法：python prop_payout_study.py calibrate | run
+用法：python research/prop_payout_study.py calibrate | run
 """
 
 from __future__ import annotations
+
+import os as _os
+import sys as _sys
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
+_os.chdir(ROOT)  # 数据与输出路径均相对仓库根目录
 
 import multiprocessing as mp
 import pickle
