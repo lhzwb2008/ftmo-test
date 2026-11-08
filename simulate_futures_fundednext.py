@@ -39,9 +39,9 @@
 
 运行：Windows + NinjaTrader 8（开启 ATI）+ longport_data_service.py
   启动顺序：longport_data_service.py → NinjaTrader 连好账户并开 ATI → 本程序
-  启动后自动领取一个还没被占用的 FNFT 账户（两个窗口会各领一个），不用再输入。
-  账户名 FNFTCH 视为挑战；通过后新发的账户（名字不是 FNFTCH）视为 funded。
-  余额读 NinjaTrader 的 Cash Value，出金后重启会用到账后的余额。ATI 查不到持仓，只能空仓时重启。
+  启动后自动领取一个还没被占用的 FNFT 账户（两个窗口会各领一个）。
+  然后选择轮次：1=挑战，2=funded。规模默认 50K，余额读 NinjaTrader 的 Cash Value。
+  ATI 查不到持仓，只能空仓时重启。
 """
 
 from simulate_futures_core import FUNDEDNEXT_FLEX, run_application

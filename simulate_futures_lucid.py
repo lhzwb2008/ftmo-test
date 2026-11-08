@@ -36,9 +36,8 @@
 
 运行：Windows + NinjaTrader 8（开启 ATI）+ longport_data_service.py
   启动顺序：longport_data_service.py → NinjaTrader 连好账户并开 ATI → 本程序
-  启动后选日亏版本，再输入 NT8 账户名；规模 50K、挑战阶段不再询问。
-  余额读 NinjaTrader 的 Cash Value，读不到才按 $50,000。ATI 查不到持仓，只能空仓时重启。
-  Lucid 账户名看不出轮次，通过挑战后重启前设 NT8_PHASE=funded。
+  启动后选日亏版本，再输入 NT8 账户名，然后选择轮次：1=挑战，2=funded。
+  规模默认 50K，余额读 NinjaTrader 的 Cash Value，读不到才按 $50,000。ATI 查不到持仓，只能空仓时重启。
 """
 
 from simulate_futures_core import LUCID_FLEX, LUCID_FLEX_DLL, run_application

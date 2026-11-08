@@ -245,12 +245,7 @@ def prompt_instance_identity():
 
 
 def prompt_capital_settings():
-    """新账户不再询问。规模默认 50K。
-
-    轮次看账户名：FNFTCH 是挑战，其他 FNFT 账户是通过后新发的 funded。
-    余额读 NinjaTrader 的 Cash Value，读不到才用起始资金。
-    环境变量仍可覆盖：NT8_PHASE、NT8_BALANCE、NT8_SIZE。
-    """
+    """规模默认 50K，余额读 NinjaTrader。轮次每次启动自己选：1=挑战，2=funded。"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
     global PROFIT_TARGET_PCT, EOD_HIGH_WATER, MAX_CONTRACTS
     global MAX_LOSS_AMOUNT, ACTIVE_RULE, CURRENT_PHASE, COMPLETED_TRADING_DAYS
@@ -270,23 +265,20 @@ def prompt_capital_settings():
         print(f"错误: {ACTIVE_PROGRAM.model_name} 不支持规模 {account_size}")
         sys.exit(1)
 
-    phase_env = os.environ.get("NT8_PHASE", "").strip().lower()
-    account_name = (NT8_ACCOUNT or "").upper()
-    if phase_env:
-        phase = phase_env
-        phase_source = "环境变量 NT8_PHASE"
-    elif account_name.startswith("FNFTCH"):
-        phase = "1"
-        phase_source = "账户名 FNFTCH（挑战）"
-    elif account_name.startswith("FNFT"):
-        phase = "funded"
-        phase_source = "账户名不是 FNFTCH，按通过后新发的 funded 账户"
-    else:
-        phase = "1"
-        phase_source = "默认挑战"
-    if phase not in ("1", "funded"):
-        print("错误: NT8_PHASE 只能是 1 或 funded")
-        sys.exit(1)
+    while True:
+        try:
+            choice = input("请选择轮次（1=挑战 / 2=funded）: ").strip()
+        except EOFError:
+            print("错误: 无法读取输入，程序退出")
+            sys.exit(1)
+        if choice == "1":
+            phase = "1"
+            break
+        if choice == "2":
+            phase = "funded"
+            break
+        print("错误: 请输入 1 或 2")
+    phase_source = "启动时选择"
 
     start_balance = float(account_size)
     balance_env = os.environ.get("NT8_BALANCE", "").strip().replace(",", "").replace("$", "")
