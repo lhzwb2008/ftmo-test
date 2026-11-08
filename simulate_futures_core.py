@@ -243,61 +243,46 @@ def prompt_instance_identity():
 
 
 def prompt_capital_settings():
-    """启动时交互输入考试轮次、账户起始资金与当前金额。"""
+    """新账户不再询问。默认 50K（没有 50K 时用唯一规模）、挑战阶段、余额等于起始资金。
+
+    通过挑战或出金后重启，用环境变量改：NT8_PHASE=funded、NT8_BALANCE=出金后余额、NT8_SIZE=100K。
+    """
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
     global PROFIT_TARGET_PCT, EOD_HIGH_WATER, MAX_CONTRACTS
     global MAX_LOSS_AMOUNT, ACTIVE_RULE, CURRENT_PHASE, COMPLETED_TRADING_DAYS
     global HISTORICAL_BEST_DAY_PROFIT, MAX_DAILY_LOSS_AMOUNT, MAX_DAILY_PROFIT_AMOUNT
 
-    while True:
-        try:
-            sizes = "/".join(f"{size // 1000}K" for size in ACTIVE_PROGRAM.rules)
-            size_str = input(f"请输入账户规模（{sizes}）: ").strip().upper().replace("$", "")
-            if size_str.endswith("K"):
-                account_size = int(float(size_str[:-1]) * 1000)
-            else:
-                account_size = int(float(size_str.replace(",", "")))
-            if account_size not in ACTIVE_PROGRAM.rules:
-                print(f"错误: {ACTIVE_PROGRAM.model_name} 不支持该规模，请重新输入")
-                continue
+    size_env = os.environ.get("NT8_SIZE", "").strip().upper().replace("$", "")
+    if size_env:
+        account_size = int(float(size_env[:-1]) * 1000) if size_env.endswith("K") else int(float(size_env.replace(",", "")))
+    elif 50_000 in ACTIVE_PROGRAM.rules:
+        account_size = 50_000
+    elif len(ACTIVE_PROGRAM.rules) == 1:
+        account_size = next(iter(ACTIVE_PROGRAM.rules))
+    else:
+        print("错误: 未指定 NT8_SIZE，且该模型不止一个规模")
+        sys.exit(1)
+    if account_size not in ACTIVE_PROGRAM.rules:
+        print(f"错误: {ACTIVE_PROGRAM.model_name} 不支持规模 {account_size}")
+        sys.exit(1)
 
-            phase = input(
-                f"请输入当前轮次（1=挑战阶段({ACTIVE_PROGRAM.model_name}) / funded=已通过考试）: "
-            ).strip().lower()
-            if phase not in ("1", "funded"):
-                print("错误: 轮次必须是 1 或 funded，请重新输入")
-                continue
+    phase = os.environ.get("NT8_PHASE", "1").strip().lower()
+    if phase not in ("1", "funded"):
+        print("错误: NT8_PHASE 只能是 1 或 funded")
+        sys.exit(1)
 
-            start_balance = float(account_size)
-            current_str = input(f"请输入账户当前金额（如 {account_size}）: ").strip()
-            current_balance = float(current_str)
-            # EOD 高水位默认取起始/当前较大者；进程内跨日会自动上移，重启后不再手输。
-            high_water = max(start_balance, current_balance)
-            if current_balance <= 0:
-                print("错误: 金额必须大于 0，请重新输入")
-                continue
-
-            existing_profit = max(0.0, current_balance - start_balance)
-            if phase == "1":
-                # 挑战交易日数从 0 起算，进程内跨日自动累加；重启后不再手输。
-                completed_days = 0
-                if existing_profit > 0:
-                    best_day_str = input(
-                        "请输入历史最佳单日盈利"
-                        f"（直接回车按保守值 ${existing_profit:.2f} 计算）: "
-                    ).strip()
-                    historical_best_day = float(best_day_str) if best_day_str else existing_profit
-                else:
-                    historical_best_day = 0.0
-            else:
-                completed_days = 0
-                historical_best_day = 0.0
-            break
-        except ValueError:
-            print("错误: 输入格式不正确，请输入数字")
-        except EOFError:
-            print("错误: 无法读取输入，程序退出")
-            sys.exit(1)
+    start_balance = float(account_size)
+    balance_env = os.environ.get("NT8_BALANCE", "").strip().replace(",", "").replace("$", "")
+    current_balance = float(balance_env) if balance_env else start_balance
+    if current_balance <= 0:
+        print("错误: NT8_BALANCE 必须大于 0")
+        sys.exit(1)
+    # EOD 高水位默认取起始/当前较大者；进程内跨日会自动上移，重启后不再手输。
+    high_water = max(start_balance, current_balance)
+    existing_profit = max(0.0, current_balance - start_balance)
+    completed_days = 0
+    # 挑战中途重启且已有盈利时，拿不到真实最佳单日，按已有盈利保守计算，避免一致性目标被低估。
+    historical_best_day = existing_profit if phase == "1" else 0.0
 
     ACTIVE_RULE = ACTIVE_PROGRAM.rules[account_size]
     CURRENT_PHASE = phase
