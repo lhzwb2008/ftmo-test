@@ -18,7 +18,7 @@ E, I, S = 'eod', 'intraday', 'static'
 API_TOPSTEP = 'TopstepX API（$14.50/月），条款要求订单从本人设备发出、禁 VPS'
 NT8 = '允许 bot，无 API；NinjaTrader（Windows）或 TradingView webhook'
 TRADEIFY = '允许 bot，无 API；要求同一策略不得在其他公司使用'
-LUCID_R = '允许自动化（合同要求书面批准）；Rithmic 线可 Linux 直连 Protocol API'
+LUCID_R = '允许自动化（帮助中心无审批；旧版 Pro/Direct 合同写需书面批准）；Rithmic 线可 Linux 直连 Protocol API'
 
 
 def topstep(size, dd, target, fee, cap_std, cap_cons, path='std', no_act=False, fee_no_act=0.0):

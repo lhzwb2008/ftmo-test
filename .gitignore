@@ -7,3 +7,4 @@ __pycache__
 *.csv
 ibkr_mnq_margin.json
 reports/*.txt
+reports/*.pkl
