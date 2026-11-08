@@ -20,7 +20,9 @@ from strategy_params import (
     STRATEGY_VERSION,
 )
 import quiet_open
-from ninjatrader_client import NinjaTraderError, choose_nt8_account, create_client_or_none, sanitize_file_tag
+from ninjatrader_client import (
+    NinjaTraderError, choose_nt8_account, create_client_or_none, read_nt8_cash_value, sanitize_file_tag,
+)
 
 load_dotenv(override=True)
 
@@ -243,9 +245,11 @@ def prompt_instance_identity():
 
 
 def prompt_capital_settings():
-    """新账户不再询问。默认 50K（没有 50K 时用唯一规模）、挑战阶段、余额等于起始资金。
+    """新账户不再询问。规模默认 50K。
 
-    通过挑战或出金后重启，用环境变量改：NT8_PHASE=funded、NT8_BALANCE=出金后余额、NT8_SIZE=100K。
+    轮次看账户名：FNFTCH 是挑战，其他 FNFT 账户是通过后新发的 funded。
+    余额读 NinjaTrader 的 Cash Value，读不到才用起始资金。
+    环境变量仍可覆盖：NT8_PHASE、NT8_BALANCE、NT8_SIZE。
     """
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
     global PROFIT_TARGET_PCT, EOD_HIGH_WATER, MAX_CONTRACTS
@@ -266,16 +270,39 @@ def prompt_capital_settings():
         print(f"错误: {ACTIVE_PROGRAM.model_name} 不支持规模 {account_size}")
         sys.exit(1)
 
-    phase = os.environ.get("NT8_PHASE", "1").strip().lower()
+    phase_env = os.environ.get("NT8_PHASE", "").strip().lower()
+    account_name = (NT8_ACCOUNT or "").upper()
+    if phase_env:
+        phase = phase_env
+        phase_source = "环境变量 NT8_PHASE"
+    elif account_name.startswith("FNFTCH"):
+        phase = "1"
+        phase_source = "账户名 FNFTCH（挑战）"
+    elif account_name.startswith("FNFT"):
+        phase = "funded"
+        phase_source = "账户名不是 FNFTCH，按通过后新发的 funded 账户"
+    else:
+        phase = "1"
+        phase_source = "默认挑战"
     if phase not in ("1", "funded"):
         print("错误: NT8_PHASE 只能是 1 或 funded")
         sys.exit(1)
 
     start_balance = float(account_size)
     balance_env = os.environ.get("NT8_BALANCE", "").strip().replace(",", "").replace("$", "")
-    current_balance = float(balance_env) if balance_env else start_balance
+    if balance_env:
+        current_balance = float(balance_env)
+        balance_source = "环境变量 NT8_BALANCE"
+    else:
+        cash_value = read_nt8_cash_value(NT8_ACCOUNT)
+        if cash_value:
+            current_balance = cash_value
+            balance_source = "NinjaTrader Cash Value"
+        else:
+            current_balance = start_balance
+            balance_source = "读不到 NinjaTrader 余额，按起始资金"
     if current_balance <= 0:
-        print("错误: NT8_BALANCE 必须大于 0")
+        print("错误: 账户余额必须大于 0")
         sys.exit(1)
     # EOD 高水位默认取起始/当前较大者；进程内跨日会自动上移，重启后不再手输。
     high_water = max(start_balance, current_balance)
@@ -302,7 +329,8 @@ def prompt_capital_settings():
     MAX_DAILY_PROFIT_AMOUNT = daily_profit_cap if daily_profit_cap > 0 else -1
 
     phase_label = {"1": f"挑战阶段({ACTIVE_PROGRAM.model_name})", "funded": "Funded(已通过)"}[phase]
-    print(f"当前轮次: {phase_label}")
+    print(f"当前轮次: {phase_label}（{phase_source}）")
+    print(f"账户余额来源: {balance_source}")
     print(
         f"固定开仓手数: {phase_contracts()} 张 MNQ"
         f"（账户规模 ${account_size:,.0f}；平台上限 {current_max_contracts()} 张）"

@@ -271,6 +271,34 @@ def claim_nt8_account(account):
     return path
 
 
+def read_nt8_cash_value(account):
+    """用 ATI 的 DLL 读账户现金。文件接口没有这个数，Accounts 标签页上的 Cash Value 走这里。"""
+    if platform.system() != "Windows" or not account:
+        return None
+    candidates = (
+        r"C:\Program Files\NinjaTrader 8\bin\NinjaTrader.Client.dll",
+        r"C:\Program Files (x86)\NinjaTrader 8\bin\NinjaTrader.Client.dll",
+    )
+    dll_path = next((path for path in candidates if os.path.isfile(path)), None)
+    if dll_path is None:
+        return None
+    try:
+        import ctypes
+        nt = ctypes.WinDLL(dll_path)
+        nt.Connected.argtypes = [ctypes.c_int]
+        nt.Connected.restype = ctypes.c_int
+        nt.CashValue.argtypes = [ctypes.c_char_p]
+        nt.CashValue.restype = ctypes.c_double
+        if nt.Connected(0) != 0:
+            return None
+        value = float(nt.CashValue(str(account).encode("ascii")))
+    except (OSError, AttributeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
 def choose_nt8_account(prefix):
     """有账户前缀时，从 NinjaTrader 日志自动领一个还没被占用的账户。领不到再手填。"""
     if prefix:
