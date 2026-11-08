@@ -12,18 +12,19 @@ NinjaTrader 8 ATI 链路实时验证脚本（在 Windows 服务器上运行）
 import sys
 
 from ninjatrader_client import create_client_or_none
-
-# 与 simulate_futures_core.py 顶部保持一致
-NT8_ACCOUNT = "FNFTCHWENBOZHANG87184"
-NT8_INSTRUMENT = "MNQ 09-26"
-NT8_INCOMING_DIR = None  # None = 默认 ~/Documents/NinjaTrader 8/incoming
+from simulate_futures_core import NT8_INSTRUMENT, NT8_INCOMING_DIR
 
 
 def main():
     print("=" * 60)
     print("NinjaTrader 8 ATI 链路验证")
     print("=" * 60)
-    client = create_client_or_none(NT8_ACCOUNT, NT8_INSTRUMENT, NT8_INCOMING_DIR)
+    account = input("请输入 NT8 账户名（Accounts 标签页 Name 列）: ").strip()
+    if not account:
+        print("账户名不能为空")
+        sys.exit(1)
+    print(f"合约: {NT8_INSTRUMENT}（取自 simulate_futures_core.py）")
+    client = create_client_or_none(account, NT8_INSTRUMENT, NT8_INCOMING_DIR)
     if client is None:
         print("客户端初始化失败, 请检查上方错误信息")
         sys.exit(1)
