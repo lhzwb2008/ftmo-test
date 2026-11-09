@@ -695,6 +695,34 @@ def live_symbol_qty(symbol):
     return int(positions.get(symbol, {}).get("quantity", 0) or 0)
 
 
+def broker_max_open_qty(symbol, side, price):
+    """按实盘市价单查询可开股数。
+
+    买入上限是融资额度 margin_max_qty。做空时该字段经常为 0，可开数量在 cash_max_qty。
+    查询失败返回 None。
+    """
+    sdk_side = OrderSide.Buy if side == "Buy" else OrderSide.Sell
+    dec_price = Decimal(f"{float(price):.2f}")
+    last_err = None
+    for _ in range(2):
+        try:
+            est = TRADE_CTX.estimate_max_purchase_quantity(
+                symbol, OrderType.MO, sdk_side, dec_price,
+            )
+            margin_max = int(getattr(est, "margin_max_qty", 0) or 0)
+            cash_max = int(getattr(est, "cash_max_qty", 0) or 0)
+            if side == "Buy":
+                return margin_max, "margin_max_qty", margin_max, cash_max
+            if cash_max > 0:
+                return cash_max, "cash_max_qty", margin_max, cash_max
+            return margin_max, "margin_max_qty", margin_max, cash_max
+        except Exception as e:
+            last_err = e
+            time_module.sleep(1)
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 查询可开股数失败: {last_err}")
+    return None
+
+
 def wait_until_flat(symbol, timeout=8, interval=1.0):
     """平仓后等待账户持仓归零，避免查询滞后把下一笔 Sell 当成开空。"""
     deadline = time_module.time() + timeout
@@ -877,6 +905,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     max_profit_price = None         # 持仓期间的最优价格（多头：最高价，空头：最低价）
     trailing_tp_activated = False   # 追踪止盈是否已激活
     force_close_done_date = None    # 当日 15:39 强平只提交一次，避免持仓查询滞后重复 Sell 被当成开空
+    last_entry_attempt = None        # 同一根 K 只尝试一次开仓，避免拒单后在 30 秒窗口内连打
     
     while True:
         now = get_us_eastern_time()
@@ -1518,41 +1547,52 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 signal, df, LOG_VERBOSE or DEBUG_MODE, now.strftime('%Y-%m-%d %H:%M:%S'),
                 current_sigma=latest_row.get('sigma'),
             )
+            if signal != 0 and last_entry_attempt == (current_date, check_time_str):
+                signal = 0
             if signal != 0:
+                last_entry_attempt = (current_date, check_time_str)
                 # 保留交易信号日志，并添加VWAP和上下界信息
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发{'多' if signal == 1 else '空'}头入场信号!")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前价格: {price}, VWAP: {latest_row['VWAP']:.4f}, 上界: {latest_row['UpperBound']:.4f}, 下界: {latest_row['LowerBound']:.4f}, 止损: {stop}")
                 
                 available_capital = get_account_balance()
                 size_mult = quiet_open.current_multiplier(now.date())
+                side = "Buy" if signal > 0 else "Sell"
                 # 应用杠杆比例；顶格 10x 市价单会触发购买力风控，多空都减 1 股留余量
                 adjusted_capital = available_capital * LEVERAGE * size_mult
                 position_size = floor(adjusted_capital / latest_price)
                 if position_size > 0:
                     position_size -= 1
-                if position_size <= 0:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: 资金不足（10x 减1股后为 0），跳过本根K")
-                    continue
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 仓位系数: {size_mult}, 调整后资金: ${adjusted_capital:.2f}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股（10x 计算结果减 1 股）")
-                side = "Buy" if signal > 0 else "Sell"
-                order_id, live_qty = open_if_flat(symbol, side, position_size, outside_rth=outside_rth_setting)
-                if not order_id:
-                    position_quantity = live_qty
-                    continue
-
-                position_quantity = live_qty
-                entry_price = latest_price
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} 实盘 {live_qty} {symbol} 价格: {entry_price}")
-
-                DAILY_TRADES.append({
-                    "time": now.strftime('%Y-%m-%d %H:%M:%S'),
-                    "action": "开仓",
-                    "side": side,
-                    "quantity": abs(int(live_qty)),
-                    "price": entry_price,
-                    "pnl": None
-                })
+                raw_size = position_size
+                cap_info = broker_max_open_qty(symbol, side, latest_price)
+                if cap_info is None:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: 查询不到券商可开股数，跳过本根K")
+                else:
+                    cap, cap_label, margin_max, cash_max = cap_info
+                    if position_size > cap:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 10x 计算 {raw_size} 股超过市价{cap_label} {cap}"
+                              f"（margin_max_qty={margin_max}, cash_max_qty={cash_max}），改为 {cap} 股")
+                        position_size = cap
+                    if position_size <= 0:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: 券商可开股数为 0，跳过本根K")
+                    else:
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 可用资金: ${available_capital:.2f}, 杠杆比例: {LEVERAGE}倍, 仓位系数: {size_mult}, 调整后资金: ${adjusted_capital:.2f}")
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓数量: {position_size} 股（不超过市价{cap_label} {cap}）")
+                        order_id, live_qty = open_if_flat(symbol, side, position_size, outside_rth=outside_rth_setting)
+                        if order_id:
+                            position_quantity = live_qty
+                            entry_price = latest_price
+                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓成功: {side} 实盘 {live_qty} {symbol} 价格: {entry_price}")
+                            DAILY_TRADES.append({
+                                "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+                                "action": "开仓",
+                                "side": side,
+                                "quantity": abs(int(live_qty)),
+                                "price": entry_price,
+                                "pnl": None
+                            })
+                        else:
+                            position_quantity = live_qty
         
 
             
@@ -1584,7 +1624,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
 
 if __name__ == "__main__":
     print("\n长桥API交易策略启动")
-    print("版本: 1.3.3 (ftmo-test: 开仓等券商终态，10x 减 1 股)")
+    print("版本: 1.3.4 (ftmo-test: 开仓不超过市价融资上限 margin_max_qty)")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"行情缓存: {os.path.abspath(MARKET_DATA_DB_PATH)}")
     if DEBUG_MODE:
