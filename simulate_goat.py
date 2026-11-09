@@ -890,7 +890,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         print(f"调试模式已开启! 使用时间: {now_et.strftime('%Y-%m-%d %H:%M:%S')}")
         if DEBUG_ONCE:
             print("单次运行模式已开启，策略将只运行一次")
-    
+
+    # 周末等非交易日启动时，启动当日（美东自然日）每小时复查，避免一次睡 12 小时跨过下一交易日开盘
+    strategy_started_date = now_et.date()
+
     # 模拟模式：不需要获取实际账户余额
     # initial_capital = get_account_balance()
     # if initial_capital <= 0:
@@ -1071,10 +1074,20 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"  当日盈亏: ${DAILY_PNL:+.2f}")
                     print(f"  累计盈亏: ${TOTAL_PNL:+.2f}")
                     print("=" * 50)
-            retry_hours = 1 if calendar_stale else 12
+            # 启动当日每小时复查；日历过期同样短间隔。之后的非交易日仍按 12 小时
+            on_startup_day = current_date == strategy_started_date
+            if calendar_stale:
+                retry_hours = 1
+                retry_note = "交易日历缓存过期"
+            elif on_startup_day:
+                retry_hours = 1
+                retry_note = "程序启动首日"
+            else:
+                retry_hours = 12
+                retry_note = "非交易日"
             next_check_time = now + timedelta(hours=retry_hours)
             wait_seconds = (next_check_time - now).total_seconds()
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {retry_hours} 小时后重新检查")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] {retry_hours} 小时后重新检查（{retry_note}）")
             time_module.sleep(wait_seconds)
             continue
             
