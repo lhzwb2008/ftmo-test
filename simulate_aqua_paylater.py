@@ -230,8 +230,8 @@ def prompt_capital_settings():
         MAX_PROFIT_AMOUNT = -1
         print(f"考核通过线: 官方权益 ${official_equity:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）")
         print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（官方线 + 滑点余量 ${pass_buffer:.2f}，由 EA 按真实权益逐 tick 全平）")
-        if current_balance >= CHALLENGE_PASS_EQUITY:
-            print("警告: 当前金额已达到考核平仓线，无需继续交易，程序退出")
+        if current_balance >= official_equity:
+            print("警告: 当前金额已达到官方考核通过线，无需继续交易，程序退出")
             sys.exit(0)
         MAX_DAILY_PROFIT_AMOUNT = -1
         print("单日利润上限: 已禁用（Challenge 阶段不设日盈 cap）")
@@ -408,9 +408,11 @@ def write_sim_config():
                      (float(ACCOUNT_START_BALANCE),))
         conn.execute("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES ('challenge_pass_equity', ?, CURRENT_TIMESTAMP)",
                      (float(CHALLENGE_PASS_EQUITY),))
-        if CHALLENGE_PASS_EQUITY <= 0:
-            conn.execute("CREATE TABLE IF NOT EXISTS ea_pass_status (id INTEGER PRIMARY KEY, halted INTEGER, equity REAL, target REAL, updated_at TEXT)")
-            conn.execute("DELETE FROM ea_pass_status WHERE id = 1")
+        # 能启动说明余额还没到官方通过线：换新会话号让 EA 清掉 pass_halted，并删掉上一阶段/上一账户的通过记录
+        conn.execute("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES ('challenge_pass_session', ?, CURRENT_TIMESTAMP)",
+                     (float(int(time_module.time())),))
+        conn.execute("CREATE TABLE IF NOT EXISTS ea_pass_status (id INTEGER PRIMARY KEY, halted INTEGER, equity REAL, target REAL, updated_at TEXT)")
+        conn.execute("DELETE FROM ea_pass_status WHERE id = 1")
         conn.commit()
         conn.close()
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户起始资金 ${ACCOUNT_START_BALANCE:,.2f}")

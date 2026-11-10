@@ -26,7 +26,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 ### Running
 
 - **Standalone utility scripts** (`check_db.py`, `test_three_db_signals.py`, `clear_db_data.py`, `delete_db.py`) work without any API credentials.
-- **Trading simulators** (`simulate_ftmo.py`, `simulate_fundednext.py`, `simulate_the5ers.py`, `simulate_icmarkets.py`, `simulate_ttp.py`, `simulate_blueberry.py`, `simulate_goat.py`, `simulate_aqua.py`, `simulate_aqua_paylater.py`) require Longport API credentials via a `.env` file or environment variables:
+- **Trading simulators** (`simulate_ftmo.py`, `simulate_fundednext.py`, `simulate_the5ers.py`, `simulate_icmarkets.py`, `simulate_ttp.py`, `simulate_blueberry.py`, `simulate_goat.py`, `simulate_aqua.py`, `simulate_aqua_paylater.py`, `simulate_wsfunded.py`) require Longport API credentials via a `.env` file or environment variables:
   - `LONGPORT_APP_KEY`
   - `LONGPORT_APP_SECRET`
   - `LONGPORT_ACCESS_TOKEN`
@@ -42,6 +42,8 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 - 开盘冷清半仓（`quiet_open.py`）：当日 09:30–09:39 成交量 / 前 20 个交易日同窗口均值 < 0.65 时，当日开仓手数 ×0.5。MT5 路径写入 `signals.size_mult`，EA 在 `CalculateLotSize()` 结果上乘系数并按步长向下取整（不低于最小手数）；`simulate.py` / `simulate_ibkr.py` / `simulate_futures_core.py` 在 Python 端缩小数量（期货 1 张时保持 1 张）。
 - 分钟历史窗口 35 个自然日（`history_days_back`），`longport_data_service.py` 每天首轮及每 30 分钟拉一次完整窗口，其余轮次只拉当日。
 - 账户初始资金：simulate 启动时把输入的"账户起始资金"写入信号库 `sim_config` 表（key=`account_start_balance`），EA 在 OnInit 及之后每 30 秒读取，用于日亏限额 / 硬止损 / 静态回撤；读不到时回退 EA input `InitialBalance` / `AccountInitialBalance`（Aqua 2-Step EA 除外，见下）。启动日志出现"🔗 账户初始资金已从 simulate 同步"即生效。已开仓位的保护性 SL 只收紧不放松，初始资金调大后对当前持仓不会放宽。
+- 考核通过（MT5 prop 各家 + WSFunded）：simulate 把"官方通过权益 + 0.1% 滑点余量"写入 `sim_config.challenge_pass_equity`（Funded=0），EA 按真实权益逐 tick 触线全平并停止开仓（GV `pass_halted` + 表 `ea_pass_status`）。simulate 每次启动写新的 `challenge_pass_session` 并删掉 `ea_pass_status`，EA 见会话号变化即清除 `pass_halted`，所以换阶段/换账户只需重启 simulate；只重启 EA 不会清除。启动时余额已达官方通过线则直接退出。
+- WSFunded Ultra（`simulate_wsfunded.py` / `SQLiteSignalEA_wsfunded.mq5`，`trading_signals_wsfunded.db`，Magic `20261110`）：开仓必须同时挂单笔止损 = min(起始资金, 当日锚点) × 5% × 50% × (1−缓冲)，挂不出就放弃该信号。只接一张账户，禁止复制到其它 WSFunded 账户。
 - 部署顺序：`longport_data_service.py` → `simulate_*.py`（启动时重建 signals 表，带 `size_mult` 列）→ 在 MetaEditor 重新编译并重载 EA（Leverage 等 inputs 不变）。新 EA 读旧表时自动回退为满仓，旧 EA 读新表忽略 `size_mult`，顺序颠倒不会出错，只是冷清减仓不生效。
 
 ### Key gotchas

@@ -1569,10 +1569,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: 查询不到券商可开股数，跳过本根K")
                 else:
                     cap, cap_label, margin_max, cash_max = cap_info
-                    if position_size > cap:
+                    # 按估算价顶格下市价单，成交价略高就会被购买力风控拒，和 10x 一样留 1 股
+                    usable_cap = max(cap - 1, 0)
+                    if position_size > usable_cap:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 10x 计算 {raw_size} 股超过市价{cap_label} {cap}"
-                              f"（margin_max_qty={margin_max}, cash_max_qty={cash_max}），改为 {cap} 股")
-                        position_size = cap
+                              f"（margin_max_qty={margin_max}, cash_max_qty={cash_max}），改为 {usable_cap} 股（上限减 1 股）")
+                        position_size = usable_cap
                     if position_size <= 0:
                         print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Warning: 券商可开股数为 0，跳过本根K")
                     else:
@@ -1624,7 +1626,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
 
 if __name__ == "__main__":
     print("\n长桥API交易策略启动")
-    print("版本: 1.3.4 (ftmo-test: 开仓不超过市价融资上限 margin_max_qty)")
+    print("版本: 1.3.5 (ftmo-test: 开仓不超过市价融资上限 margin_max_qty 减 1 股)")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
     print(f"行情缓存: {os.path.abspath(MARKET_DATA_DB_PATH)}")
     if DEBUG_MODE:
