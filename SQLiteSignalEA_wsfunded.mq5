@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-11-10c Ultra单笔止损+免配置"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-11-10d Ultra单笔止损+免配置+考核止盈挂单"  // 每次改 EA 逻辑时同步更新日期和说明
 // 杠杆、起始资金、绑定账户、考核通过线全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 // Ultra：单个 trading idea 的止损风险 ≤ 当日回撤额度的 50%。下单时必须带上，禁止只挂日亏宽止损。
 #define   IDEA_RISK_FRACTION  0.50
@@ -70,6 +70,8 @@ bool   SimConfigReady(string &why);
 void   LoadSimConfig(bool force);
 void   WriteAccountHeartbeat();
 void   CheckBalanceOperations();
+void   UpdatePassTP();
+double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -134,6 +136,7 @@ int OnInit()
     
     // 启动时立即检查已有持仓保护性SL（硬止损∩日亏线取更紧）
     EnsureStopLosses();
+    UpdatePassTP();
     SyncPositionState();
     WriteAccountHeartbeat();
     // 周末/休市没有 tick，心跳、配置重读、出入金检测靠定时器
@@ -191,6 +194,7 @@ void OnTick()
     last_check_time = current_time;
     // 统一维护保护性SL：min(单笔硬止损, 日亏触发线SL)，取更紧者
     UpdateProtectiveSL();
+    UpdatePassTP();
     CheckDatabaseSignals();
 }
 
@@ -464,6 +468,111 @@ void UpdateProtectiveSL()
 void EnsureStopLosses()
 {
     UpdateProtectiveSL();
+}
+
+//+------------------------------------------------------------------+
+//| 考核止盈价：净值到达平仓线时本仓位对应的价格（0=不需要/算不出）。   |
+//| pos_float 为本仓位当前浮盈+隔夜费，从净值里扣掉后得到不含本仓的基数。 |
+//+------------------------------------------------------------------+
+double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float)
+{
+    if(g_challenge_pass_equity <= 0 || lots <= 0 || open_price <= 0)
+        return 0;
+    double needed = g_challenge_pass_equity - (AccountInfoDouble(ACCOUNT_EQUITY) - pos_float);
+    if(needed <= 0)
+        return 0;
+
+    bool is_buy = (type == POSITION_TYPE_BUY);
+    double per_unit = 0;
+    if(!OrderCalcProfit(is_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, open_price,
+                        is_buy ? open_price + 1.0 : open_price - 1.0, per_unit) || per_unit <= 0)
+    {
+        double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+        double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+        per_unit = (ts > 0) ? lots * tick_value / ts : 0;
+    }
+    if(per_unit <= 0)
+        return 0;
+
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tick_size <= 0) tick_size = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double raw = is_buy ? open_price + needed / per_unit : open_price - needed / per_unit;
+    if(raw <= 0)
+        return 0;
+    // 多单向上、空单向下取整到最小价位，保证成交时净值不低于平仓线
+    double tp = is_buy ? MathCeil(raw / tick_size) * tick_size : MathFloor(raw / tick_size) * tick_size;
+    return NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+}
+
+//+------------------------------------------------------------------+
+//| 考核阶段给持仓挂服务器端止盈（净值到平仓线的价格），EA 掉线也会成交。 |
+//| 止盈是仓位自带属性，仓位被策略/止损/收盘平掉时随之消失，无需撤单。   |
+//| 挂不出（离现价太近）时不挂，由 ChallengePassCheck 逐 tick 兜底。     |
+//+------------------------------------------------------------------+
+void UpdatePassTP()
+{
+    static datetime last_fail = 0;
+    static ulong    noted_ticket = 0;
+    if(pass_halted || TimeLocal() - last_fail < 30)
+        return;
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tick_size <= 0) tick_size = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!PositionSelectByTicket(ticket))
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+            continue;
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        double cur_sl = PositionGetDouble(POSITION_SL);
+        double cur_tp = PositionGetDouble(POSITION_TP);
+
+        if(g_challenge_pass_equity <= 0)
+        {
+            // Funded / 通过线清零：撤掉之前挂的考核止盈
+            if(cur_tp > 0)
+            {
+                if(trade.PositionModify(ticket, cur_sl, 0))
+                    Print("🎯 无考核通过线，已撤掉持仓 ", ticket, " 的考核止盈");
+                else
+                    last_fail = TimeLocal();
+            }
+            continue;
+        }
+
+        double target_tp = CalcPassTPPrice(type, PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
+                                           PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP));
+        if(target_tp <= 0)
+            continue;
+        if(cur_tp > 0 && MathAbs(cur_tp - target_tp) < tick_size / 2)
+            continue;
+
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        bool placeable = (type == POSITION_TYPE_BUY) ? (target_tp > bid + min_stop) : (target_tp < ask - min_stop);
+        if(!placeable)
+        {
+            if(noted_ticket != ticket)
+            {
+                noted_ticket = ticket;
+                Print("🎯 考核止盈价 ", DoubleToString(target_tp, digits), " 离现价太近挂不出，由逐 tick 权益检查兜底");
+            }
+            continue;
+        }
+
+        if(trade.PositionModify(ticket, cur_sl, target_tp))
+            Print("🎯 已挂考核止盈: ", DoubleToString(target_tp, digits),
+                  "（成交时净值≈$", DoubleToString(g_challenge_pass_equity, 2), "，持仓 ", ticket, "）");
+        else
+        {
+            last_fail = TimeLocal();
+            Print("❌ 挂考核止盈失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode(), "，30 秒后重试");
+        }
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -893,6 +1002,8 @@ void ProcessSignal(long signal_id, string action)
     {
         Print("✅ 执行成功");
         MarkSignalConsumed(signal_id);
+        if(action == "BUY" || action == "SELL")
+            UpdatePassTP();
     }
     else
     {
@@ -1354,10 +1465,16 @@ void ChallengePassCheck()
         }
         return;
     }
+    // 考核止盈单由券商成交后，成交价可能略差于挂单价：空仓且余额已过官方线即视为通过
+    bool flat_passed = g_challenge_official_equity > 0 && !HasPassPositions()
+                       && AccountInfoDouble(ACCOUNT_BALANCE) >= g_challenge_official_equity;
     double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    if(equity <= 0 || equity < g_challenge_pass_equity)
+    if(!flat_passed && (equity <= 0 || equity < g_challenge_pass_equity))
         return;
-    Print("!!!!! 考核通过线已达到，立即全平并停止开仓 !!!!!");
+    if(flat_passed)
+        Print("!!!!! 已空仓且余额达到官方通过线（考核止盈单已成交），停止开仓 !!!!!");
+    else
+        Print("!!!!! 考核通过线已达到，立即全平并停止开仓 !!!!!");
     Print("当前权益: $", DoubleToString(equity, 2),
           " 通过线: $", DoubleToString(g_challenge_pass_equity, 2));
     CloseAllPositions();

@@ -53,9 +53,6 @@ CHALLENGE_PASS_BUFFER_PCT = 0.001  # 考核平仓滑点余量（起始资金的 
 CHALLENGE_PASS_EQUITY = 0.0        # 考核平仓权益；0=Funded 或未启用，EA 不做通过检测
 CHALLENGE_OFFICIAL_EQUITY = 0.0    # 官方通过权益（不含余量），EA 平仓后余额低于它就恢复交易
 
-# 止盈设置（金额）——启动时按上述比例自动计算，请勿手动修改；日内止损由 MT5 EA 执行
-MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
-
 # 交易时间设置（只跑一张账户。直接回车用 09:40–15:40）
 TRADING_SESSION_HOURS = 6  # 交易窗口长度（小时），结束时间 = 开始时间 + 此值
 TRADING_TIME_PRESETS = {
@@ -311,7 +308,7 @@ def parse_positive(raw):
 
 def prompt_capital_settings():
     """余额和登录号读 EA 心跳；只确认轮次、起始资金、杠杆、开仓时间（同一账户回车沿用上次）"""
-    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, CHALLENGE_PASS_EQUITY
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, CHALLENGE_PASS_EQUITY
     global PROFIT_TARGET_PCT, LEVERAGE, ACCOUNT_LOGIN, CURRENT_PHASE, CHALLENGE_OFFICIAL_EQUITY
 
     info = wait_for_ea_account()
@@ -355,9 +352,8 @@ def prompt_capital_settings():
         official_equity = start_balance * (1.0 + PROFIT_TARGET_PCT)
         CHALLENGE_OFFICIAL_EQUITY = official_equity
         CHALLENGE_PASS_EQUITY = official_equity + pass_buffer
-        MAX_PROFIT_AMOUNT = -1
         print(f"考核通过线: 官方权益 ${official_equity:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）")
-        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（官方线 + 滑点余量 ${pass_buffer:.2f}，由 EA 按真实权益逐 tick 全平；"
+        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（官方线 + 滑点余量 ${pass_buffer:.2f}，EA 开仓即挂券商止盈，逐 tick 权益检查兜底；"
               f"平完余额若低于官方线，EA 自动恢复交易）")
         if current_balance >= official_equity:
             print("警告: 当前金额已达到官方考核通过线，无需继续交易，程序退出")
@@ -365,7 +361,6 @@ def prompt_capital_settings():
     else:
         CHALLENGE_OFFICIAL_EQUITY = 0.0
         CHALLENGE_PASS_EQUITY = 0.0
-        MAX_PROFIT_AMOUNT = -1
         print("账户止盈: 已禁用（Funded 账户无利润目标，日内止损由 EA 执行）")
     
     print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
@@ -1053,9 +1048,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已启动 ===")
     if CHALLENGE_PASS_EQUITY > 0:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 真实权益逐 tick）")
-    elif MAX_PROFIT_AMOUNT > 0:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 券商止盈 + 逐 tick 兜底）")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 由 MT5 EA 端执行（本线程仅镜像 EA 停止标志）")
@@ -1143,10 +1136,6 @@ def daily_loss_monitor_thread(symbol, position_data):
                               f"（模拟持仓: {position_quantity}, EA持仓: {ea_has_position}, 原因: {ea_ext_reason}）")
                 
                 status_parts = [f"当日盈亏: ${current_daily_pnl:+.2f}", f"累计盈亏: ${current_total_pnl:+.2f}"]
-                
-                if MAX_PROFIT_AMOUNT > 0:
-                    profit_remain = MAX_PROFIT_AMOUNT - current_total_pnl
-                    status_parts.append(f"距止盈: ${profit_remain:.2f}")
                 
                 status_parts.append(f"持仓: {position_quantity}")
                 
@@ -2250,9 +2239,9 @@ if __name__ == "__main__":
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     if CHALLENGE_PASS_EQUITY > 0:
-        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 按真实权益逐 tick 全平）")
+        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈，逐 tick 权益检查兜底）")
     else:
-        print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
+        print("考核平仓线: 无（Funded 阶段不设利润目标）")
     print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL；换账户、出入金自动重算锚点）")
     print(f"单笔止损: min(起始资金, 当日锚点) × {DAILY_LOSS_PCT*100:.0f}% × {IDEA_RISK_FRACTION*100:.0f}% × {1-IDEA_RISK_BUFFER_PCT:.2f}，下单时一并挂出")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
