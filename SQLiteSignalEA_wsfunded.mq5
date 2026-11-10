@@ -5,11 +5,14 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-11-10d Ultra单笔止损+免配置+考核止盈挂单"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-11-10e Ultra单笔止损+免配置+考核止盈挂官方线"  // 每次改 EA 逻辑时同步更新日期和说明
 // 杠杆、起始资金、绑定账户、考核通过线全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 // Ultra：单个 trading idea 的止损风险 ≤ 当日回撤额度的 50%。下单时必须带上，禁止只挂日亏宽止损。
 #define   IDEA_RISK_FRACTION  0.50
 #property strict
+
+// 考核止盈挂单在官方线基础上多留的滑点（最小价位个数）
+#define   PASS_TP_SLIP_TICKS  5
 
 // 添加必要的权限声明
 #property script_show_inputs
@@ -71,7 +74,8 @@ void   LoadSimConfig(bool force);
 void   WriteAccountHeartbeat();
 void   CheckBalanceOperations();
 void   UpdatePassTP();
-double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float);
+double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float, double close_cost);
+double EstimateCloseCost(long position_id);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -471,14 +475,46 @@ void EnsureStopLosses()
 }
 
 //+------------------------------------------------------------------+
-//| 考核止盈价：净值到达平仓线时本仓位对应的价格（0=不需要/算不出）。   |
+//| 平仓手续费估算：按本仓位开仓成交的手续费/费用算（多数券商两边相同）。 |
+//+------------------------------------------------------------------+
+double EstimateCloseCost(long position_id)
+{
+    static long   cached_id = -1;
+    static double cached_cost = 0;
+    if(position_id == cached_id)
+        return cached_cost;
+    if(!HistorySelectByPosition(position_id))
+        return 0;
+    double cost = 0;
+    bool found = false;
+    for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+    {
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal == 0 || HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_IN)
+            continue;
+        found = true;
+        cost += MathAbs(HistoryDealGetDouble(deal, DEAL_COMMISSION)) + MathAbs(HistoryDealGetDouble(deal, DEAL_FEE));
+    }
+    // 开仓成交还没进历史时不缓存，下一秒再查
+    if(found)
+    {
+        cached_id = position_id;
+        cached_cost = cost;
+    }
+    return cost;
+}
+
+//+------------------------------------------------------------------+
+//| 考核止盈价：成交后余额 = 官方线 + 平仓手续费，再多留几个价位的滑点。 |
+//| 券商挂单成交没有 EA 触线再下单的延迟，不需要逐 tick 兜底那 0.1% 余量。 |
 //| pos_float 为本仓位当前浮盈+隔夜费，从净值里扣掉后得到不含本仓的基数。 |
 //+------------------------------------------------------------------+
-double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float)
+double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float, double close_cost)
 {
-    if(g_challenge_pass_equity <= 0 || lots <= 0 || open_price <= 0)
+    double target_equity = (g_challenge_official_equity > 0) ? g_challenge_official_equity : g_challenge_pass_equity;
+    if(g_challenge_pass_equity <= 0 || target_equity <= 0 || lots <= 0 || open_price <= 0)
         return 0;
-    double needed = g_challenge_pass_equity - (AccountInfoDouble(ACCOUNT_EQUITY) - pos_float);
+    double needed = target_equity + close_cost - (AccountInfoDouble(ACCOUNT_EQUITY) - pos_float);
     if(needed <= 0)
         return 0;
 
@@ -496,10 +532,11 @@ double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, 
 
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
     if(tick_size <= 0) tick_size = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double raw = is_buy ? open_price + needed / per_unit : open_price - needed / per_unit;
+    double dist = needed / per_unit + PASS_TP_SLIP_TICKS * tick_size;
+    double raw = is_buy ? open_price + dist : open_price - dist;
     if(raw <= 0)
         return 0;
-    // 多单向上、空单向下取整到最小价位，保证成交时净值不低于平仓线
+    // 多单向上、空单向下取整到最小价位，保证成交时余额不低于官方线
     double tp = is_buy ? MathCeil(raw / tick_size) * tick_size : MathFloor(raw / tick_size) * tick_size;
     return NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
 }
@@ -544,11 +581,15 @@ void UpdatePassTP()
             continue;
         }
 
-        double target_tp = CalcPassTPPrice(type, PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
-                                           PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP));
+        double lots = PositionGetDouble(POSITION_VOLUME);
+        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        double pos_float = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+        double close_cost = EstimateCloseCost(PositionGetInteger(POSITION_IDENTIFIER));
+        double target_tp = CalcPassTPPrice(type, lots, open_price, pos_float, close_cost);
         if(target_tp <= 0)
             continue;
-        if(cur_tp > 0 && MathAbs(cur_tp - target_tp) < tick_size / 2)
+        // 净值小数误差会让止盈价在相邻价位间跳动，差 1.5 个价位以内不改单（滑点余量已覆盖）
+        if(cur_tp > 0 && MathAbs(cur_tp - target_tp) < tick_size * 1.5)
             continue;
 
         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -566,7 +607,10 @@ void UpdatePassTP()
 
         if(trade.PositionModify(ticket, cur_sl, target_tp))
             Print("🎯 已挂考核止盈: ", DoubleToString(target_tp, digits),
-                  "（成交时净值≈$", DoubleToString(g_challenge_pass_equity, 2), "，持仓 ", ticket, "）");
+                  "（官方线 $", DoubleToString(g_challenge_official_equity, 2),
+                  " + 平仓费 $", DoubleToString(close_cost, 2),
+                  " + ", DoubleToString(PASS_TP_SLIP_TICKS, 0), " 个价位滑点；逐 tick 兜底线 $",
+                  DoubleToString(g_challenge_pass_equity, 2), "，持仓 ", ticket, "）");
         else
         {
             last_fail = TimeLocal();

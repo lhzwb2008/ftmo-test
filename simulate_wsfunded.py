@@ -353,7 +353,7 @@ def prompt_capital_settings():
         CHALLENGE_OFFICIAL_EQUITY = official_equity
         CHALLENGE_PASS_EQUITY = official_equity + pass_buffer
         print(f"考核通过线: 官方权益 ${official_equity:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）")
-        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（官方线 + 滑点余量 ${pass_buffer:.2f}，EA 开仓即挂券商止盈，逐 tick 权益检查兜底；"
+        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（官方线 + 滑点余量 ${pass_buffer:.2f}，EA 开仓即在官方线 + 平仓费 + 5 个价位处挂券商止盈，此线为逐 tick 兜底；"
               f"平完余额若低于官方线，EA 自动恢复交易）")
         if current_balance >= official_equity:
             print("警告: 当前金额已达到官方考核通过线，无需继续交易，程序退出")
@@ -2239,7 +2239,7 @@ if __name__ == "__main__":
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     if CHALLENGE_PASS_EQUITY > 0:
-        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈，逐 tick 权益检查兜底）")
+        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（逐 tick 兜底；券商止盈挂在官方线 ${CHALLENGE_OFFICIAL_EQUITY:.2f} + 平仓费 + 5 个价位）")
     else:
         print("考核平仓线: 无（Funded 阶段不设利润目标）")
     print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL；换账户、出入金自动重算锚点）")
