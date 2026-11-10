@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.02"
-#define   EA_BUILD   "2026-11-10b 考核通过按会话清除"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-10-27c 初始资金读 simulate"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -34,9 +34,6 @@ CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
 double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到，回退 input）
-double g_challenge_pass_equity = 0;  // simulate 写入的考核平仓权益（0=Funded/关闭）
-bool   pass_halted = false;          // 考核已通过则停止开仓，直到通过线写成 0 或 simulate 换新会话
-bool   pass_status_pending = false;  // ea_pass_status 写入失败，待补写
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 
 //--- 日内亏损风控状态（通过 GlobalVariables 持久化，EA 重启不丢失）
@@ -62,12 +59,6 @@ int OnInit()
         return(INIT_FAILED);
     }
     LoadSimInitialBalance(true);
-    LoadChallengePassTarget(true);
-    if(g_challenge_pass_equity > 0)
-        Print("🎯 考核通过检测: 权益 >= $", DoubleToString(g_challenge_pass_equity, 2),
-              " 立即全平。当前已停止=", pass_halted ? "是" : "否");
-    else
-        Print("🎯 考核通过检测: 已关闭（Funded 或未写入通过线）");
     
     Print("✅ EA初始化成功");
     Print("💰 杠杆: ", Leverage, "倍");
@@ -108,7 +99,6 @@ void OnTick()
 {
     // 日内亏损检查逐tick执行（不受节流影响）：真实权益对比触发线，触线立即全平
     DailyRiskCheck();
-    ChallengePassCheck();
     
     datetime current_time = TimeCurrent();
     if(current_time - last_check_time < CheckIntervalSeconds)
@@ -296,14 +286,6 @@ void ProcessSignal(long signal_id, string action)
     bool result = false;
     double lots = 0;
     
-    // 考核已通过：停止新开仓，只消费掉开仓信号（通过线为 0 时 pass_halted 保持 false）
-    if(pass_halted && (action == "BUY" || action == "SELL"))
-    {
-        Print("🚫 考核已通过，不再开仓，忽略信号: ", action);
-        MarkSignalConsumed(signal_id);
-        return;
-    }
-
     // 日内止损已触发：当日禁止一切新开仓，只消费掉开仓信号
     if(daily_halted && (action == "BUY" || action == "SELL"))
     {
@@ -664,172 +646,6 @@ string DailyGVName(string suffix)
 {
     return "DLS_" + IntegerToString(MagicNumber) + "_" + suffix;
 }
-
-//+------------------------------------------------------------------+
-//| 考核通过：simulate 写入 challenge_pass_equity（0=关闭/Funded）     |
-//| 权益 >= 通过线则全平并停止开仓。通过线为 0 时本函数立即返回。       |
-//+------------------------------------------------------------------+
-void ApplyChallengePassTarget(double value, double session)
-{
-    // simulate 每次启动写一个新会话号；会话号变了说明换了阶段或账户，上次的通过停止状态作废
-    if(session > 0)
-    {
-        string session_gv = DailyGVName("pass_session");
-        if(!GlobalVariableCheck(session_gv) || MathAbs(GlobalVariableGet(session_gv) - session) > 0.5)
-        {
-            if(pass_halted || GlobalVariableCheck(DailyGVName("pass_halted")))
-                Print("simulate 已重新启动（新会话），清除上次的考核通过停止状态");
-            pass_halted = false;
-            pass_status_pending = false;
-            if(GlobalVariableCheck(DailyGVName("pass_halted")))
-                GlobalVariableDel(DailyGVName("pass_halted"));
-            GlobalVariableSet(session_gv, session);
-        }
-    }
-    if(value <= 0)
-    {
-        bool had = (g_challenge_pass_equity > 0 || pass_halted || GlobalVariableCheck(DailyGVName("pass_halted")));
-        g_challenge_pass_equity = 0;
-        pass_halted = false;
-        if(GlobalVariableCheck(DailyGVName("pass_halted")))
-            GlobalVariableDel(DailyGVName("pass_halted"));
-        if(had)
-            Print("考核通过检测已关闭（通过线为 0）");
-        return;
-    }
-    if(MathAbs(value - g_challenge_pass_equity) >= 0.5)
-        Print("考核平仓线: $", DoubleToString(value, 2), "（真实权益触线即全平）");
-    g_challenge_pass_equity = value;
-    if(GlobalVariableCheck(DailyGVName("pass_halted")) && GlobalVariableGet(DailyGVName("pass_halted")) > 0.5)
-        pass_halted = true;
-}
-
-void LoadChallengePassTarget(bool force)
-{
-    static datetime last_load = 0;
-    static bool table_ready = false;
-    if(db_handle == INVALID_HANDLE)
-        return;
-    // 未武装时每秒读一次即可。已武装时每个 tick 都重读，避免切到 Funded（写成 0）后仍按旧线平仓
-    if(!force && TimeLocal() - last_load < 1)
-        return;
-    last_load = TimeLocal();
-
-    if(!table_ready)
-    {
-        long has_table = 0;
-        int probe = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sim_config'");
-        if(probe == INVALID_HANDLE)
-            return;
-        if(DatabaseRead(probe))
-            DatabaseColumnLong(probe, 0, has_table);
-        DatabaseFinalize(probe);
-        if(has_table == 0)
-            return;
-        table_ready = true;
-    }
-
-    int req = DatabasePrepare(db_handle,
-        "SELECT key, value FROM sim_config WHERE key IN ('challenge_pass_equity', 'challenge_pass_session')");
-    if(req == INVALID_HANDLE)
-        return;
-    double value = 0;
-    double session = 0;
-    bool found = false;
-    while(DatabaseRead(req))
-    {
-        string key = "";
-        double v = 0;
-        if(!DatabaseColumnText(req, 0, key) || !DatabaseColumnDouble(req, 1, v))
-            continue;
-        if(key == "challenge_pass_equity")
-        {
-            value = v;
-            found = true;
-        }
-        else if(key == "challenge_pass_session")
-            session = v;
-    }
-    DatabaseFinalize(req);
-    // 库忙或旧版 simulate 没写通过线时保持现状，不能因为读失败就关掉检测
-    if(!found)
-        return;
-    ApplyChallengePassTarget(value, session);
-}
-
-bool WritePassStatus()
-{
-    if(db_handle == INVALID_HANDLE)
-        return false;
-    if(!DatabaseExecute(db_handle,
-        "CREATE TABLE IF NOT EXISTS ea_pass_status (id INTEGER PRIMARY KEY, halted INTEGER, equity REAL, target REAL, updated_at TEXT)"))
-    {
-        Print("创建 ea_pass_status 失败: ", GetLastError());
-        return false;
-    }
-    string when = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS);
-    StringReplace(when, "'", "");
-    string sql = StringFormat(
-        "INSERT OR REPLACE INTO ea_pass_status (id, halted, equity, target, updated_at) VALUES (1, 1, %.2f, %.2f, '%s')",
-        AccountInfoDouble(ACCOUNT_EQUITY),
-        g_challenge_pass_equity,
-        when);
-    if(!DatabaseExecute(db_handle, sql))
-    {
-        Print("写入 ea_pass_status 失败: ", GetLastError());
-        return false;
-    }
-    return true;
-}
-
-bool HasPassPositions()
-{
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-            return true;
-    }
-    return false;
-}
-
-void ChallengePassCheck()
-{
-    static datetime last_retry = 0;
-    if(g_challenge_pass_equity > 0)
-        LoadChallengePassTarget(true);
-    else
-        LoadChallengePassTarget(false);
-    if(g_challenge_pass_equity <= 0)
-        return;
-    if(pass_halted)
-    {
-        // 触线时的全平可能因拒单/断线没平干净，状态行也可能因库忙没写进去，停止期间每 5 秒补一次
-        if(TimeLocal() - last_retry >= 5)
-        {
-            last_retry = TimeLocal();
-            if(HasPassPositions())
-            {
-                Print("考核已通过但仍有持仓，再次全平");
-                CloseAllPositions();
-            }
-            if(pass_status_pending && WritePassStatus())
-                pass_status_pending = false;
-        }
-        return;
-    }
-    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    if(equity <= 0 || equity < g_challenge_pass_equity)
-        return;
-    Print("!!!!! 考核通过线已达到，立即全平并停止开仓 !!!!!");
-    Print("当前权益: $", DoubleToString(equity, 2),
-          " 通过线: $", DoubleToString(g_challenge_pass_equity, 2));
-    CloseAllPositions();
-    pass_halted = true;
-    GlobalVariableSet(DailyGVName("pass_halted"), 1.0);
-    pass_status_pending = !WritePassStatus();
-}
-
 
 double DailyLossLimitUSD()
 {
