@@ -1411,6 +1411,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 🎯 重置动态追踪止盈状态
                 max_profit_price = None
                 trailing_tp_activated = False
+                with pnl_lock:
+                    position_data['quantity'] = 0
+                    position_data['entry_price'] = None
                 
                 # 在交易日结束时打印当日所有交易记录
                 if DAILY_TRADES:
@@ -1736,6 +1739,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 🎯 重置动态追踪止盈状态
             max_profit_price = None
             trailing_tp_activated = False
+            with pnl_lock:
+                position_data['quantity'] = 0
+                position_data['entry_price'] = None
             
             # 在交易日结束时打印当日所有交易记录
             if DAILY_TRADES:
@@ -1828,6 +1834,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 🎯 重置动态追踪止盈状态
                 max_profit_price = None
                 trailing_tp_activated = False
+                with pnl_lock:
+                    position_data['quantity'] = 0
+                    position_data['entry_price'] = None
             now = get_us_eastern_time()
             today = now.date()
             today_start = datetime.combine(today, time(trading_start_time[0], trading_start_time[1]), tzinfo=now.tzinfo)
@@ -2023,6 +2032,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     # 🎯 重置动态追踪止盈状态
                     max_profit_price = None
                     trailing_tp_activated = False
+                    with pnl_lock:
+                        position_data['quantity'] = 0
+                        position_data['entry_price'] = None
                     
         else:
             # 检查是否已有持仓，如果有则不再开仓
