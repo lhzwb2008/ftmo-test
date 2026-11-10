@@ -592,9 +592,11 @@ void UpdatePassTP()
         bool crossed = (type == POSITION_TYPE_BUY) ? (target_tp <= bid) : (target_tp >= ask);
         if(crossed)
         {
+            // 不标记为 EA 自身平仓：和券商止盈成交一样计入外部平仓序号，simulate 据此镜像平仓
             Print("🎯 现价已越过考核止盈价 ", DoubleToString(target_tp, digits), "，直接平仓");
-            CloseAllPositions();
-            return;
+            if(!trade.PositionClose(ticket))
+                Print("❌ 考核止盈平仓失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode(), "，下一秒重试");
+            continue;
         }
         bool placeable = (type == POSITION_TYPE_BUY) ? (target_tp > bid + min_stop) : (target_tp < ask - min_stop);
         if(!placeable)
