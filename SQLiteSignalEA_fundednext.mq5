@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-10-27c 初始资金读 simulate"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-11-10 考核通过线逐tick"  // 每次改 EA 逻辑时同步更新日期和说明
 #property strict
 
 // 添加必要的权限声明
@@ -34,7 +34,9 @@ input bool     ForceResetDailyRisk = false;            // 强制重置日内锚�
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
-double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到，回退 input）
+double g_sim_initial_balance = 0;
+double g_challenge_pass_equity = 0;  // simulate 写入的考核平仓权益（0=Funded/关闭）
+bool   pass_halted = false;          // 考核已通过则停止开仓，直到通过线写成 0  // simulate 写入的账户起始资金（0=未读到，回退 input）
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 
 //--- 日内亏损风控状态（通过 GlobalVariables 持久化，EA 重启不丢失）
@@ -75,6 +77,12 @@ int OnInit()
         return(INIT_FAILED);
     }
     LoadSimInitialBalance(true);
+    LoadChallengePassTarget(true);
+    if(g_challenge_pass_equity > 0)
+        Print("🎯 考核通过检测: 权益 >= $", DoubleToString(g_challenge_pass_equity, 2),
+              " 立即全平。当前已停止=", pass_halted ? "是" : "否");
+    else
+        Print("🎯 考核通过检测: 已关闭（Funded 或未写入通过线）");
     
     Print("✅ EA初始化成功");
     Print("🧩 编译版本: 1.03（开仓前校验止损；服务器 Invalid stops 只拒绝一次，不再重试）");
@@ -131,6 +139,7 @@ void OnTick()
 {
     // 日内亏损检查逐tick执行（不受节流影响）：真实权益对比触发线，触线立即全平
     DailyRiskCheck();
+    ChallengePassCheck();
     // 检测硬止损/服务器SL等外部平仓，并写回 ea_position 供 simulate 镜像
     SyncPositionState();
     
@@ -596,6 +605,14 @@ void ProcessSignal(long signal_id, string action)
     double sent_price = 0;
     double sent_sl = 0;
     
+    // 考核已通过：停止新开仓，只消费掉开仓信号（通过线为 0 时 pass_halted 保持 false）
+    if(pass_halted && (action == "BUY" || action == "SELL"))
+    {
+        Print("🚫 考核已通过，不再开仓，忽略信号: ", action);
+        MarkSignalConsumed(signal_id);
+        return;
+    }
+
     // 日内止损已触发：当日禁止一切新开仓，只消费掉开仓信号
     if(daily_halted && (action == "BUY" || action == "SELL"))
     {
@@ -980,6 +997,121 @@ string DailyGVName(string suffix)
 {
     return "DLS_" + IntegerToString(MagicNumber) + "_" + suffix;
 }
+
+//+------------------------------------------------------------------+
+//| 考核通过：simulate 写入 challenge_pass_equity（0=关闭/Funded）     |
+//| 权益 >= 通过线则全平并停止开仓。通过线为 0 时本函数立即返回。       |
+//+------------------------------------------------------------------+
+void ApplyChallengePassTarget(double value)
+{
+    if(value <= 0)
+    {
+        bool had = (g_challenge_pass_equity > 0 || pass_halted || GlobalVariableCheck(DailyGVName("pass_halted")));
+        g_challenge_pass_equity = 0;
+        pass_halted = false;
+        if(GlobalVariableCheck(DailyGVName("pass_halted")))
+            GlobalVariableDel(DailyGVName("pass_halted"));
+        if(had)
+            Print("考核通过检测已关闭（通过线为 0）");
+        return;
+    }
+    if(MathAbs(value - g_challenge_pass_equity) >= 0.5)
+        Print("考核平仓线: $", DoubleToString(value, 2), "（真实权益触线即全平）");
+    g_challenge_pass_equity = value;
+    if(GlobalVariableCheck(DailyGVName("pass_halted")) && GlobalVariableGet(DailyGVName("pass_halted")) > 0.5)
+        pass_halted = true;
+}
+
+void LoadChallengePassTarget(bool force)
+{
+    static datetime last_load = 0;
+    static bool table_ready = false;
+    if(db_handle == INVALID_HANDLE)
+        return;
+    // 未武装时每秒读一次即可。已武装时每个 tick 都重读，避免切到 Funded（写成 0）后仍按旧线平仓
+    if(!force && TimeLocal() - last_load < 1)
+        return;
+    last_load = TimeLocal();
+
+    if(!table_ready)
+    {
+        long has_table = 0;
+        int probe = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sim_config'");
+        if(probe == INVALID_HANDLE)
+            return;
+        if(DatabaseRead(probe))
+            DatabaseColumnLong(probe, 0, has_table);
+        DatabaseFinalize(probe);
+        if(has_table == 0)
+            return;
+        table_ready = true;
+    }
+
+    int req = DatabasePrepare(db_handle, "SELECT value FROM sim_config WHERE key = 'challenge_pass_equity'");
+    if(req == INVALID_HANDLE)
+        return;
+    double value = 0;
+    bool found = false;
+    ResetLastError();
+    if(DatabaseRead(req))
+    {
+        if(DatabaseColumnDouble(req, 0, value))
+            found = true;
+    }
+    int err = GetLastError();
+    DatabaseFinalize(req);
+    if(!found)
+    {
+        if(err != 0)
+            return;
+        value = 0;
+    }
+    ApplyChallengePassTarget(value);
+}
+
+void WritePassStatus()
+{
+    if(db_handle == INVALID_HANDLE)
+        return;
+    if(!DatabaseExecute(db_handle,
+        "CREATE TABLE IF NOT EXISTS ea_pass_status (id INTEGER PRIMARY KEY, halted INTEGER, equity REAL, target REAL, updated_at TEXT)"))
+    {
+        Print("创建 ea_pass_status 失败: ", GetLastError());
+        return;
+    }
+    string when = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS);
+    StringReplace(when, "'", "");
+    string sql = StringFormat(
+        "INSERT OR REPLACE INTO ea_pass_status (id, halted, equity, target, updated_at) VALUES (1, 1, %.2f, %.2f, '%s')",
+        AccountInfoDouble(ACCOUNT_EQUITY),
+        g_challenge_pass_equity,
+        when);
+    if(!DatabaseExecute(db_handle, sql))
+        Print("写入 ea_pass_status 失败: ", GetLastError());
+}
+
+void ChallengePassCheck()
+{
+    if(g_challenge_pass_equity > 0)
+        LoadChallengePassTarget(true);
+    else
+        LoadChallengePassTarget(false);
+    if(g_challenge_pass_equity <= 0)
+        return;
+    if(pass_halted)
+        return;
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    if(equity <= 0 || equity < g_challenge_pass_equity)
+        return;
+    Print("!!!!! 考核通过线已达到，立即全平并停止开仓 !!!!!");
+    Print("当前权益: $", DoubleToString(equity, 2),
+          " 通过线: $", DoubleToString(g_challenge_pass_equity, 2));
+    CloseAllPositions();
+    pass_halted = true;
+    GlobalVariableSet(DailyGVName("pass_halted"), 1.0);
+    WritePassStatus();
+}
+
 
 double DailyLossLimitUSD()
 {

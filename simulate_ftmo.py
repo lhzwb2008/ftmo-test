@@ -40,7 +40,8 @@ LEVERAGE = None  # 杠杆倍数（启动时手动输入）
 # 风控比例（FTMO 2-Step 官方规则: Phase1 目标 10% / Phase2 5% / Funded 无目标；最大日亏均 5%）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.10, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
-TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标，覆盖点差/滑点/检测到成交之间的价格回撤，宁可超出目标也不能差一点没到）
+CHALLENGE_PASS_BUFFER_PCT = 0.001  # 考核平仓滑点余量（起始资金的 0.1%，10 万账户 $100）
+CHALLENGE_PASS_EQUITY = 0.0        # 考核平仓权益；0=Funded 或未启用，EA 不做通过检测
 
 # Funded 权益止盈（与 EA EnableEquityTakeProfit 对应；默认关闭）
 # 启用后按绝对权益目标计算止盈金额；EA 端触线后通过 ea_daily_status.tp_halted 镜像同步
@@ -114,7 +115,7 @@ class Logger:
 
 def prompt_capital_settings():
     """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈金额"""
-    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT, CHALLENGE_PASS_EQUITY
     global PROFIT_TARGET_PCT, LEVERAGE
     
     while True:
@@ -164,15 +165,18 @@ def prompt_capital_settings():
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
     
     if PROFIT_TARGET_PCT > 0:
-        # 账户止盈金额 = 起始资金 × 目标比例 − 已有盈利 + 余量（起始资金 × TP_BUFFER_PCT，覆盖点差/滑点等损耗）
-        tp_buffer = start_balance * TP_BUFFER_PCT
-        MAX_PROFIT_AMOUNT = start_balance * PROFIT_TARGET_PCT - (current_balance - start_balance) + tp_buffer
-        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 起始资金 × {PROFIT_TARGET_PCT*100:.1f}% − 已有盈亏 + 余量 ${tp_buffer:.2f})")
-        if MAX_PROFIT_AMOUNT <= 0:
-            print("警告: 当前金额已达到/超过账户止盈目标，无需继续交易，程序退出")
+        pass_buffer = start_balance * CHALLENGE_PASS_BUFFER_PCT
+        official_equity = start_balance * (1.0 + PROFIT_TARGET_PCT)
+        CHALLENGE_PASS_EQUITY = official_equity + pass_buffer
+        MAX_PROFIT_AMOUNT = -1
+        print(f"考核通过线: 官方权益 ${official_equity:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）")
+        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（官方线 + 滑点余量 ${pass_buffer:.2f}，由 EA 按真实权益逐 tick 全平）")
+        if current_balance >= CHALLENGE_PASS_EQUITY:
+            print("警告: 当前金额已达到考核平仓线，无需继续交易，程序退出")
             sys.exit(0)
     elif phase == "funded" and ENABLE_EQUITY_TAKE_PROFIT:
         # Funded 权益止盈：目标权益 − 当前金额（会话内累计盈亏达到该差额即止盈）
+        CHALLENGE_PASS_EQUITY = 0.0
         MAX_PROFIT_AMOUNT = EQUITY_TAKE_PROFIT_TARGET - current_balance
         print(f"账户止盈: 已启用（Funded 权益目标 ${EQUITY_TAKE_PROFIT_TARGET:.2f}）")
         print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 目标权益 − 当前金额)")
@@ -181,6 +185,7 @@ def prompt_capital_settings():
             print("警告: 当前金额已达到/超过权益止盈目标，无需继续交易，程序退出")
             sys.exit(0)
     else:
+        CHALLENGE_PASS_EQUITY = 0.0
         MAX_PROFIT_AMOUNT = -1
         if phase == "funded":
             print("账户止盈: 已禁用（Funded 默认无利润目标；可设 ENABLE_EQUITY_TAKE_PROFIT=True 启用权益止盈）")
@@ -300,9 +305,16 @@ def write_sim_config():
         conn.execute("CREATE TABLE IF NOT EXISTS sim_config (key TEXT PRIMARY KEY, value REAL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         conn.execute("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES ('account_start_balance', ?, CURRENT_TIMESTAMP)",
                      (float(ACCOUNT_START_BALANCE),))
+        conn.execute("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES ('challenge_pass_equity', ?, CURRENT_TIMESTAMP)",
+                     (float(CHALLENGE_PASS_EQUITY),))
+        if CHALLENGE_PASS_EQUITY <= 0:
+            conn.execute("CREATE TABLE IF NOT EXISTS ea_pass_status (id INTEGER PRIMARY KEY, halted INTEGER, equity REAL, target REAL, updated_at TEXT)")
+            conn.execute("DELETE FROM ea_pass_status WHERE id = 1")
         conn.commit()
         conn.close()
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户起始资金 ${ACCOUNT_START_BALANCE:,.2f}")
+        if CHALLENGE_PASS_EQUITY > 0:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入考核平仓线: ${CHALLENGE_PASS_EQUITY:,.2f}")
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入 EA 共享配置失败: {str(e)}")
 
@@ -343,6 +355,25 @@ def check_ea_daily_halt():
     if not row:
         return False
     return bool(row[0])
+
+def check_ea_challenge_pass():
+    """读取 EA 写回的 ea_pass_status。考核账户由 EA 按真实权益逐 tick 判定通过。
+
+    Funded 通过线为 0 时直接返回 False，不读库，日内止损和权益止盈路径不受影响。
+    """
+    if CHALLENGE_PASS_EQUITY <= 0:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT halted FROM ea_pass_status WHERE id = 1").fetchone()
+        conn.close()
+    except Exception:
+        return False
+    if not row or row[0] is None:
+        return False
+    return bool(row[0])
+
+
 
 
 def check_ea_equity_tp_halt():
@@ -777,7 +808,9 @@ def daily_loss_monitor_thread(symbol, position_data):
     global DAILY_PNL, PROFIT_TARGET_TRIGGERED
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已启动 ===")
-    if MAX_PROFIT_AMOUNT > 0:
+    if CHALLENGE_PASS_EQUITY > 0:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 真实权益逐 tick）")
+    elif MAX_PROFIT_AMOUNT > 0:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
@@ -824,8 +857,20 @@ def daily_loss_monitor_thread(symbol, position_data):
                     current_total_pnl = TOTAL_PNL + unrealized_pnl
                     current_daily_pnl = DAILY_PNL + unrealized_pnl
                 
-                # 检查是否触发止盈（基于累计盈亏，且MAX_PROFIT_AMOUNT > 0时才启用）
-                if MAX_PROFIT_AMOUNT > 0 and current_total_pnl >= MAX_PROFIT_AMOUNT:
+                # 考核通过由 EA 按真实权益逐 tick 判定；此处只镜像 ea_pass_status。Funded 通过线为 0，不会进入
+                if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已达到考核通过线 !!!!!")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 通过线: ${CHALLENGE_PASS_EQUITY:.2f}")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 同步平掉模拟仓位并停止开仓")
+
+                    with pnl_lock:
+                        FORCE_CLOSE_POSITION = True
+                        PROFIT_TARGET_TRIGGERED = True
+
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置考核通过平仓标志")
+                    break
+                # Funded 权益止盈仍按模拟累计盈亏兜底（仅 ENABLE_EQUITY_TAKE_PROFIT；考核账户不再走这条）
+                if ENABLE_EQUITY_TAKE_PROFIT and MAX_PROFIT_AMOUNT > 0 and current_total_pnl >= MAX_PROFIT_AMOUNT:
                     print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 检测到达成止盈目标 !!!!!")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 累计总盈利: ${current_total_pnl:.2f}")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
@@ -1142,8 +1187,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             positions_opened_today = 0
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
-            # Funded 权益止盈是账户级永久停止，跨日不重置；挑战期百分比止盈沿用原跨日重置逻辑
-            if not (ENABLE_EQUITY_TAKE_PROFIT and PROFIT_TARGET_TRIGGERED):
+            # Funded 权益止盈与考核通过都是账户级停止，跨日不重置
+            if not ((ENABLE_EQUITY_TAKE_PROFIT or CHALLENGE_PASS_EQUITY > 0) and PROFIT_TARGET_TRIGGERED):
                 PROFIT_TARGET_TRIGGERED = False
             
             # 停止旧的监控线程
@@ -1721,6 +1766,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已触发权益止盈，不再开仓")
                 continue
             
+            if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
+                PROFIT_TARGET_TRIGGERED = True
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已达到考核通过线，不再开仓")
+                continue
+
             # 开仓前实时确认 EA 端日内止损状态，避免监控线程轮询间隙内误开仓造成两边不一致
             if check_ea_daily_halt():
                 DAILY_STOP_TRIGGERED = True
@@ -1874,7 +1924,21 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {sleep_seconds:.1f} 秒到下一个精确检查时间 {next_check_time.strftime('%H:%M:%S')}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间精度检查: 秒={now.second}, 微秒={now.microsecond}")
-            time_module.sleep(sleep_seconds)
+            # 考核账户分段醒来，以便几秒内镜像 EA 的通过平仓。Funded 通过线为 0，仍一次性睡到下一个检查点
+            if CHALLENGE_PASS_EQUITY > 0:
+                remaining = sleep_seconds
+                while remaining > 0:
+                    if check_ea_challenge_pass():
+                        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] EA 端已达到考核通过线，提前结束等待并平仓")
+                        with pnl_lock:
+                            FORCE_CLOSE_POSITION = True
+                            PROFIT_TARGET_TRIGGERED = True
+                        break
+                    chunk = min(5.0, remaining)
+                    time_module.sleep(chunk)
+                    remaining -= chunk
+            else:
+                time_module.sleep(sleep_seconds)
 
 if __name__ == "__main__":
     # 启用日志记录（同时输出到控制台和文件）
@@ -1899,7 +1963,10 @@ if __name__ == "__main__":
     print(f"账户当前金额(仓位基准): ${INITIAL_CAPITAL:.2f}")
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
-    print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
+    if CHALLENGE_PASS_EQUITY > 0:
+        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 按真实权益逐 tick 全平）")
+    else:
+        print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
     print(f"Funded 权益止盈: {'已启用' if ENABLE_EQUITY_TAKE_PROFIT else '已禁用'}"
           + (f"（目标权益 ${EQUITY_TAKE_PROFIT_TARGET:.2f}）" if ENABLE_EQUITY_TAKE_PROFIT else ""))
     print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL）")
