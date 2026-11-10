@@ -44,9 +44,7 @@ EA_HEARTBEAT_MAX_AGE_SECONDS = 60  # EA 每 5 秒写一次 ea_account，超过�
 # 风控比例（FundedNext Stellar 2-Step 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏均 5%）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
-CHALLENGE_PASS_BUFFER_PCT = 0.001  # 考核平仓滑点余量（起始资金的 0.1%，10 万账户 $100）
-CHALLENGE_PASS_EQUITY = 0.0        # 考核平仓权益；0=Funded 或未启用，EA 不做通过检测
-CHALLENGE_OFFICIAL_EQUITY = 0.0    # 官方通过权益（不含余量），EA 平仓后余额低于它就恢复交易
+CHALLENGE_PASS_EQUITY = 0.0        # 官方考核通过线；0=Funded 或未启用。EA 开仓挂券商止盈，空仓且余额过线停止开仓
 
 # 交易时间设置（FundedNext 专用：启动时手动选择，与轮次无关；多账户错开开仓时间避免 copy 嫌疑）
 TRADING_SESSION_HOURS = 6  # 交易窗口长度（小时），结束时间 = 开始时间 + 此值
@@ -296,7 +294,7 @@ def parse_positive(raw):
 def prompt_capital_settings():
     """余额和登录号读 EA 心跳；只确认轮次、起始资金、杠杆、开仓时间（同一账户回车沿用上次）"""
     global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, CHALLENGE_PASS_EQUITY
-    global PROFIT_TARGET_PCT, LEVERAGE, ACCOUNT_LOGIN, CURRENT_PHASE, CHALLENGE_OFFICIAL_EQUITY
+    global PROFIT_TARGET_PCT, LEVERAGE, ACCOUNT_LOGIN, CURRENT_PHASE
 
     info = wait_for_ea_account()
     login = int(info["login"])
@@ -336,18 +334,13 @@ def prompt_capital_settings():
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
     
     if PROFIT_TARGET_PCT > 0:
-        pass_buffer = start_balance * CHALLENGE_PASS_BUFFER_PCT
-        official_equity = start_balance * (1.0 + PROFIT_TARGET_PCT)
-        CHALLENGE_OFFICIAL_EQUITY = official_equity
-        CHALLENGE_PASS_EQUITY = official_equity + pass_buffer
-        print(f"考核通过线: 官方权益 ${official_equity:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）")
-        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（官方线 + 滑点余量 ${pass_buffer:.2f}，EA 开仓即在官方线 + 平仓费 + 5 个价位处挂券商止盈，此线为逐 tick 兜底；"
-              f"平完余额若低于官方线，EA 自动恢复交易）")
-        if current_balance >= official_equity:
+        CHALLENGE_PASS_EQUITY = start_balance * (1.0 + PROFIT_TARGET_PCT)
+        print(f"考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）。"
+              f"EA 开仓即挂券商止盈：成交后余额 = 通过线 + 平仓费 + 5 个价位滑点")
+        if current_balance >= CHALLENGE_PASS_EQUITY:
             print("警告: 当前金额已达到官方考核通过线，无需继续交易，程序退出")
             sys.exit(0)
     else:
-        CHALLENGE_OFFICIAL_EQUITY = 0.0
         CHALLENGE_PASS_EQUITY = 0.0
         print("账户止盈: 已禁用（Funded 账户无利润目标，日内止损由 EA 执行）")
     
@@ -469,7 +462,6 @@ def write_sim_config():
         'hard_sl_risk_percent': float(sim_hard_sl_pct()),
         'account_login': float(ACCOUNT_LOGIN),
         'challenge_pass_equity': float(CHALLENGE_PASS_EQUITY),
-        'challenge_official_equity': float(CHALLENGE_OFFICIAL_EQUITY),
         # 能启动说明余额还没到官方通过线：换新会话号让 EA 清掉 pass_halted
         'challenge_pass_session': float(int(time_module.time())),
     }
@@ -486,7 +478,7 @@ def write_sim_config():
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户 {ACCOUNT_LOGIN} | 起始资金 ${ACCOUNT_START_BALANCE:,.2f}"
               f" | 杠杆 {LEVERAGE}x | 单笔硬止损 {sim_hard_sl_pct()}%")
         if CHALLENGE_PASS_EQUITY > 0:
-            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入考核平仓线: ${CHALLENGE_PASS_EQUITY:,.2f}（官方线 ${CHALLENGE_OFFICIAL_EQUITY:,.2f}）")
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入考核通过线: ${CHALLENGE_PASS_EQUITY:,.2f}")
         return written_at
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入 EA 共享配置失败: {str(e)}")
@@ -549,7 +541,7 @@ def check_ea_daily_halt():
     return bool(row[0])
 
 def check_ea_challenge_pass():
-    """读取 EA 写回的 ea_pass_status。考核账户由 EA 按真实权益逐 tick 判定通过。
+    """读取 EA 写回的 ea_pass_status。考核账户由 EA 判定通过（券商止盈成交后空仓且余额过线）。
 
     Funded 通过线为 0 时直接返回 False，不读库，日内止损和权益止盈路径不受影响。
     """
@@ -1035,7 +1027,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已启动 ===")
     if CHALLENGE_PASS_EQUITY > 0:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 券商止盈 + 逐 tick 兜底）")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 由 MT5 EA 端执行（本线程仅镜像 EA 停止标志）")
@@ -1081,7 +1073,7 @@ def daily_loss_monitor_thread(symbol, position_data):
                     current_total_pnl = TOTAL_PNL + unrealized_pnl
                     current_daily_pnl = DAILY_PNL + unrealized_pnl
                 
-                # 考核通过由 EA 按真实权益逐 tick 判定；此处只镜像 ea_pass_status。Funded 通过线为 0，不会进入
+                # 考核通过由 EA 判定；此处只镜像 ea_pass_status。Funded 通过线为 0，不会进入
                 if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
                     print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已达到考核通过线 !!!!!")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 通过线: ${CHALLENGE_PASS_EQUITY:.2f}")
@@ -1492,12 +1484,6 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         last_date = current_date
         LAST_STATS_DATE = current_date
 
-        # EA 平仓后余额没到官方线会删掉 ea_pass_status 并恢复交易，这边跟着恢复
-        if CHALLENGE_PASS_EQUITY > 0 and PROFIT_TARGET_TRIGGERED and position_quantity == 0 and not check_ea_challenge_pass():
-            PROFIT_TARGET_TRIGGERED = False
-            if not DAILY_STOP_TRIGGERED:
-                FORCE_CLOSE_POSITION = False
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 平仓后余额未到官方通过线，已恢复交易，模拟端同步恢复开仓")
         
         # 在每天9:30之后启动日内止损监控线程（只启动一次）
         # 判断当前时间是否在9:30之后且监控线程未启动
@@ -2226,7 +2212,7 @@ if __name__ == "__main__":
     print(f"杠杆倍数: {LEVERAGE}x")
     print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     if CHALLENGE_PASS_EQUITY > 0:
-        print(f"考核平仓线: ${CHALLENGE_PASS_EQUITY:.2f}（逐 tick 兜底；券商止盈挂在官方线 ${CHALLENGE_OFFICIAL_EQUITY:.2f} + 平仓费 + 5 个价位）")
+        print(f"考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
     else:
         print("考核平仓线: 无（Funded 阶段不设利润目标）")
     print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL；换账户、出入金自动重算锚点）")

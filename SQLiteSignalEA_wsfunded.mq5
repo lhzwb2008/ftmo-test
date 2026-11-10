@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-11-10e Ultra单笔止损+免配置+考核止盈挂官方线"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-11-10f Ultra单笔止损+免配置+考核止盈挂官方线、无逐tick兜底"  // 每次改 EA 逻辑时同步更新日期和说明
 // 杠杆、起始资金、绑定账户、考核通过线全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 // Ultra：单个 trading idea 的止损风险 ≤ 当日回撤额度的 50%。下单时必须带上，禁止只挂日亏宽止损。
 #define   IDEA_RISK_FRACTION  0.50
@@ -41,11 +41,9 @@ double g_sim_initial_balance = 0;    // simulate 写入的账户起始资金（0
 double g_sim_leverage = 0;           // simulate 写入的杠杆（0=未读到，不开仓）
 long   g_sim_login = 0;              // simulate 绑定的 MT5 登录号（与本终端不一致则不开仓）
 double g_initial_deposit = 0;        // MT5 历史里第一笔入金，供 simulate 作为起始资金默认值
-double g_challenge_pass_equity = 0;  // simulate 写入的考核平仓权益（0=Funded/关闭）
-double g_challenge_official_equity = 0;  // 官方通过权益；平仓后余额低于它说明没过，恢复交易
+double g_challenge_pass_equity = 0;  // simulate 写入的官方考核通过线（0=Funded/关闭）
 bool   pass_halted = false;          // 考核已通过则停止开仓，直到通过线写成 0 或 simulate 换新会话
 bool   pass_status_pending = false;  // ea_pass_status 写入失败，待补写
-datetime pass_halted_at = 0;         // 本次进入通过停止的本地时间
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
 
 //--- 日内亏损风控状态（通过 GlobalVariables 持久化，EA 重启不丢失）
@@ -108,8 +106,8 @@ int OnInit()
     else
         Print("⏳ 等待 simulate 下发配置（", why, "）。在此之前只写心跳、不开仓，启动 simulate 后自动生效");
     if(g_challenge_pass_equity > 0)
-        Print("🎯 考核通过检测: 权益 >= $", DoubleToString(g_challenge_pass_equity, 2),
-              " 立即全平。当前已停止=", pass_halted ? "是" : "否");
+        Print("🎯 考核通过线: $", DoubleToString(g_challenge_pass_equity, 2),
+              "（开仓即挂券商止盈，空仓且余额过线即停止开仓）。当前已停止=", pass_halted ? "是" : "否");
     else
         Print("🎯 考核通过检测: 已关闭（Funded 或未写入通过线）");
     
@@ -506,17 +504,14 @@ double EstimateCloseCost(long position_id)
 
 //+------------------------------------------------------------------+
 //| 考核止盈价：成交后余额 = 官方线 + 平仓手续费，再多留几个价位的滑点。 |
-//| 券商挂单成交没有 EA 触线再下单的延迟，不需要逐 tick 兜底那 0.1% 余量。 |
 //| pos_float 为本仓位当前浮盈+隔夜费，从净值里扣掉后得到不含本仓的基数。 |
 //+------------------------------------------------------------------+
 double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float, double close_cost)
 {
-    double target_equity = (g_challenge_official_equity > 0) ? g_challenge_official_equity : g_challenge_pass_equity;
-    if(g_challenge_pass_equity <= 0 || target_equity <= 0 || lots <= 0 || open_price <= 0)
+    if(g_challenge_pass_equity <= 0 || lots <= 0 || open_price <= 0)
         return 0;
-    double needed = target_equity + close_cost - (AccountInfoDouble(ACCOUNT_EQUITY) - pos_float);
-    if(needed <= 0)
-        return 0;
+    // 已经过线时 needed 为负，算出的止盈价在现价另一侧，由 UpdatePassTP 直接平仓
+    double needed = g_challenge_pass_equity + close_cost - (AccountInfoDouble(ACCOUNT_EQUITY) - pos_float);
 
     bool is_buy = (type == POSITION_TYPE_BUY);
     double per_unit = 0;
@@ -544,7 +539,7 @@ double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, 
 //+------------------------------------------------------------------+
 //| 考核阶段给持仓挂服务器端止盈（净值到平仓线的价格），EA 掉线也会成交。 |
 //| 止盈是仓位自带属性，仓位被策略/止损/收盘平掉时随之消失，无需撤单。   |
-//| 挂不出（离现价太近）时不挂，由 ChallengePassCheck 逐 tick 兜底。     |
+//| 止盈价已被现价越过（券商不收）时直接平仓，效果等同止盈立即成交。     |
 //+------------------------------------------------------------------+
 void UpdatePassTP()
 {
@@ -594,23 +589,30 @@ void UpdatePassTP()
 
         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        bool crossed = (type == POSITION_TYPE_BUY) ? (target_tp <= bid) : (target_tp >= ask);
+        if(crossed)
+        {
+            Print("🎯 现价已越过考核止盈价 ", DoubleToString(target_tp, digits), "，直接平仓");
+            CloseAllPositions();
+            return;
+        }
         bool placeable = (type == POSITION_TYPE_BUY) ? (target_tp > bid + min_stop) : (target_tp < ask - min_stop);
         if(!placeable)
         {
+            // 离现价不足最小止损距离：下一秒要么越过（直接平），要么拉开（挂上）
             if(noted_ticket != ticket)
             {
                 noted_ticket = ticket;
-                Print("🎯 考核止盈价 ", DoubleToString(target_tp, digits), " 离现价太近挂不出，由逐 tick 权益检查兜底");
+                Print("🎯 考核止盈价 ", DoubleToString(target_tp, digits), " 离现价不足最小距离，暂不挂单");
             }
             continue;
         }
 
         if(trade.PositionModify(ticket, cur_sl, target_tp))
             Print("🎯 已挂考核止盈: ", DoubleToString(target_tp, digits),
-                  "（官方线 $", DoubleToString(g_challenge_official_equity, 2),
+                  "（官方线 $", DoubleToString(g_challenge_pass_equity, 2),
                   " + 平仓费 $", DoubleToString(close_cost, 2),
-                  " + ", DoubleToString(PASS_TP_SLIP_TICKS, 0), " 个价位滑点；逐 tick 兜底线 $",
-                  DoubleToString(g_challenge_pass_equity, 2), "，持仓 ", ticket, "）");
+                  " + ", DoubleToString(PASS_TP_SLIP_TICKS, 0), " 个价位滑点，持仓 ", ticket, "）");
         else
         {
             last_fail = TimeLocal();
@@ -1326,12 +1328,11 @@ string LegacyGVName(string suffix)
 }
 
 //+------------------------------------------------------------------+
-//| 考核通过：simulate 写入 challenge_pass_equity（0=关闭/Funded）     |
-//| 权益 >= 通过线则全平并停止开仓。通过线为 0 时本函数立即返回。       |
+//| 考核通过：simulate 写入官方通过线 challenge_pass_equity（0=关闭/Funded）|
+//| 开仓挂券商止盈到线即平；空仓且余额过线则停止开仓。                   |
 //+------------------------------------------------------------------+
-void ApplyChallengePassTarget(double value, double session, double official)
+void ApplyChallengePassTarget(double value, double session)
 {
-    g_challenge_official_equity = (official > 0) ? official : 0;
     // simulate 每次启动写一个新会话号；会话号变了说明换了阶段或账户，上次的通过停止状态作废
     if(session > 0)
     {
@@ -1359,13 +1360,10 @@ void ApplyChallengePassTarget(double value, double session, double official)
         return;
     }
     if(MathAbs(value - g_challenge_pass_equity) >= 0.5)
-        Print("考核平仓线: $", DoubleToString(value, 2), "（真实权益触线即全平）");
+        Print("考核通过线: $", DoubleToString(value, 2), "（开仓即挂券商止盈）");
     g_challenge_pass_equity = value;
     if(!pass_halted && GlobalVariableCheck(DailyGVName("pass_halted")) && GlobalVariableGet(DailyGVName("pass_halted")) > 0.5)
-    {
         pass_halted = true;
-        pass_halted_at = TimeLocal();
-    }
 }
 
 void LoadChallengePassTarget(bool force)
@@ -1394,12 +1392,11 @@ void LoadChallengePassTarget(bool force)
     }
 
     int req = DatabasePrepare(db_handle,
-        "SELECT key, value FROM sim_config WHERE key IN ('challenge_pass_equity', 'challenge_pass_session', 'challenge_official_equity')");
+        "SELECT key, value FROM sim_config WHERE key IN ('challenge_pass_equity', 'challenge_pass_session')");
     if(req == INVALID_HANDLE)
         return;
     double value = 0;
     double session = 0;
-    double official = 0;
     bool found = false;
     while(DatabaseRead(req))
     {
@@ -1414,22 +1411,12 @@ void LoadChallengePassTarget(bool force)
         }
         else if(key == "challenge_pass_session")
             session = v;
-        else if(key == "challenge_official_equity")
-            official = v;
     }
     DatabaseFinalize(req);
     // 库忙或旧版 simulate 没写通过线时保持现状，不能因为读失败就关掉检测
     if(!found)
         return;
-    ApplyChallengePassTarget(value, session, official);
-}
-
-void ClearPassStatusRow()
-{
-    if(db_handle == INVALID_HANDLE)
-        return;
-    if(SimTableExists("ea_pass_status"))
-        DatabaseExecute(db_handle, "DELETE FROM ea_pass_status WHERE id = 1");
+    ApplyChallengePassTarget(value, session);
 }
 
 bool WritePassStatus()
@@ -1479,51 +1466,27 @@ void ChallengePassCheck()
         return;
     if(pass_halted)
     {
-        // 触线时的全平可能因拒单/断线没平干净，状态行也可能因库忙没写进去，停止期间每 5 秒补一次
+        // 停止期间若仍有持仓（如人工开仓）则平掉；状态行可能因库忙没写进去，每 5 秒补一次
         if(TimeLocal() - last_retry >= 5)
         {
             last_retry = TimeLocal();
             if(HasPassPositions())
             {
-                Print("考核已通过但仍有持仓，再次全平");
+                Print("考核已通过但仍有持仓，全平");
                 CloseAllPositions();
-            }
-            else if(g_challenge_official_equity > 0 && TimeLocal() - pass_halted_at >= 10)
-            {
-                // 平仓滑点把余额打回官方线以下：考核其实没过，恢复交易，等下一次触线
-                double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-                if(balance < g_challenge_official_equity)
-                {
-                    Print("⚠️ 平仓后余额 $", DoubleToString(balance, 2), " 低于官方通过线 $",
-                          DoubleToString(g_challenge_official_equity, 2), "，考核未完成，恢复交易");
-                    pass_halted = false;
-                    pass_status_pending = false;
-                    if(GlobalVariableCheck(DailyGVName("pass_halted")))
-                        GlobalVariableDel(DailyGVName("pass_halted"));
-                    ClearPassStatusRow();
-                    return;
-                }
             }
             if(pass_status_pending && WritePassStatus())
                 pass_status_pending = false;
         }
         return;
     }
-    // 考核止盈单由券商成交后，成交价可能略差于挂单价：空仓且余额已过官方线即视为通过
-    bool flat_passed = g_challenge_official_equity > 0 && !HasPassPositions()
-                       && AccountInfoDouble(ACCOUNT_BALANCE) >= g_challenge_official_equity;
-    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    if(!flat_passed && (equity <= 0 || equity < g_challenge_pass_equity))
+    // 通过只认空仓后的余额：考核止盈单成交，或其它平仓后余额已过官方线
+    if(HasPassPositions() || AccountInfoDouble(ACCOUNT_BALANCE) < g_challenge_pass_equity)
         return;
-    if(flat_passed)
-        Print("!!!!! 已空仓且余额达到官方通过线（考核止盈单已成交），停止开仓 !!!!!");
-    else
-        Print("!!!!! 考核通过线已达到，立即全平并停止开仓 !!!!!");
-    Print("当前权益: $", DoubleToString(equity, 2),
+    Print("!!!!! 已空仓且余额达到官方考核通过线，停止开仓 !!!!!");
+    Print("当前余额: $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
           " 通过线: $", DoubleToString(g_challenge_pass_equity, 2));
-    CloseAllPositions();
     pass_halted = true;
-    pass_halted_at = TimeLocal();
     GlobalVariableSet(DailyGVName("pass_halted"), 1.0);
     pass_status_pending = !WritePassStatus();
 }
