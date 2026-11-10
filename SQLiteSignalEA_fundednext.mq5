@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-11-10f 免配置+考核止盈挂官方线、无逐tick兜底"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-11-10g 免配置+考核止盈成交即停"  // 每次改 EA 逻辑时同步更新日期和说明
 // 杠杆、起始资金、单笔硬止损、绑定账户全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 #property strict
 
@@ -53,6 +53,7 @@ datetime last_status_write = 0;       // 上次写 ea_daily_status 状态表的�
 
 //--- 持仓同步（硬止损/服务器SL打掉后写回 DB，供 simulate 镜像平仓）
 ulong    last_tracked_ticket = 0;     // 上一tick跟踪的持仓票号
+long     last_tracked_position_id = 0; // 上一tick跟踪的持仓 ID（查平仓原因用）
 int      ea_close_seq = 0;            // 外部平仓序号（递增），simulate 据此发现硬止损平仓
 bool     internal_close_pending = false; // EA 自己执行了平仓（CLOSE信号/反手/日亏全平），下次持仓消失不算外部平仓
 
@@ -70,6 +71,7 @@ void   LoadSimConfig(bool force);
 void   WriteAccountHeartbeat();
 void   CheckBalanceOperations();
 void   UpdatePassTP();
+void   EnterPassHalt(string why);
 double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float, double close_cost);
 double EstimateCloseCost(long position_id);
 
@@ -587,9 +589,11 @@ void UpdatePassTP()
         {
             // 不标记为 EA 自身平仓：和券商止盈成交一样计入外部平仓序号，simulate 据此镜像平仓
             Print("🎯 现价已越过考核止盈价 ", DoubleToString(target_tp, digits), "，直接平仓");
-            if(!trade.PositionClose(ticket))
+            if(trade.PositionClose(ticket))
+                EnterPassHalt("现价越过考核止盈价，已平仓");
+            else
                 Print("❌ 考核止盈平仓失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode(), "，下一秒重试");
-            continue;
+            return;
         }
         bool placeable = (type == POSITION_TYPE_BUY) ? (target_tp > bid + min_stop) : (target_tp < ask - min_stop);
         if(!placeable)
@@ -1479,15 +1483,42 @@ void ChallengePassCheck()
         }
         return;
     }
-    // 通过只认空仓后的余额：考核止盈单成交，或其它平仓后余额已过官方线
+    // 考核止盈成交另见 SyncPositionState；这里兜住 EA 重启期间止盈已成交、或其它方式平在线上方的情况
     if(HasPassPositions() || AccountInfoDouble(ACCOUNT_BALANCE) < g_challenge_pass_equity)
         return;
-    Print("!!!!! 已空仓且余额达到官方考核通过线，停止开仓 !!!!!");
+    EnterPassHalt("空仓且余额达到官方考核通过线");
+}
+
+//+------------------------------------------------------------------+
+//| 考核条件已满足：停止开仓并通知 simulate。不看成交后余额，满足一次即停。 |
+//+------------------------------------------------------------------+
+void EnterPassHalt(string why)
+{
+    if(pass_halted)
+        return;
+    Print("!!!!! ", why, "，考核完成，停止开仓 !!!!!");
     Print("当前余额: $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
           " 通过线: $", DoubleToString(g_challenge_pass_equity, 2));
     pass_halted = true;
     GlobalVariableSet(DailyGVName("pass_halted"), 1.0);
     pass_status_pending = !WritePassStatus();
+}
+
+//+------------------------------------------------------------------+
+//| 持仓是否由券商止盈平掉。EA 只在考核阶段挂止盈，止盈成交即考核止盈。 |
+//+------------------------------------------------------------------+
+bool ClosedByTakeProfit(long position_id)
+{
+    if(position_id <= 0 || !HistorySelectByPosition(position_id))
+        return false;
+    for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+    {
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal > 0 && HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_OUT
+           && HistoryDealGetInteger(deal, DEAL_REASON) == DEAL_REASON_TP)
+            return true;
+    }
+    return false;
 }
 
 
@@ -1658,6 +1689,7 @@ void CheckBalanceOperations()
 void SyncPositionState()
 {
     ulong ticket = 0;
+    long position_id = 0;
     int side = 0;
     double volume = 0, open_price = 0, sl = 0;
     
@@ -1669,6 +1701,7 @@ void SyncPositionState()
         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
             continue;
         ticket = t;
+        position_id = PositionGetInteger(POSITION_IDENTIFIER);
         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
         side = (type == POSITION_TYPE_BUY) ? 1 : -1;
         volume = PositionGetDouble(POSITION_VOLUME);
@@ -1695,6 +1728,8 @@ void SyncPositionState()
             Print("📣 检测到持仓被外部平掉(硬止损/日亏SL/手动等)，close_seq=", ea_close_seq,
                   " 原票号=", last_tracked_ticket, " —— 已写回 ea_position 供 simulate 镜像");
             WritePositionStatus(0, 0, 0, 0, "external_close");
+            if(g_challenge_pass_equity > 0 && ClosedByTakeProfit(last_tracked_position_id))
+                EnterPassHalt("考核止盈已成交");
         }
     }
     else if(ticket != 0)
@@ -1719,6 +1754,7 @@ void SyncPositionState()
     }
     
     last_tracked_ticket = ticket;
+    last_tracked_position_id = position_id;
 }
 
 //+------------------------------------------------------------------+
