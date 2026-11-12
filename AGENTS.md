@@ -26,7 +26,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
 ### Running
 
 - **Standalone utility scripts** (`check_db.py`, `test_three_db_signals.py`, `clear_db_data.py`, `delete_db.py`) work without any API credentials.
-- **Trading simulators** (`simulate_ftmo.py`, `simulate_fundednext.py`, `simulate_the5ers.py`, `simulate_icmarkets.py`, `simulate_ttp.py`, `simulate_blueberry.py`, `simulate_goat.py`, `simulate_aqua.py`, `simulate_aqua_paylater.py`, `simulate_wsfunded.py`) require Longport API credentials via a `.env` file or environment variables:
+- **Trading simulators** (`simulate_ftmo.py`, `simulate_fundednext.py`, `simulate_the5ers.py`, `simulate_icmarkets.py`, `simulate_ttp.py`, `simulate_blueberry.py`, `simulate_goat.py`, `simulate_aqua.py`, `simulate_aqua_paylater.py`, `simulate_wsfunded.py`, `simulate_the5ers_summer.py`) require Longport API credentials via a `.env` file or environment variables:
   - `LONGPORT_APP_KEY`
   - `LONGPORT_APP_SECRET`
   - `LONGPORT_ACCESS_TOKEN`
@@ -49,6 +49,7 @@ The codebase has existing style issues (whitespace, unused imports). Use `--max-
   - 日内锚点 GV 名带登录号（`DLS_<Magic>_<login>_*`），换账户自动重新起锚；当日出入金（BALANCE/CREDIT 等 deal）30 秒内自动重新起锚，不再需要 `ForceResetDailyRisk`。升级时 GV 名变化会让锚点按当前权益重设，请在非交易时段重载 EA。
   - 考核通过：simulate 把官方通过线（起始资金 × 目标比例，无余量）写入 `challenge_pass_equity`（Funded=0）。EA 开仓后给持仓挂券商端止盈，成交后余额 = 官方线 + 平仓手续费（按开仓那笔估）+ `PASS_TP_SLIP_TICKS`=5 个价位滑点；`UpdatePassTP` 每秒校正（差 1.5 个价位以内不改单），离现价不足最小距离时暂不挂，现价已越过止盈价则直接平仓（计入外部平仓序号，simulate 镜像）。仓位被其它方式平掉时止盈随之消失，无需撤单。没有逐 tick 权益兜底。考核止盈成交（`DEAL_REASON_TP`）、越线平仓、或空仓且余额 ≥ 官方线，任一满足即停止开仓（GV `pass_halted` + 表 `ea_pass_status`），不看成交后余额，也不会自动恢复。simulate 每次启动写新的 `challenge_pass_session` 并删掉 `ea_pass_status`，EA 见会话号变化即清除 `pass_halted`，换阶段只需重启 simulate。启动时余额已达官方通过线则直接退出。
 - WSFunded Ultra（`simulate_wsfunded.py` / `SQLiteSignalEA_wsfunded.mq5`，`trading_signals_wsfunded.db`，Magic `20261110`）：开仓必须同时挂单笔止损 = min(起始资金, 当日锚点) × 5% × 50% × (1−缓冲)，挂不出就放弃该信号。只接一张账户，禁止复制到其它 WSFunded 账户。
+- The5ers Summer Plan 2-Step（`simulate_the5ers_summer.py` / `SQLiteSignalEA_the5ers_summer.mq5`，`trading_signals_the5ers_summer.db`，Magic `20261112`）：基于免配置版（最小手模式之前的 FundedNext），与在跑的 High Stakes `simulate_the5ers.py` 互不影响。启动选方案（10/5 第一轮 10%、8/5 第一轮 8%）和轮次；杠杆默认按测算给考核 3x / Pro 2x（`research/the5ers_summer_study.py`）。启动方案默认 8/5。EA 日亏限额 = min(起始资金, 当日锚点) × 3%，在 95% 处全平并停当日开仓；总亏地板不设保护；单笔硬止损默认不挂（`HARD_SL_PCT`=0，官方不强制止损，要挂改这个常量）。一台机器只跑一张 Summer 账户，New 和 Classic 分机器跑。Pro 出金的 50% 一致性没有自动处理，申请前看后台。
 - 部署顺序：`longport_data_service.py` → `simulate_*.py`（启动时重建 signals 表，带 `size_mult` 列）→ 在 MetaEditor 重新编译并重载 EA（Leverage 等 inputs 不变）。新 EA 读旧表时自动回退为满仓，旧 EA 读新表忽略 `size_mult`，顺序颠倒不会出错，只是冷清减仓不生效。
 
 ### Key gotchas
