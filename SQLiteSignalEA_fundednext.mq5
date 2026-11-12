@@ -5,12 +5,13 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-11-10g 免配置+考核止盈成交即停"  // 每次改 EA 逻辑时同步更新日期和说明
-// 杠杆、起始资金、单笔硬止损、绑定账户全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
+#define   EA_BUILD   "2026-11-12a 最小手模式"  // 每次改 EA 逻辑时同步更新日期和说明
+// 杠杆、起始资金、单笔硬止损、最小手模式、绑定账户全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 #property strict
 
 // 考核止盈挂单在官方线基础上多留的滑点（最小价位个数）
 #define   PASS_TP_SLIP_TICKS  5
+#define   MIN_MODE_LOTS       0.01   // minimum 模式目标手数；品种最小手更大时改开最小手
 
 // 添加必要的权限声明
 #property script_show_inputs
@@ -36,8 +37,9 @@ CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
 double g_sim_initial_balance = 0;    // simulate 写入的账户起始资金（0=未读到，不开仓）
-double g_sim_leverage = 0;           // simulate 写入的杠杆（0=未读到，不开仓）
+double g_sim_leverage = 0;           // simulate 写入的杠杆（0=未读到，不开仓；最小手模式允许为 0）
 double g_sim_hard_sl_pct = -1;       // simulate 写入的单笔硬止损%（<0=未读到；0=禁用）
+bool   g_min_lot_mode = false;       // simulate 写入的最小手模式：固定最小手，不挂止损，过线也继续开仓
 long   g_sim_login = 0;              // simulate 绑定的 MT5 登录号（与本终端不一致则不开仓）
 double g_initial_deposit = 0;        // MT5 历史里第一笔入金，供 simulate 作为起始资金默认值
 double g_challenge_pass_equity = 0;  // simulate 写入的官方考核通过线（0=Funded/关闭）
@@ -68,6 +70,8 @@ void   SyncPositionState();
 double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type);
 bool   SimConfigReady(string &why);
 void   LoadSimConfig(bool force);
+double MinModeLots();
+bool   PrepareEntry(long signal_id, ENUM_POSITION_TYPE type, double price, double &lots, double &sl);
 void   WriteAccountHeartbeat();
 void   CheckBalanceOperations();
 void   UpdatePassTP();
@@ -101,8 +105,14 @@ int OnInit()
     LoadChallengePassTarget(true);
     string why = "";
     if(SimConfigReady(why))
-        Print("🔗 已读取 simulate 配置: 起始资金 $", DoubleToString(g_sim_initial_balance, 2),
-              " | 杠杆 ", g_sim_leverage, "x | 单笔硬止损 ", g_sim_hard_sl_pct, "%");
+    {
+        if(g_min_lot_mode)
+            Print("🔗 已读取 simulate 配置: 最小手模式 | 起始资金 $", DoubleToString(g_sim_initial_balance, 2),
+                  " | 目标手数 ", DoubleToString(MIN_MODE_LOTS, 2), " | 不挂止损");
+        else
+            Print("🔗 已读取 simulate 配置: 起始资金 $", DoubleToString(g_sim_initial_balance, 2),
+                  " | 杠杆 ", g_sim_leverage, "x | 单笔硬止损 ", g_sim_hard_sl_pct, "%");
+    }
     else
         Print("⏳ 等待 simulate 下发配置（", why, "）。在此之前只写心跳、不开仓，启动 simulate 后自动生效");
     if(g_challenge_pass_equity > 0)
@@ -397,6 +407,27 @@ void NoteOrderRejected(long signal_id, double price, double sl)
 //+------------------------------------------------------------------+
 void UpdateProtectiveSL()
 {
+    // 最小手模式不挂止损。清掉本 EA 持仓上残留的 SL，避免切模式前挂上的保护单还在
+    if(g_min_lot_mode)
+    {
+        for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+            ulong ticket = PositionGetTicket(i);
+            if(!PositionSelectByTicket(ticket))
+                continue;
+            if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+                continue;
+            if(PositionGetDouble(POSITION_SL) <= 0)
+                continue;
+            double tp = PositionGetDouble(POSITION_TP);
+            if(trade.PositionModify(ticket, 0, tp))
+                Print("🛡️ 最小手模式，已撤掉持仓 ", ticket, " 的止损");
+            else
+                Print("❌ 最小手模式撤止损失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode());
+        }
+        return;
+    }
+
     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
     double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
@@ -727,11 +758,13 @@ void LoadSimConfig(bool force)
         return;
 
     int req = DatabasePrepare(db_handle,
-        "SELECT key, value FROM sim_config WHERE key IN ('account_start_balance', 'leverage', 'hard_sl_risk_percent', 'account_login')");
+        "SELECT key, value FROM sim_config WHERE key IN ('account_start_balance', 'leverage', 'hard_sl_risk_percent', 'account_login', 'min_lot_mode')");
     if(req == INVALID_HANDLE)
         return;
     double start = g_sim_initial_balance, lev = g_sim_leverage, hard = g_sim_hard_sl_pct;
     long login = g_sim_login;
+    bool min_mode = g_min_lot_mode;
+    bool saw_leverage = false;
     while(DatabaseRead(req))
     {
         string key = "";
@@ -740,33 +773,43 @@ void LoadSimConfig(bool force)
             continue;
         if(key == "account_start_balance" && v > 0)
             start = v;
-        else if(key == "leverage" && v > 0)
+        else if(key == "leverage" && v >= 0)
+        {
             lev = v;
+            saw_leverage = true;
+        }
         else if(key == "hard_sl_risk_percent" && v >= 0)
             hard = v;
         else if(key == "account_login" && v > 0)
             login = (long)MathRound(v);
+        else if(key == "min_lot_mode")
+            min_mode = (v >= 0.5);
     }
     DatabaseFinalize(req);
 
     if(MathAbs(start - g_sim_initial_balance) >= 0.005)
         Print("🔗 起始资金(simulate): $", DoubleToString(start, 2));
-    if(MathAbs(lev - g_sim_leverage) >= 0.0001)
+    if(min_mode != g_min_lot_mode)
+        Print(min_mode ? "🔗 最小手模式: 开 0.01 手（品种最小手更大时开最小手），不挂止损，过线也继续交易"
+                       : "🔗 最小手模式: 已关闭，恢复按杠杆计算手数");
+    if(!min_mode && saw_leverage && MathAbs(lev - g_sim_leverage) >= 0.0001)
         Print("🔗 杠杆(simulate): ", lev, "x");
     if(MathAbs(hard - g_sim_hard_sl_pct) >= 0.0001)
-        Print("🔗 单笔硬止损(simulate): ", hard, "%", hard > 0 ? "" : "（考核阶段不挂）");
+        Print("🔗 单笔硬止损(simulate): ", hard, "%",
+              hard > 0 ? "" : (min_mode ? "（最小手模式不挂）" : "（考核阶段不挂）"));
     if(login != g_sim_login)
         Print("🔗 simulate 绑定账户: ", login, (login == AccountInfoInteger(ACCOUNT_LOGIN)) ? "（与本终端一致）" : "（⚠️ 与本终端登录号不一致，不会开仓）");
     g_sim_initial_balance = start;
     g_sim_leverage = lev;
     g_sim_hard_sl_pct = hard;
     g_sim_login = login;
+    g_min_lot_mode = min_mode;
 }
 
 bool SimConfigReady(string &why)
 {
     if(g_sim_initial_balance <= 0) { why = "缺起始资金"; return false; }
-    if(g_sim_leverage <= 0) { why = "缺杠杆"; return false; }
+    if(!g_min_lot_mode && g_sim_leverage <= 0) { why = "缺杠杆"; return false; }
     if(g_sim_hard_sl_pct < 0) { why = "缺单笔硬止损"; return false; }
     if(g_sim_login <= 0) { why = "缺绑定账户"; return false; }
     if(g_sim_login != AccountInfoInteger(ACCOUNT_LOGIN))
@@ -968,19 +1011,9 @@ void ProcessSignal(long signal_id, string action)
         else
         {
             // 无持仓，开多仓
-            lots = ApplySizeMult(CalculateLotSize());
-            if(lots <= 0)
-            {
-                Print("❌ 计算手数失败，余额不足");
-                MarkSignalConsumed(signal_id);
-                return;
-            }
-            
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            double daily_sl = CalcDailyFloorSLPrice(lots, ask, POSITION_TYPE_BUY);
-            double hard_sl = CalcHardSLPrice(lots, ask, POSITION_TYPE_BUY);
             double sl = 0;
-            if(!PrepareOpenSl(signal_id, POSITION_TYPE_BUY, daily_sl, hard_sl, sl))
+            if(!PrepareEntry(signal_id, POSITION_TYPE_BUY, ask, lots, sl))
                 return;
             sent_price = ask;
             sent_sl = sl;
@@ -1010,19 +1043,9 @@ void ProcessSignal(long signal_id, string action)
         else
         {
             // 无持仓，开空仓
-            lots = ApplySizeMult(CalculateLotSize());
-            if(lots <= 0)
-            {
-                Print("❌ 计算手数失败，余额不足");
-                MarkSignalConsumed(signal_id);
-                return;
-            }
-            
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            double daily_sl = CalcDailyFloorSLPrice(lots, bid, POSITION_TYPE_SELL);
-            double hard_sl = CalcHardSLPrice(lots, bid, POSITION_TYPE_SELL);
             double sl = 0;
-            if(!PrepareOpenSl(signal_id, POSITION_TYPE_SELL, daily_sl, hard_sl, sl))
+            if(!PrepareEntry(signal_id, POSITION_TYPE_SELL, bid, lots, sl))
                 return;
             sent_price = bid;
             sent_sl = sl;
@@ -1164,6 +1187,72 @@ double ApplySizeMult(double lots)
     Print("📉 开盘冷清半仓: 手数 ", DoubleToString(lots, 2), " × ", DoubleToString(signal_size_mult, 2),
           " → ", DoubleToString(scaled, 2));
     return scaled;
+}
+
+//+------------------------------------------------------------------+
+//| 最小手模式：目标 0.01，品种最小手或步长更大时向上对齐               |
+//+------------------------------------------------------------------+
+double MinModeLots()
+{
+    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    if(min_lot < 0) min_lot = 0;
+    double lots = MathMax(MIN_MODE_LOTS, min_lot);
+    if(step > 0)
+        lots = MathCeil(lots / step - 1e-8) * step;
+    if(min_lot > 0 && lots < min_lot)
+        lots = min_lot;
+    lots = NormalizeDouble(lots, 8);
+    if(max_lot > 0 && lots > max_lot + 1e-8)
+    {
+        Print("❌ 最小手 ", DoubleToString(lots, 4), " 超过品种最大手数 ", DoubleToString(max_lot, 4));
+        return 0;
+    }
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double margin = 0;
+    if(price > 0 && OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, price, margin)
+       && margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
+    {
+        Print("❌ 最小手保证金 $", DoubleToString(margin, 2),
+              " 超过可用保证金 $", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
+        return 0;
+    }
+    Print("📊 最小手模式手数: ", DoubleToString(lots, 2),
+          "（目标 ", DoubleToString(MIN_MODE_LOTS, 2),
+          "，品种最小 ", DoubleToString(min_lot, 2),
+          "，步长 ", DoubleToString(step, 2), "）");
+    return lots;
+}
+
+//+------------------------------------------------------------------+
+//| 开仓手数和止损。最小手模式固定手数且止损为 0；其余模式走原逻辑       |
+//+------------------------------------------------------------------+
+bool PrepareEntry(long signal_id, ENUM_POSITION_TYPE type, double price, double &lots, double &sl)
+{
+    sl = 0;
+    if(g_min_lot_mode)
+    {
+        lots = MinModeLots();
+        if(lots <= 0)
+        {
+            Print("❌ 最小手模式无法下单");
+            MarkSignalConsumed(signal_id);
+            return false;
+        }
+        return true;
+    }
+
+    lots = ApplySizeMult(CalculateLotSize());
+    if(lots <= 0)
+    {
+        Print("❌ 计算手数失败，余额不足");
+        MarkSignalConsumed(signal_id);
+        return false;
+    }
+    double daily_sl = CalcDailyFloorSLPrice(lots, price, type);
+    double hard_sl = CalcHardSLPrice(lots, price, type);
+    return PrepareOpenSl(signal_id, type, daily_sl, hard_sl, sl);
 }
 
 //+------------------------------------------------------------------+
