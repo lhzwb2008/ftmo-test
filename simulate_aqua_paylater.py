@@ -42,7 +42,7 @@ FUNDED_HARD_SL_PCT = 0.95  # 单笔硬止损占起始资金的百分比；0=不�
 MIN_LOT = 0.01  # minimum 模式的目标手数；品种最小手更大时 EA 改开最小手
 EA_HEARTBEAT_MAX_AGE_SECONDS = 60  # EA 每 5 秒写一次 ea_account，超过这个时间视为 EA 没在运行
 EA_FILE = "SQLiteSignalEA_aqua_paylater.mq5"
-EXPECTED_EA_BUILD = "2026-11-13 免配置"
+EXPECTED_EA_BUILD = "2026-11-13b 免配置+日盈帽重载后保留"
 
 # 风控比例（Aqua Pay Later：Challenge 目标 3%、无日亏、硬止损 0.95%；Funded 无目标、日亏 3%、硬止损 0.95%、日盈帽默认 $1100）
 PHASE_PROFIT_TARGET_PCT = {"challenge": 0.03, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
@@ -288,7 +288,7 @@ def prompt_capital_settings():
         LEVERAGE = 0.0
         profile_leverage = saved_leverage(profile) or 0
     else:
-        profile_leverage = ask("杠杆倍数（如 4 / 2 / 1.5）", fmt_amount(saved_leverage(profile)) if saved_leverage(profile) else None, parse_positive)
+        profile_leverage = ask("杠杆倍数（建议 2）", fmt_amount(saved_leverage(profile)) if saved_leverage(profile) else "2", parse_positive)
         LEVERAGE = profile_leverage
     if phase == "funded":
         MAX_DAILY_PROFIT_AMOUNT = ask("Funded 日盈上限（200K 默认 1100，达到后当日停止开仓）", "1100", parse_positive)

@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-11-13 免配置"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-11-13b 免配置+日盈帽重载后保留"  // 每次改 EA 逻辑时同步更新日期和说明
 // 杠杆、起始资金、单笔硬止损、最小手模式、绑定账户全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 #property strict
 
@@ -806,6 +806,18 @@ void LoadSimConfig(bool force)
     }
     DatabaseFinalize(req);
 
+    static double shown_loss_pct = -2.0, shown_profit_cap = -2.0;
+    if(g_daily_loss_pct >= 0 && MathAbs(g_daily_loss_pct - shown_loss_pct) >= 0.0001)
+    {
+        Print("🔗 日亏比例(simulate): ", g_daily_loss_pct, "%", g_daily_loss_pct > 0 ? "" : "（Challenge 不设日亏线）");
+        shown_loss_pct = g_daily_loss_pct;
+    }
+    if(MathAbs(g_daily_profit_cap - shown_profit_cap) >= 0.005)
+    {
+        Print("🔗 单日利润上限(simulate): ", g_daily_profit_cap > 0 ? "$" + DoubleToString(g_daily_profit_cap, 2) : "不设");
+        shown_profit_cap = g_daily_profit_cap;
+    }
+
     if(MathAbs(start - g_sim_initial_balance) >= 0.005)
         Print("🔗 起始资金(simulate): $", DoubleToString(start, 2));
     if(min_mode != g_min_lot_mode)
@@ -1002,7 +1014,7 @@ void ProcessSignal(long signal_id, string action)
     // 日内止损已触发：当日禁止一切新开仓，只消费掉开仓信号
     if((daily_halted || profit_cap_halted) && (action == "BUY" || action == "SELL"))
     {
-        Print("🚫 日内止损已触发，今日不再开仓，忽略信号: ", action);
+        Print("🚫 今日已停止开仓（日亏线=", daily_halted ? "是" : "否", " 日盈帽=", profit_cap_halted ? "是" : "否", "），忽略信号: ", action);
         MarkSignalConsumed(signal_id);
         return;
     }
@@ -1673,9 +1685,12 @@ void DailyRiskLoadOrReset()
     {
         daily_anchor = GlobalVariableGet(DailyGVName("anchor"));
         daily_halted = GlobalVariableGet(DailyGVName("halted")) > 0.5;
+        // 当日已撞日盈帽的状态也要恢复，否则重载 EA 后当天会再开仓
+        profit_cap_halted = GlobalVariableCheck(DailyGVName("pcap")) && GlobalVariableGet(DailyGVName("pcap")) > 0.5;
         daily_period_start = period;
         Print("♻️ 已恢复当日风控状态: 锚点=$", DoubleToString(daily_anchor, 2),
-              " 当日已停止=", daily_halted ? "是" : "否");
+              " 当日已停止=", daily_halted ? "是" : "否",
+              " 日盈帽已停止=", profit_cap_halted ? "是" : "否");
         WriteDailyStatus(daily_halted ? "halted" : "restored");
         return;
     }
