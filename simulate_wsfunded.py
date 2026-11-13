@@ -39,6 +39,8 @@ LEVERAGE = None  # 杠杆倍数（启动时确认，写入 sim_config 由 EA 读
 ACCOUNT_LOGIN = None  # 绑定的 MT5 登录号，EA 登录号不一致时拒绝开仓
 CURRENT_PHASE = None  # "1" / "2" / "funded"
 EA_HEARTBEAT_MAX_AGE_SECONDS = 60  # EA 每 5 秒写一次 ea_account，超过这个时间视为 EA 没在运行
+EA_FILE = "SQLiteSignalEA_wsfunded.mq5"
+EXPECTED_EA_BUILD = "2026-11-10g Ultra单笔止损+免配置+考核止盈成交即停"
 
 # 风控比例（WSFunded Ultra 2-Step：Phase1 目标 10% / Phase2 5% / Funded 无目标；
 # 日亏 5%；总亏 10% 静态，由券商在净值跌破起始资金 90% 时关户。
@@ -236,6 +238,23 @@ def wait_for_ea_account():
         time_module.sleep(2)
 
 
+def remind_replace_ea(info=None):
+    """心跳里的 EA 版本不是本脚本对应的那一版时，提醒重新编译并替换图表上的 EA"""
+    if info is None:
+        info = read_ea_account()
+    build = (info or {}).get("ea_build") or ""
+    print("\n" + "!" * 60)
+    if build == EXPECTED_EA_BUILD:
+        print(f"EA 已是最新版本：{EXPECTED_EA_BUILD}")
+    else:
+        print("请用 MetaEditor 编译并替换图表上的 EA（inputs 不用改，重载即可）：")
+        print(f"  文件：{EA_FILE}")
+        print(f"  需要版本：{EXPECTED_EA_BUILD}")
+        print(f"  当前心跳：{build or '还没有'}")
+        print("  重载后日志应出现「已读取 simulate 配置」")
+    print("!" * 60)
+
+
 def load_profile(login):
     """该登录号上次启动时的选择，作为本次默认值"""
     try:
@@ -357,6 +376,7 @@ def prompt_capital_settings():
         print("账户止盈: 已禁用（Funded 账户无利润目标，日内止损由 EA 执行）")
     
     print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
+    remind_replace_ea(info)
     idea_usd = idea_risk_usd(start_balance, current_balance)
     official_idea = min(start_balance, current_balance) * DAILY_LOSS_PCT * IDEA_RISK_FRACTION
     print(f"单笔止损: 当日回撤额度的 {IDEA_RISK_FRACTION*100:.0f}%，再留 {IDEA_RISK_BUFFER_PCT*100:.0f}% 缓冲")
@@ -2258,7 +2278,8 @@ if __name__ == "__main__":
     print(f"初始 TOTAL_PNL: ${TOTAL_PNL:.2f}")
     print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     print("=" * 60 + "\n")
-    
+    remind_replace_ea()
+
     if not ensure_market_data_service_available():
         sys.exit(1)
 

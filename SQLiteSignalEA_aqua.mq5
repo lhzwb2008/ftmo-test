@@ -1,14 +1,17 @@
 //+------------------------------------------------------------------+
-//|                                      SQLiteSignalEA_aqua.mq5      |
-//|                        AquaFunded 2-Step Standard 信号执行EA      |
-//| 杠杆/单笔硬止损/初始资金只从 simulate 写入的 sim_config 读取       |
-//| 读不到则 EA 拒绝启动（先启动 simulate_aqua.py 再加载 EA）          |
+//|                                            SQLiteSignalEA.mq5     |
+//|                                     简化版SQLite信号执行EA         |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.08"
-#define   EA_BUILD   "2026-11-06c 杠杆/硬止损/初始资金只读 simulate"  // 每次改 EA 逻辑时同步更新日期和说明
+#property version   "1.04"
+#define   EA_BUILD   "2026-11-13 免配置"  // 每次改 EA 逻辑时同步更新日期和说明
+// 杠杆、起始资金、单笔硬止损、最小手模式、绑定账户全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 #property strict
+
+// 考核止盈挂单在官方线基础上多留的滑点（最小价位个数）
+#define   PASS_TP_SLIP_TICKS  5
+#define   MIN_MODE_LOTS       0.01   // minimum 模式目标手数；品种最小手更大时改开最小手
 
 // 添加必要的权限声明
 #property script_show_inputs
@@ -16,28 +19,36 @@
 #include <Trade\Trade.mqh>
 #include <Trade\AccountInfo.mqh>
 
-//--- 输入参数（多账户只需改 InstanceId=1/2/3/4，DB与Magic自动）
-input int      InstanceId = 1;                         // 实例编号 1/2/3/4（与 Python 启动输入一致）
+//--- 输入参数
+input int      InstanceId = 1;                         // 实例编号（与 simulate 启动输入一致）
+string         g_db_path = "";
+int            g_magic = 0;
 input bool     UseCommonPath = true;                   // 使用通用目录（推荐）
 input double   RiskPercent = 100.0;                    // 使用余额百分比(%)
 input int      CheckIntervalSeconds = 1;               // 检查间隔（秒）
 
 //--- 日内亏损风控参数（EA端基于真实权益逐tick监控，Python端不再负责日内止损；限额基于账户初始资金，见 EffInitialBalance）
-input double   DailyLossPercent = 5.0;                 // 官方日内最大亏损比例(%)（Aqua Standard 官方 5；0=禁用）
+input double   DailyLossPercentInput = 5.0;             // 未收到 simulate 时的日亏比例(%)（Aqua Standard 官方 5；0=禁用）
+double         g_daily_loss_pct = -1.0;          // simulate 下发的 daily_loss_percent；<0 表示用 input
+#define DailyLossPercent ((g_daily_loss_pct >= 0.0) ? g_daily_loss_pct : DailyLossPercentInput)
 input double   DailyLossBufferPercent = 5.0;           // 触发缓冲(%，占日亏限额比例)（覆盖滑点/跳空，重大数据日建议调大）
 input int      DailyResetServerHour = 0;               // 日亏锚点重置时间（服务器小时，0=服务器午夜，需与考试商日重置一致）
-input bool     ForceResetDailyRisk = false;            // 强制重置日内锚点（出金后勾选一次，加载后请取消勾选；换账号已自动区分）
+input bool     ForceResetDailyRisk = false;            // 强制重置日内锚点（一般不用：换账户、出入金已自动重算）
 
 //--- 全局变量
 CTrade trade;
 datetime last_check_time = 0;
 int db_handle = INVALID_HANDLE;
-double g_sim_initial_balance = 0;  // simulate 写入的账户起始资金（0=未读到）
-double g_sim_leverage = 0;         // simulate 写入的杠杆（0=未读到）
-double g_sim_hard_sl_pct = -1;     // simulate 写入的单笔硬止损%（<0=未读到；0=禁用）
+double g_sim_initial_balance = 0;    // simulate 写入的账户起始资金（0=未读到，不开仓）
+double g_sim_leverage = 0;           // simulate 写入的杠杆（0=未读到，不开仓；最小手模式允许为 0）
+double g_sim_hard_sl_pct = -1;       // simulate 写入的单笔硬止损%（<0=未读到；0=禁用）
+bool   g_min_lot_mode = false;       // simulate 写入的最小手模式：固定最小手，不挂止损，过线也继续开仓
+long   g_sim_login = 0;              // simulate 绑定的 MT5 登录号（与本终端不一致则不开仓）
+double g_initial_deposit = 0;        // MT5 历史里第一笔入金，供 simulate 作为起始资金默认值
+double g_challenge_pass_equity = 0;  // simulate 写入的官方考核通过线（0=Funded/关闭）
+bool   pass_halted = false;          // 考核已通过则停止开仓，直到通过线写成 0 或 simulate 换新会话
+bool   pass_status_pending = false;  // ea_pass_status 写入失败，待补写
 double signal_size_mult = 1.0;  // 当前信号的开仓手数系数（signals.size_mult，开盘冷清日 0.5）
-string   g_db_path = "";              // 运行时: trading_signals_aqua_{InstanceId}.db
-int      g_magic = 0;                 // 运行时魔术号
 
 //--- 日内亏损风控状态（通过 GlobalVariables 持久化，EA 重启不丢失）
 double   daily_anchor = 0.0;          // 日初锚点权益 = max(balance, equity)，比各家官方锚点定义都保守
@@ -47,11 +58,11 @@ datetime last_status_write = 0;       // 上次写 ea_daily_status 状态表的�
 
 //--- 持仓同步（硬止损/服务器SL打掉后写回 DB，供 simulate 镜像平仓）
 ulong    last_tracked_ticket = 0;     // 上一tick跟踪的持仓票号
+long     last_tracked_position_id = 0; // 上一tick跟踪的持仓 ID（查平仓原因用）
 int      ea_close_seq = 0;            // 外部平仓序号（递增），simulate 据此发现硬止损平仓
 bool     internal_close_pending = false; // EA 自己执行了平仓（CLOSE信号/反手/日亏全平），下次持仓消失不算外部平仓
 
 //--- 前向声明（MQL5 要求先声明后使用）
-bool ResolveInstanceSettings();
 string DailyGVName(string suffix);
 double DailyLossLimitUSD();
 double DailyTriggerFloor();
@@ -60,17 +71,32 @@ void   WritePositionStatus(int side, double volume, double open_price, double sl
 void   UpdateProtectiveSL();
 void   SyncPositionState();
 double CalcProtectiveSL(double lots, double open_price, ENUM_POSITION_TYPE type);
+bool   SimConfigReady(string &why);
+void   LoadSimConfig(bool force);
+double MinModeLots();
+bool   PrepareEntry(long signal_id, ENUM_POSITION_TYPE type, double price, double &lots, double &sl);
+void   WriteAccountHeartbeat();
+void   CheckBalanceOperations();
+void   UpdatePassTP();
+void   EnterPassHalt(string why);
+double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float, double close_cost);
+double EstimateCloseCost(long position_id);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    if(InstanceId < 1)
+    {
+        Print("InstanceId 必须 >= 1");
+        return(INIT_FAILED);
+    }
+    g_db_path = "trading_signals_aqua_" + IntegerToString(InstanceId) + ".db";
+    g_magic = 20260808 + InstanceId;
+    Print("实例 ", InstanceId, " → ", g_db_path, " Magic ", g_magic);
     Print("🏷️ EA 版本 ", EA_BUILD, " | 文件 ", __FILE__,
           " | 编译于 ", TimeToString(__DATETIME__, TIME_DATE | TIME_MINUTES));
-    if(!ResolveInstanceSettings())
-        return(INIT_PARAMETERS_INCORRECT);
-
     // 设置魔术数字
     trade.SetExpertMagicNumber(g_magic);
     
@@ -80,20 +106,33 @@ int OnInit()
         Print("❌ 无法打开SQLite数据库");
         return(INIT_FAILED);
     }
+    Print("👤 MT5 账户: ", AccountInfoInteger(ACCOUNT_LOGIN), " @ ", AccountInfoString(ACCOUNT_SERVER),
+          " 余额=$", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+    g_initial_deposit = DetectInitialDeposit();
+    if(g_initial_deposit > 0)
+        Print("👤 MT5 历史第一笔入金: $", DoubleToString(g_initial_deposit, 2));
+
     LoadSimConfig(true);
-    if(g_sim_initial_balance <= 0 || g_sim_leverage <= 0 || g_sim_hard_sl_pct < 0)
+    LoadChallengePassTarget(true);
+    string why = "";
+    if(SimConfigReady(why))
     {
-        Print("❌ 未读到 simulate 共享配置（起始资金/杠杆/单笔硬止损），请先启动 simulate_aqua.py（实例 ", InstanceId,
-              "）完成轮次与杠杆输入，再重新加载 EA");
-        return(INIT_FAILED);
+        if(g_min_lot_mode)
+            Print("🔗 已读取 simulate 配置: 最小手模式 | 起始资金 $", DoubleToString(g_sim_initial_balance, 2),
+                  " | 目标手数 ", DoubleToString(MIN_MODE_LOTS, 2), " | 不挂止损");
+        else
+            Print("🔗 已读取 simulate 配置: 起始资金 $", DoubleToString(g_sim_initial_balance, 2),
+                  " | 杠杆 ", g_sim_leverage, "x | 单笔硬止损 ", g_sim_hard_sl_pct, "%");
     }
+    else
+        Print("⏳ 等待 simulate 下发配置（", why, "）。在此之前只写心跳、不开仓，启动 simulate 后自动生效");
+    if(g_challenge_pass_equity > 0)
+        Print("🎯 考核通过线: $", DoubleToString(g_challenge_pass_equity, 2),
+              "（开仓即挂券商止盈，空仓且余额过线即停止开仓）。当前已停止=", pass_halted ? "是" : "否");
+    else
+        Print("🎯 考核通过检测: 已关闭（Funded 或未写入通过线）");
     
     Print("✅ EA初始化成功");
-    Print("🧩 编译版本: 1.04（开仓前校验止损；服务器 Invalid stops 只拒绝一次，不再重试）");
-    Print("🔢 Aqua 实例编号: ", InstanceId);
-    Print("🗄 信号库: ", g_db_path);
-    Print("🪄 Magic: ", g_magic);
-    Print("💰 杠杆: ", EffLeverage(), "倍（simulate 同步）");
     Print("📊 使用余额: ", RiskPercent, "%");
     
     // 初始化日内亏损风控（恢复或重置当日锚点/halted 状态）
@@ -107,22 +146,37 @@ int OnInit()
     else
         Print("🛡️ 日内止损(EA端): 已禁用");
     
-    if(EffHardSLPct() > 0)
-        Print("🛡️ 单笔硬止损(Wave Stop兜底): 初始资金 $", DoubleToString(EffInitialBalance(), 2), " × ", EffHardSLPct(),
-              "% = $", DoubleToString(EffInitialBalance() * EffHardSLPct() / 100.0, 2),
-              " （simulate 同步；与日亏线SL取更紧者）");
-    else
-        Print("🛡️ 单笔硬止损: 已禁用（simulate 同步；Challenge 模式）");
-    
-    // 恢复外部平仓序号，避免 EA 重启后 simulate 漏同步
-    if(GlobalVariableCheck(CloseSeqGVName()))
-        ea_close_seq = (int)GlobalVariableGet(CloseSeqGVName());
+    // 恢复外部平仓序号，避免 EA 重启后 simulate 漏同步（旧版 GV 不带登录号，升级时沿用）
+    if(GlobalVariableCheck(DailyGVName("close_seq")))
+        ea_close_seq = (int)GlobalVariableGet(DailyGVName("close_seq"));
+    else if(GlobalVariableCheck(LegacyGVName("close_seq")))
+        ea_close_seq = (int)GlobalVariableGet(LegacyGVName("close_seq"));
     
     // 启动时立即检查已有持仓保护性SL（硬止损∩日亏线取更紧）
     EnsureStopLosses();
+    UpdatePassTP();
     SyncPositionState();
+    WriteAccountHeartbeat();
+    // 周末/休市没有 tick，心跳、配置重读、出入金检测靠定时器
+    EventSetTimer(5);
     
     return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| 定时器：心跳 + 重读配置 + 出入金检测（不依赖 tick）               |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    static datetime last_deposit_scan = 0;
+    LoadSimConfig(false);
+    if(TimeLocal() - last_deposit_scan >= 3600)
+    {
+        last_deposit_scan = TimeLocal();
+        g_initial_deposit = DetectInitialDeposit();
+    }
+    CheckBalanceOperations();
+    WriteAccountHeartbeat();
 }
 
 //+------------------------------------------------------------------+
@@ -130,6 +184,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    EventKillTimer();
     if(db_handle != INVALID_HANDLE)
     {
         DatabaseClose(db_handle);
@@ -146,6 +201,7 @@ void OnTick()
 {
     // 日内亏损检查逐tick执行（不受节流影响）：真实权益对比触发线，触线立即全平
     DailyRiskCheck();
+    ChallengePassCheck();
     // 检测硬止损/服务器SL等外部平仓，并写回 ea_position 供 simulate 镜像
     SyncPositionState();
     
@@ -156,19 +212,19 @@ void OnTick()
     last_check_time = current_time;
     // 统一维护保护性SL：min(单笔硬止损, 日亏触发线SL)，取更紧者
     UpdateProtectiveSL();
+    UpdatePassTP();
     CheckDatabaseSignals();
 }
 
 //+------------------------------------------------------------------+
 //| 计算硬止损距离（价格单位）                                         |
-//| Aqua Funded：Wave Stop＝合计浮亏达当前余额1%记 strike；单仓时等价单笔1% |
-//| 总亏 8% 下余额≥92K，0.9% × 初始 100K ≤ 1% × 92K，始终先于 Wave Stop  |
-//| Challenge：硬止损 0 禁用；Funded 0.9 挂服务器（simulate 按轮次写入） |
-//| 风险金额 = 初始资金 × EffHardSLPct()%，换算成价格距离              |
+//| Funded 账户：每笔单必须挂SL，且累计风险≤初始资金3%                   |
+//| 比例由 simulate 按轮次下发：Funded 2.5%，考核 0（不挂）             |
+//| 风险金额 = 初始资金 × 硬止损%，换算成价格距离                       |
 //+------------------------------------------------------------------+
 double CalcHardSLDistance(double lots)
 {
-    if(lots <= 0 || EffHardSLPct() <= 0) return 0;
+    if(lots <= 0 || g_sim_hard_sl_pct <= 0) return 0;
     
     double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -176,7 +232,7 @@ double CalcHardSLDistance(double lots)
     
     // 每1.0手每1个价格单位的亏损金额
     double loss_per_unit = tick_value / tick_size;
-    double risk_amount = EffInitialBalance() * (EffHardSLPct() / 100.0);
+    double risk_amount = EffInitialBalance() * (g_sim_hard_sl_pct / 100.0);
     
     double distance = risk_amount / (loss_per_unit * lots);
     
@@ -204,7 +260,7 @@ double CalcHardSLPrice(double lots, double open_price, ENUM_POSITION_TYPE type)
 //+------------------------------------------------------------------+
 double CalcDailyFloorSLPrice(double lots, double open_price, ENUM_POSITION_TYPE type)
 {
-    if(DailyLossPercent <= 0 || daily_halted || lots <= 0 || daily_anchor <= 0)
+    if(DailyLossPercent <= 0 || daily_halted || lots <= 0 || daily_anchor <= 0 || EffInitialBalance() <= 0)
         return 0;
     
     double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
@@ -362,6 +418,27 @@ void NoteOrderRejected(long signal_id, double price, double sl)
 //+------------------------------------------------------------------+
 void UpdateProtectiveSL()
 {
+    // 最小手模式不挂止损。清掉本 EA 持仓上残留的 SL，避免切模式前挂上的保护单还在
+    if(g_min_lot_mode)
+    {
+        for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+            ulong ticket = PositionGetTicket(i);
+            if(!PositionSelectByTicket(ticket))
+                continue;
+            if(PositionGetInteger(POSITION_MAGIC) != g_magic)
+                continue;
+            if(PositionGetDouble(POSITION_SL) <= 0)
+                continue;
+            double tp = PositionGetDouble(POSITION_TP);
+            if(trade.PositionModify(ticket, 0, tp))
+                Print("🛡️ 最小手模式，已撤掉持仓 ", ticket, " 的止损");
+            else
+                Print("❌ 最小手模式撤止损失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode());
+        }
+        return;
+    }
+
     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
     double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
@@ -433,22 +510,156 @@ void EnsureStopLosses()
 }
 
 //+------------------------------------------------------------------+
-//| 按 InstanceId 解析信号库文件名与 Magic（与 simulate_aqua.py 对齐）   |
+//| 平仓手续费估算：按本仓位开仓成交的手续费/费用算（多数券商两边相同）。 |
 //+------------------------------------------------------------------+
-bool ResolveInstanceSettings()
+double EstimateCloseCost(long position_id)
 {
-    if(InstanceId < 1)
+    static long   cached_id = -1;
+    static double cached_cost = 0;
+    if(position_id == cached_id)
+        return cached_cost;
+    if(!HistorySelectByPosition(position_id))
+        return 0;
+    double cost = 0;
+    bool found = false;
+    for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
     {
-        Print("❌ InstanceId 必须是 1/2/3/4…（与 Python 启动编号一致）");
-        return false;
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal == 0 || HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_IN)
+            continue;
+        found = true;
+        cost += MathAbs(HistoryDealGetDouble(deal, DEAL_COMMISSION)) + MathAbs(HistoryDealGetDouble(deal, DEAL_FEE));
     }
+    // 开仓成交还没进历史时不缓存，下一秒再查
+    if(found)
+    {
+        cached_id = position_id;
+        cached_cost = cost;
+    }
+    return cost;
+}
 
-    // 仅由编号推导，无需再配 DB / Magic
-    g_db_path = "trading_signals_aqua_" + IntegerToString(InstanceId) + ".db";
-    g_magic = 20260808 + InstanceId;
+//+------------------------------------------------------------------+
+//| 考核止盈价：成交后余额 = 官方线 + 平仓手续费，再多留几个价位的滑点。 |
+//| pos_float 为本仓位当前浮盈+隔夜费，从净值里扣掉后得到不含本仓的基数。 |
+//+------------------------------------------------------------------+
+double CalcPassTPPrice(ENUM_POSITION_TYPE type, double lots, double open_price, double pos_float, double close_cost)
+{
+    if(g_challenge_pass_equity <= 0 || lots <= 0 || open_price <= 0)
+        return 0;
+    // 已经过线时 needed 为负，算出的止盈价在现价另一侧，由 UpdatePassTP 直接平仓
+    double needed = g_challenge_pass_equity + close_cost - (AccountInfoDouble(ACCOUNT_EQUITY) - pos_float);
 
-    Print("🔗 实例 #", InstanceId, " → ", g_db_path, " / Magic=", g_magic);
-    return true;
+    bool is_buy = (type == POSITION_TYPE_BUY);
+    double per_unit = 0;
+    if(!OrderCalcProfit(is_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, open_price,
+                        is_buy ? open_price + 1.0 : open_price - 1.0, per_unit) || per_unit <= 0)
+    {
+        double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+        double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+        per_unit = (ts > 0) ? lots * tick_value / ts : 0;
+    }
+    if(per_unit <= 0)
+        return 0;
+
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tick_size <= 0) tick_size = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double dist = needed / per_unit + PASS_TP_SLIP_TICKS * tick_size;
+    double raw = is_buy ? open_price + dist : open_price - dist;
+    if(raw <= 0)
+        return 0;
+    // 多单向上、空单向下取整到最小价位，保证成交时余额不低于官方线
+    double tp = is_buy ? MathCeil(raw / tick_size) * tick_size : MathFloor(raw / tick_size) * tick_size;
+    return NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+}
+
+//+------------------------------------------------------------------+
+//| 考核阶段给持仓挂服务器端止盈（净值到平仓线的价格），EA 掉线也会成交。 |
+//| 止盈是仓位自带属性，仓位被策略/止损/收盘平掉时随之消失，无需撤单。   |
+//| 止盈价已被现价越过（券商不收）时直接平仓，效果等同止盈立即成交。     |
+//+------------------------------------------------------------------+
+void UpdatePassTP()
+{
+    static datetime last_fail = 0;
+    static ulong    noted_ticket = 0;
+    if(pass_halted || TimeLocal() - last_fail < 30)
+        return;
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tick_size <= 0) tick_size = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double min_stop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!PositionSelectByTicket(ticket))
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != g_magic)
+            continue;
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        double cur_sl = PositionGetDouble(POSITION_SL);
+        double cur_tp = PositionGetDouble(POSITION_TP);
+
+        if(g_challenge_pass_equity <= 0)
+        {
+            // Funded / 通过线清零：撤掉之前挂的考核止盈
+            if(cur_tp > 0)
+            {
+                if(trade.PositionModify(ticket, cur_sl, 0))
+                    Print("🎯 无考核通过线，已撤掉持仓 ", ticket, " 的考核止盈");
+                else
+                    last_fail = TimeLocal();
+            }
+            continue;
+        }
+
+        double lots = PositionGetDouble(POSITION_VOLUME);
+        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        double pos_float = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+        double close_cost = EstimateCloseCost(PositionGetInteger(POSITION_IDENTIFIER));
+        double target_tp = CalcPassTPPrice(type, lots, open_price, pos_float, close_cost);
+        if(target_tp <= 0)
+            continue;
+        // 净值小数误差会让止盈价在相邻价位间跳动，差 1.5 个价位以内不改单（滑点余量已覆盖）
+        if(cur_tp > 0 && MathAbs(cur_tp - target_tp) < tick_size * 1.5)
+            continue;
+
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        bool crossed = (type == POSITION_TYPE_BUY) ? (target_tp <= bid) : (target_tp >= ask);
+        if(crossed)
+        {
+            // 不标记为 EA 自身平仓：和券商止盈成交一样计入外部平仓序号，simulate 据此镜像平仓
+            Print("🎯 现价已越过考核止盈价 ", DoubleToString(target_tp, digits), "，直接平仓");
+            if(trade.PositionClose(ticket))
+                EnterPassHalt("现价越过考核止盈价，已平仓");
+            else
+                Print("❌ 考核止盈平仓失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode(), "，下一秒重试");
+            return;
+        }
+        bool placeable = (type == POSITION_TYPE_BUY) ? (target_tp > bid + min_stop) : (target_tp < ask - min_stop);
+        if(!placeable)
+        {
+            // 离现价不足最小止损距离：下一秒要么越过（直接平），要么拉开（挂上）
+            if(noted_ticket != ticket)
+            {
+                noted_ticket = ticket;
+                Print("🎯 考核止盈价 ", DoubleToString(target_tp, digits), " 离现价不足最小距离，暂不挂单");
+            }
+            continue;
+        }
+
+        if(trade.PositionModify(ticket, cur_sl, target_tp))
+            Print("🎯 已挂考核止盈: ", DoubleToString(target_tp, digits),
+                  "（官方线 $", DoubleToString(g_challenge_pass_equity, 2),
+                  " + 平仓费 $", DoubleToString(close_cost, 2),
+                  " + ", DoubleToString(PASS_TP_SLIP_TICKS, 0), " 个价位滑点，持仓 ", ticket, "）");
+        else
+        {
+            last_fail = TimeLocal();
+            Print("❌ 挂考核止盈失败，持仓 ", ticket, " 错误: ", trade.ResultRetcode(), "，30 秒后重试");
+        }
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -476,14 +687,14 @@ bool OpenDatabase()
     Print("🔍 当前终端目录: ", TerminalInfoString(TERMINAL_DATA_PATH));
     Print("🔍 通用数据目录: ", TerminalInfoString(TERMINAL_COMMONDATA_PATH));
     
-    // 方式1: 尝试读写模式
+    // 方式1: 尝试读写模式（文件不存在则创建，EA 可以先于 simulate 启动）
     if(UseCommonPath)
     {
-        db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READWRITE | DATABASE_OPEN_COMMON);
+        db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE | DATABASE_OPEN_COMMON);
     }
     else
     {
-        db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READWRITE);
+        db_handle = DatabaseOpen(g_db_path, DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
     }
     
     if(db_handle == INVALID_HANDLE)
@@ -524,75 +735,171 @@ bool OpenDatabase()
 }
 
 //+------------------------------------------------------------------+
-//| 账户初始资金 / 杠杆 / 单笔硬止损：全部来自 simulate 写入的 sim_config
+//| 账户初始资金：只用 simulate 写入 sim_config 的起始资金（0=未就绪） |
 //+------------------------------------------------------------------+
 double EffInitialBalance()
 {
     return g_sim_initial_balance;
 }
 
-double EffLeverage()
+bool SimTableExists(string name)
 {
-    return g_sim_leverage;
-}
-
-double EffHardSLPct()
-{
-    return MathMax(g_sim_hard_sl_pct, 0.0);
-}
-
-bool ReadSimConfig(string key, double &value)
-{
-    int req = DatabasePrepare(db_handle, "SELECT value FROM sim_config WHERE key = '" + key + "'");
+    long n = 0;
+    int req = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '" + name + "'");
     if(req == INVALID_HANDLE)
         return false;
-    bool ok = DatabaseRead(req) && DatabaseColumnDouble(req, 0, value);
+    if(DatabaseRead(req))
+        DatabaseColumnLong(req, 0, n);
     DatabaseFinalize(req);
-    return ok;
+    return n > 0;
 }
 
 //+------------------------------------------------------------------+
-//| 每 30 秒读 simulate 写入的 sim_config：起始资金 / 杠杆 / 单笔硬止损 |
-//| 某项读不到时保留上次读到的值（OnInit 时缺任一项则拒绝启动）        |
+//| 读 simulate 下发的账户配置。读失败时保持上一次的值，不能清零       |
 //+------------------------------------------------------------------+
 void LoadSimConfig(bool force)
 {
     static datetime last_load = 0;
     if(db_handle == INVALID_HANDLE)
         return;
-    if(!force && TimeLocal() - last_load < 30)
+    if(!force && TimeLocal() - last_load < 3)
         return;
     last_load = TimeLocal();
+    if(!SimTableExists("sim_config"))
+        return;
 
-    long has_table = 0;
-    int req = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sim_config'");
+    int req = DatabasePrepare(db_handle,
+        "SELECT key, value FROM sim_config WHERE key IN ('account_start_balance', 'leverage', 'hard_sl_risk_percent', 'account_login', 'min_lot_mode', 'daily_loss_percent', 'daily_profit_cap')");
     if(req == INVALID_HANDLE)
         return;
-    if(DatabaseRead(req))
-        DatabaseColumnLong(req, 0, has_table);
+    double start = g_sim_initial_balance, lev = g_sim_leverage, hard = g_sim_hard_sl_pct;
+    long login = g_sim_login;
+    bool min_mode = g_min_lot_mode;
+    bool saw_leverage = false;
+    while(DatabaseRead(req))
+    {
+        string key = "";
+        double v = 0;
+        if(!DatabaseColumnText(req, 0, key) || !DatabaseColumnDouble(req, 1, v))
+            continue;
+        if(key == "account_start_balance" && v > 0)
+            start = v;
+        else if(key == "leverage" && v >= 0)
+        {
+            lev = v;
+            saw_leverage = true;
+        }
+        else if(key == "hard_sl_risk_percent" && v >= 0)
+            hard = v;
+        else if(key == "account_login" && v > 0)
+            login = (long)MathRound(v);
+        else if(key == "min_lot_mode")
+            min_mode = (v >= 0.5);
+        else if(key == "daily_loss_percent" && v >= 0)
+            g_daily_loss_pct = v;
+    }
     DatabaseFinalize(req);
-    if(has_table == 0)
-        return;
 
-    double value = 0;
-    if(ReadSimConfig("account_start_balance", value) && value > 0 && MathAbs(value - g_sim_initial_balance) >= 0.005)
+    if(MathAbs(start - g_sim_initial_balance) >= 0.005)
+        Print("🔗 起始资金(simulate): $", DoubleToString(start, 2));
+    if(min_mode != g_min_lot_mode)
+        Print(min_mode ? "🔗 最小手模式: 开 0.01 手（品种最小手更大时开最小手），不挂止损，过线也继续交易"
+                       : "🔗 最小手模式: 已关闭，恢复按杠杆计算手数");
+    if(!min_mode && saw_leverage && MathAbs(lev - g_sim_leverage) >= 0.0001)
+        Print("🔗 杠杆(simulate): ", lev, "x");
+    if(MathAbs(hard - g_sim_hard_sl_pct) >= 0.0001)
+        Print("🔗 单笔硬止损(simulate): ", hard, "%",
+              hard > 0 ? "" : (min_mode ? "（最小手模式不挂）" : "（考核阶段不挂）"));
+    if(login != g_sim_login)
+        Print("🔗 simulate 绑定账户: ", login, (login == AccountInfoInteger(ACCOUNT_LOGIN)) ? "（与本终端一致）" : "（⚠️ 与本终端登录号不一致，不会开仓）");
+    g_sim_initial_balance = start;
+    g_sim_leverage = lev;
+    g_sim_hard_sl_pct = hard;
+    g_sim_login = login;
+    g_min_lot_mode = min_mode;
+}
+
+bool SimConfigReady(string &why)
+{
+    if(g_sim_initial_balance <= 0) { why = "缺起始资金"; return false; }
+    if(!g_min_lot_mode && g_sim_leverage <= 0) { why = "缺杠杆"; return false; }
+    if(g_sim_hard_sl_pct < 0) { why = "缺单笔硬止损"; return false; }
+    if(g_sim_login <= 0) { why = "缺绑定账户"; return false; }
+    if(g_sim_login != AccountInfoInteger(ACCOUNT_LOGIN))
     {
-        g_sim_initial_balance = value;
-        Print("🔗 账户初始资金已从 simulate 同步: $", DoubleToString(value, 2));
+        why = "simulate 绑定账户 " + IntegerToString(g_sim_login) + " 与本终端 " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + " 不一致";
+        return false;
     }
-    value = 0;
-    if(ReadSimConfig("leverage", value) && value > 0 && MathAbs(value - g_sim_leverage) >= 0.0001)
+    why = "";
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| MT5 历史里最早一笔正数入金，作为 simulate 起始资金的默认值         |
+//+------------------------------------------------------------------+
+double DetectInitialDeposit()
+{
+    if(!HistorySelect(0, TimeCurrent() + 86400))
+        return g_initial_deposit;
+    datetime first_time = 0;
+    double first_amount = 0;
+    int n = HistoryDealsTotal();
+    for(int i = 0; i < n; i++)
     {
-        g_sim_leverage = value;
-        Print("🔗 杠杆已从 simulate 同步: ", DoubleToString(value, 2), "倍");
+        ulong t = HistoryDealGetTicket(i);
+        if(t == 0 || HistoryDealGetInteger(t, DEAL_TYPE) != DEAL_TYPE_BALANCE)
+            continue;
+        double amount = HistoryDealGetDouble(t, DEAL_PROFIT);
+        datetime when = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
+        if(amount > 0 && (first_time == 0 || when < first_time))
+        {
+            first_time = when;
+            first_amount = amount;
+        }
     }
-    value = -1;
-    if(ReadSimConfig("hard_sl_risk_percent", value) && value >= 0 && MathAbs(value - g_sim_hard_sl_pct) >= 0.0001)
-    {
-        g_sim_hard_sl_pct = value;
-        Print("🔗 单笔硬止损已从 simulate 同步: ", DoubleToString(value, 2), "%",
-              value > 0 ? StringFormat(" = $%.2f", EffInitialBalance() * value / 100.0) : "（禁用）");
-    }
+    return first_amount;
+}
+
+string SqlText(string s)
+{
+    StringReplace(s, "'", "''");
+    return s;
+}
+
+//+------------------------------------------------------------------+
+//| 账户心跳：simulate 启动时据此读取余额/登录号，不用手输              |
+//+------------------------------------------------------------------+
+void WriteAccountHeartbeat()
+{
+    if(db_handle == INVALID_HANDLE)
+        return;
+    if(!DatabaseExecute(db_handle,
+        "CREATE TABLE IF NOT EXISTS ea_account (id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "login INTEGER, server TEXT, company TEXT, name TEXT, currency TEXT, "
+        "balance REAL, equity REAL, initial_deposit REAL, symbol TEXT, ea_build TEXT, "
+        "config_ready INTEGER, config_note TEXT, updated_at TEXT)"))
+        return;
+    string why = "";
+    bool ready = SimConfigReady(why);
+    string sql = StringFormat(
+        "INSERT OR REPLACE INTO ea_account (id, login, server, company, name, currency, balance, equity, "
+        "initial_deposit, symbol, ea_build, config_ready, config_note, updated_at) "
+        "VALUES (1, %I64d, '%s', '%s', '%s', '%s', %.2f, %.2f, %.2f, '%s', '%s', %d, '%s', '%s')",
+        AccountInfoInteger(ACCOUNT_LOGIN),
+        SqlText(AccountInfoString(ACCOUNT_SERVER)),
+        SqlText(AccountInfoString(ACCOUNT_COMPANY)),
+        SqlText(AccountInfoString(ACCOUNT_NAME)),
+        SqlText(AccountInfoString(ACCOUNT_CURRENCY)),
+        AccountInfoDouble(ACCOUNT_BALANCE),
+        AccountInfoDouble(ACCOUNT_EQUITY),
+        g_initial_deposit,
+        SqlText(_Symbol),
+        SqlText(EA_BUILD),
+        ready ? 1 : 0,
+        SqlText(why),
+        TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS));
+    if(!DatabaseExecute(db_handle, sql))
+        Print("⚠️ 写入 ea_account 失败: ", GetLastError());
 }
 
 //+------------------------------------------------------------------+
@@ -603,6 +910,18 @@ void CheckDatabaseSignals()
     if(db_handle == INVALID_HANDLE)
         return;
     LoadSimConfig(false);
+    // simulate 尚未建表（EA 先启动）时静默等待，避免每秒打印查询失败
+    static bool signals_ready = false;
+    static datetime last_table_probe = 0;
+    if(!signals_ready)
+    {
+        if(TimeLocal() - last_table_probe < 5)
+            return;
+        last_table_probe = TimeLocal();
+        if(!SimTableExists("signals"))
+            return;
+        signals_ready = true;
+    }
     
     // 查询所有未消费的信号，按时间倒序排列，获取最新的一条
     string query = "SELECT id, action, size_mult FROM signals WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1";
@@ -657,6 +976,23 @@ void ProcessSignal(long signal_id, string action)
     double sent_price = 0;
     double sent_sl = 0;
     
+    // 配置未就绪或账户不对：不开仓，只消费开仓信号。平仓信号照常执行
+    string cfg_why = "";
+    if((action == "BUY" || action == "SELL") && !SimConfigReady(cfg_why))
+    {
+        Print("🚫 simulate 配置未就绪（", cfg_why, "），不开仓，忽略信号: ", action);
+        MarkSignalConsumed(signal_id);
+        return;
+    }
+
+    // 考核已通过：停止新开仓，只消费掉开仓信号（通过线为 0 时 pass_halted 保持 false）
+    if(pass_halted && (action == "BUY" || action == "SELL"))
+    {
+        Print("🚫 考核已通过，不再开仓，忽略信号: ", action);
+        MarkSignalConsumed(signal_id);
+        return;
+    }
+
     // 日内止损已触发：当日禁止一切新开仓，只消费掉开仓信号
     if(daily_halted && (action == "BUY" || action == "SELL"))
     {
@@ -688,19 +1024,9 @@ void ProcessSignal(long signal_id, string action)
         else
         {
             // 无持仓，开多仓
-            lots = ApplySizeMult(CalculateLotSize());
-            if(lots <= 0)
-            {
-                Print("❌ 计算手数失败，余额不足");
-                MarkSignalConsumed(signal_id);
-                return;
-            }
-            
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            double daily_sl = CalcDailyFloorSLPrice(lots, ask, POSITION_TYPE_BUY);
-            double hard_sl = CalcHardSLPrice(lots, ask, POSITION_TYPE_BUY);
             double sl = 0;
-            if(!PrepareOpenSl(signal_id, POSITION_TYPE_BUY, daily_sl, hard_sl, sl))
+            if(!PrepareEntry(signal_id, POSITION_TYPE_BUY, ask, lots, sl))
                 return;
             sent_price = ask;
             sent_sl = sl;
@@ -730,19 +1056,9 @@ void ProcessSignal(long signal_id, string action)
         else
         {
             // 无持仓，开空仓
-            lots = ApplySizeMult(CalculateLotSize());
-            if(lots <= 0)
-            {
-                Print("❌ 计算手数失败，余额不足");
-                MarkSignalConsumed(signal_id);
-                return;
-            }
-            
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            double daily_sl = CalcDailyFloorSLPrice(lots, bid, POSITION_TYPE_SELL);
-            double hard_sl = CalcHardSLPrice(lots, bid, POSITION_TYPE_SELL);
             double sl = 0;
-            if(!PrepareOpenSl(signal_id, POSITION_TYPE_SELL, daily_sl, hard_sl, sl))
+            if(!PrepareEntry(signal_id, POSITION_TYPE_SELL, bid, lots, sl))
                 return;
             sent_price = bid;
             sent_sl = sl;
@@ -771,6 +1087,8 @@ void ProcessSignal(long signal_id, string action)
     {
         Print("✅ 执行成功");
         MarkSignalConsumed(signal_id);
+        if(action == "BUY" || action == "SELL")
+            UpdatePassTP();
     }
     else
     {
@@ -885,6 +1203,72 @@ double ApplySizeMult(double lots)
 }
 
 //+------------------------------------------------------------------+
+//| 最小手模式：目标 0.01，品种最小手或步长更大时向上对齐               |
+//+------------------------------------------------------------------+
+double MinModeLots()
+{
+    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    if(min_lot < 0) min_lot = 0;
+    double lots = MathMax(MIN_MODE_LOTS, min_lot);
+    if(step > 0)
+        lots = MathCeil(lots / step - 1e-8) * step;
+    if(min_lot > 0 && lots < min_lot)
+        lots = min_lot;
+    lots = NormalizeDouble(lots, 8);
+    if(max_lot > 0 && lots > max_lot + 1e-8)
+    {
+        Print("❌ 最小手 ", DoubleToString(lots, 4), " 超过品种最大手数 ", DoubleToString(max_lot, 4));
+        return 0;
+    }
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double margin = 0;
+    if(price > 0 && OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, price, margin)
+       && margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
+    {
+        Print("❌ 最小手保证金 $", DoubleToString(margin, 2),
+              " 超过可用保证金 $", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
+        return 0;
+    }
+    Print("📊 最小手模式手数: ", DoubleToString(lots, 2),
+          "（目标 ", DoubleToString(MIN_MODE_LOTS, 2),
+          "，品种最小 ", DoubleToString(min_lot, 2),
+          "，步长 ", DoubleToString(step, 2), "）");
+    return lots;
+}
+
+//+------------------------------------------------------------------+
+//| 开仓手数和止损。最小手模式固定手数且止损为 0；其余模式走原逻辑       |
+//+------------------------------------------------------------------+
+bool PrepareEntry(long signal_id, ENUM_POSITION_TYPE type, double price, double &lots, double &sl)
+{
+    sl = 0;
+    if(g_min_lot_mode)
+    {
+        lots = MinModeLots();
+        if(lots <= 0)
+        {
+            Print("❌ 最小手模式无法下单");
+            MarkSignalConsumed(signal_id);
+            return false;
+        }
+        return true;
+    }
+
+    lots = ApplySizeMult(CalculateLotSize());
+    if(lots <= 0)
+    {
+        Print("❌ 计算手数失败，余额不足");
+        MarkSignalConsumed(signal_id);
+        return false;
+    }
+    double daily_sl = CalcDailyFloorSLPrice(lots, price, type);
+    double hard_sl = CalcHardSLPrice(lots, price, type);
+    return PrepareOpenSl(signal_id, type, daily_sl, hard_sl, sl);
+}
+
+//+------------------------------------------------------------------+
 //| 根据账户余额和杠杆计算手数                                         |
 //+------------------------------------------------------------------+
 double CalculateLotSize()
@@ -963,7 +1347,7 @@ double CalculateLotSize()
     }
     
     // 方法2：使用设定的杠杆倍数计算
-    double total_trading_value = risk_amount * EffLeverage();
+    double total_trading_value = risk_amount * g_sim_leverage;
     double lots_by_leverage = total_trading_value / (price * contract_size);
     
     // 选择两种方法中较小的值（更保守）
@@ -1002,7 +1386,7 @@ double CalculateLotSize()
     Print("💰 可用保证金: $", DoubleToString(free_margin, 2));
     Print("💰 使用资金: $", DoubleToString(risk_amount, 2), " (", RiskPercent, "%)");
     Print("📊 1手价值: $", DoubleToString(price * contract_size, 2));
-    Print("📊 设定杠杆倍数: ", EffLeverage(), "倍");
+    Print("📊 设定杠杆倍数: ", g_sim_leverage, "倍（simulate 下发）");
     Print("💰 可交易总价值: $", DoubleToString(total_trading_value, 2));
     Print("📊 最终手数: ", DoubleToString(lots, 2));
     Print("💰 实际持仓价值: $", DoubleToString(position_value, 2));
@@ -1037,16 +1421,208 @@ double CalculateLotSize()
 //| 注意：本文件限额基于账户初始资金                                |
 //+------------------------------------------------------------------+
 
+// GV 是整个终端共用的，按登录号区分，换账户自动得到一套新的风控/通过状态
 string DailyGVName(string suffix)
 {
     return "DLS_" + IntegerToString(g_magic) + "_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + suffix;
 }
 
-// 不带账号：simulate 只认递增的 close_seq，换账号归零会漏掉外部平仓
-string CloseSeqGVName()
+string LegacyGVName(string suffix)
 {
-    return "DLS_" + IntegerToString(g_magic) + "_close_seq";
+    return "DLS_" + IntegerToString(g_magic) + "_" + suffix;
 }
+
+//+------------------------------------------------------------------+
+//| 考核通过：simulate 写入官方通过线 challenge_pass_equity（0=关闭/Funded）|
+//| 开仓挂券商止盈到线即平；空仓且余额过线则停止开仓。                   |
+//+------------------------------------------------------------------+
+void ApplyChallengePassTarget(double value, double session)
+{
+    // simulate 每次启动写一个新会话号；会话号变了说明换了阶段或账户，上次的通过停止状态作废
+    if(session > 0)
+    {
+        string session_gv = DailyGVName("pass_session");
+        if(!GlobalVariableCheck(session_gv) || MathAbs(GlobalVariableGet(session_gv) - session) > 0.5)
+        {
+            if(pass_halted || GlobalVariableCheck(DailyGVName("pass_halted")))
+                Print("simulate 已重新启动（新会话），清除上次的考核通过停止状态");
+            pass_halted = false;
+            pass_status_pending = false;
+            if(GlobalVariableCheck(DailyGVName("pass_halted")))
+                GlobalVariableDel(DailyGVName("pass_halted"));
+            GlobalVariableSet(session_gv, session);
+        }
+    }
+    if(value <= 0)
+    {
+        bool had = (g_challenge_pass_equity > 0 || pass_halted || GlobalVariableCheck(DailyGVName("pass_halted")));
+        g_challenge_pass_equity = 0;
+        pass_halted = false;
+        if(GlobalVariableCheck(DailyGVName("pass_halted")))
+            GlobalVariableDel(DailyGVName("pass_halted"));
+        if(had)
+            Print("考核通过检测已关闭（通过线为 0）");
+        return;
+    }
+    if(MathAbs(value - g_challenge_pass_equity) >= 0.5)
+        Print("考核通过线: $", DoubleToString(value, 2), "（开仓即挂券商止盈）");
+    g_challenge_pass_equity = value;
+    if(!pass_halted && GlobalVariableCheck(DailyGVName("pass_halted")) && GlobalVariableGet(DailyGVName("pass_halted")) > 0.5)
+        pass_halted = true;
+}
+
+void LoadChallengePassTarget(bool force)
+{
+    static datetime last_load = 0;
+    static bool table_ready = false;
+    if(db_handle == INVALID_HANDLE)
+        return;
+    // 未武装时每秒读一次即可。已武装时每个 tick 都重读，避免切到 Funded（写成 0）后仍按旧线平仓
+    if(!force && TimeLocal() - last_load < 1)
+        return;
+    last_load = TimeLocal();
+
+    if(!table_ready)
+    {
+        long has_table = 0;
+        int probe = DatabasePrepare(db_handle, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sim_config'");
+        if(probe == INVALID_HANDLE)
+            return;
+        if(DatabaseRead(probe))
+            DatabaseColumnLong(probe, 0, has_table);
+        DatabaseFinalize(probe);
+        if(has_table == 0)
+            return;
+        table_ready = true;
+    }
+
+    int req = DatabasePrepare(db_handle,
+        "SELECT key, value FROM sim_config WHERE key IN ('challenge_pass_equity', 'challenge_pass_session')");
+    if(req == INVALID_HANDLE)
+        return;
+    double value = 0;
+    double session = 0;
+    bool found = false;
+    while(DatabaseRead(req))
+    {
+        string key = "";
+        double v = 0;
+        if(!DatabaseColumnText(req, 0, key) || !DatabaseColumnDouble(req, 1, v))
+            continue;
+        if(key == "challenge_pass_equity")
+        {
+            value = v;
+            found = true;
+        }
+        else if(key == "challenge_pass_session")
+            session = v;
+    }
+    DatabaseFinalize(req);
+    // 库忙或旧版 simulate 没写通过线时保持现状，不能因为读失败就关掉检测
+    if(!found)
+        return;
+    ApplyChallengePassTarget(value, session);
+}
+
+bool WritePassStatus()
+{
+    if(db_handle == INVALID_HANDLE)
+        return false;
+    if(!DatabaseExecute(db_handle,
+        "CREATE TABLE IF NOT EXISTS ea_pass_status (id INTEGER PRIMARY KEY, halted INTEGER, equity REAL, target REAL, updated_at TEXT)"))
+    {
+        Print("创建 ea_pass_status 失败: ", GetLastError());
+        return false;
+    }
+    string when = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS);
+    StringReplace(when, "'", "");
+    string sql = StringFormat(
+        "INSERT OR REPLACE INTO ea_pass_status (id, halted, equity, target, updated_at) VALUES (1, 1, %.2f, %.2f, '%s')",
+        AccountInfoDouble(ACCOUNT_EQUITY),
+        g_challenge_pass_equity,
+        when);
+    if(!DatabaseExecute(db_handle, sql))
+    {
+        Print("写入 ea_pass_status 失败: ", GetLastError());
+        return false;
+    }
+    return true;
+}
+
+bool HasPassPositions()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == g_magic)
+            return true;
+    }
+    return false;
+}
+
+void ChallengePassCheck()
+{
+    static datetime last_retry = 0;
+    if(g_challenge_pass_equity > 0)
+        LoadChallengePassTarget(true);
+    else
+        LoadChallengePassTarget(false);
+    if(g_challenge_pass_equity <= 0)
+        return;
+    if(pass_halted)
+    {
+        // 停止期间若仍有持仓（如人工开仓）则平掉；状态行可能因库忙没写进去，每 5 秒补一次
+        if(TimeLocal() - last_retry >= 5)
+        {
+            last_retry = TimeLocal();
+            if(HasPassPositions())
+            {
+                Print("考核已通过但仍有持仓，全平");
+                CloseAllPositions();
+            }
+            if(pass_status_pending && WritePassStatus())
+                pass_status_pending = false;
+        }
+        return;
+    }
+    // 考核止盈成交另见 SyncPositionState；这里兜住 EA 重启期间止盈已成交、或其它方式平在线上方的情况
+    if(HasPassPositions() || AccountInfoDouble(ACCOUNT_BALANCE) < g_challenge_pass_equity)
+        return;
+    EnterPassHalt("空仓且余额达到官方考核通过线");
+}
+
+//+------------------------------------------------------------------+
+//| 考核条件已满足：停止开仓并通知 simulate。不看成交后余额，满足一次即停。 |
+//+------------------------------------------------------------------+
+void EnterPassHalt(string why)
+{
+    if(pass_halted)
+        return;
+    Print("!!!!! ", why, "，考核完成，停止开仓 !!!!!");
+    Print("当前余额: $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
+          " 通过线: $", DoubleToString(g_challenge_pass_equity, 2));
+    pass_halted = true;
+    GlobalVariableSet(DailyGVName("pass_halted"), 1.0);
+    pass_status_pending = !WritePassStatus();
+}
+
+//+------------------------------------------------------------------+
+//| 持仓是否由券商止盈平掉。EA 只在考核阶段挂止盈，止盈成交即考核止盈。 |
+//+------------------------------------------------------------------+
+bool ClosedByTakeProfit(long position_id)
+{
+    if(position_id <= 0 || !HistorySelectByPosition(position_id))
+        return false;
+    for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+    {
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal > 0 && HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_OUT
+           && HistoryDealGetInteger(deal, DEAL_REASON) == DEAL_REASON_TP)
+            return true;
+    }
+    return false;
+}
+
 
 double DailyLossLimitUSD()
 {
@@ -1112,6 +1688,7 @@ void DailyRiskNewDay(datetime period)
     daily_halted = false;
     GlobalVariableSet(DailyGVName("day"), (double)period);
     GlobalVariableSet(DailyGVName("anchor"), daily_anchor);
+    GlobalVariableSet(DailyGVName("anchor_at"), (double)TimeCurrent());
     GlobalVariableSet(DailyGVName("halted"), 0.0);
     Print("🌅 新风控日: 锚点=$", DoubleToString(daily_anchor, 2),
           " 日亏限额=$", DoubleToString(DailyLossLimitUSD(), 2),
@@ -1130,6 +1707,9 @@ void DailyRiskCheck()
     datetime period = CurrentDailyPeriodStart();
     if(period != daily_period_start)
         DailyRiskNewDay(period);
+    // 没有起始资金时日亏限额为 0，触发线等于锚点，会被误判触线全平
+    if(EffInitialBalance() <= 0)
+        return;
     
     double equity = AccountInfoDouble(ACCOUNT_EQUITY);
     double floor_eq = DailyTriggerFloor();
@@ -1157,11 +1737,61 @@ void DailyRiskCheck()
 }
 
 //+------------------------------------------------------------------+
+//| 锚点设定之后出现出入金（出金、补款、返还）：按当前余额重算锚点      |
+//| 不重算的话出金会让触发线高于真实余额，下一笔就被误判触线            |
+//+------------------------------------------------------------------+
+void CheckBalanceOperations()
+{
+    static datetime last_scan = 0;
+    if(DailyLossPercent <= 0 || daily_period_start == 0)
+        return;
+    if(TimeLocal() - last_scan < 30)
+        return;
+    last_scan = TimeLocal();
+
+    datetime anchor_at = daily_period_start;
+    if(GlobalVariableCheck(DailyGVName("anchor_at")))
+        anchor_at = (datetime)GlobalVariableGet(DailyGVName("anchor_at"));
+    if(!HistorySelect(anchor_at, TimeCurrent() + 60))
+        return;
+    datetime latest_op = 0;
+    double net = 0;
+    int n = HistoryDealsTotal();
+    for(int i = 0; i < n; i++)
+    {
+        ulong t = HistoryDealGetTicket(i);
+        if(t == 0)
+            continue;
+        long type = HistoryDealGetInteger(t, DEAL_TYPE);
+        if(type != DEAL_TYPE_BALANCE && type != DEAL_TYPE_CREDIT && type != DEAL_TYPE_CHARGE &&
+           type != DEAL_TYPE_CORRECTION && type != DEAL_TYPE_BONUS)
+            continue;
+        datetime when = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
+        if(when <= anchor_at)
+            continue;
+        net += HistoryDealGetDouble(t, DEAL_PROFIT);
+        if(when > latest_op)
+            latest_op = when;
+    }
+    if(latest_op == 0)
+        return;
+
+    double old_anchor = daily_anchor;
+    daily_anchor = MathMax(AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+    GlobalVariableSet(DailyGVName("anchor"), daily_anchor);
+    GlobalVariableSet(DailyGVName("anchor_at"), (double)latest_op);
+    Print("💵 检测到出入金 $", DoubleToString(net, 2), "，日内锚点 $", DoubleToString(old_anchor, 2),
+          " → $", DoubleToString(daily_anchor, 2), "，触发线 $", DoubleToString(DailyTriggerFloor(), 2));
+    WriteDailyStatus("balance_operation");
+}
+
+//+------------------------------------------------------------------+
 //| 检测持仓消失（硬止损/日亏SL/手动平仓），递增 close_seq 写回 DB      |
 //+------------------------------------------------------------------+
 void SyncPositionState()
 {
     ulong ticket = 0;
+    long position_id = 0;
     int side = 0;
     double volume = 0, open_price = 0, sl = 0;
     
@@ -1173,6 +1803,7 @@ void SyncPositionState()
         if(PositionGetInteger(POSITION_MAGIC) != g_magic)
             continue;
         ticket = t;
+        position_id = PositionGetInteger(POSITION_IDENTIFIER);
         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
         side = (type == POSITION_TYPE_BUY) ? 1 : -1;
         volume = PositionGetDouble(POSITION_VOLUME);
@@ -1195,10 +1826,12 @@ void SyncPositionState()
         else
         {
             ea_close_seq++;
-            GlobalVariableSet(CloseSeqGVName(), (double)ea_close_seq);
+            GlobalVariableSet(DailyGVName("close_seq"), (double)ea_close_seq);
             Print("📣 检测到持仓被外部平掉(硬止损/日亏SL/手动等)，close_seq=", ea_close_seq,
                   " 原票号=", last_tracked_ticket, " —— 已写回 ea_position 供 simulate 镜像");
             WritePositionStatus(0, 0, 0, 0, "external_close");
+            if(g_challenge_pass_equity > 0 && ClosedByTakeProfit(last_tracked_position_id))
+                EnterPassHalt("考核止盈已成交");
         }
     }
     else if(ticket != 0)
@@ -1223,6 +1856,7 @@ void SyncPositionState()
     }
     
     last_tracked_ticket = ticket;
+    last_tracked_position_id = position_id;
 }
 
 //+------------------------------------------------------------------+

@@ -32,22 +32,24 @@ load_dotenv(override=True)
 # 交易品种
 SYMBOL = os.environ.get('SYMBOL', 'QQQ.US')
 
-# 资金和风控设置（启动时交互输入账户起始资金与当前金额，自动计算止盈金额；日内止损由 MT5 EA 执行）
-ACCOUNT_START_BALANCE = None  # 账户起始资金（启动时输入）
-INITIAL_CAPITAL = None  # 账户当前金额（启动时输入，用于计算全仓盈亏）
-LEVERAGE = None  # 杠杆倍数（启动时手动输入）
-ACCOUNT_PHASE = None  # "1" | "2" | "funded"（启动时输入）
-FUNDED_HARD_SL_PCT = 0.9  # Funded 单笔硬止损(%)，Wave Stop 1%（按当前余额）；总亏 8% 下余额≥92K，0.9%×100K 始终先触发
+# 资金和风控设置（当前余额、登录号从 EA 心跳读取；起始资金/杠杆/轮次启动时确认，按账户记住上次的值）
+ACCOUNT_START_BALANCE = None  # 账户起始资金（默认取 MT5 历史第一笔入金）
+INITIAL_CAPITAL = None  # 账户当前金额（EA 心跳里的余额，用于计算全仓盈亏）
+LEVERAGE = None  # 杠杆倍数（启动时确认，写入 sim_config 由 EA 读取）
+ACCOUNT_LOGIN = None  # 绑定的 MT5 登录号，EA 登录号不一致时拒绝开仓
+CURRENT_PHASE = None  # "1" / "2" / "funded" / "minimum"
+FUNDED_HARD_SL_PCT = 0.9  # 单笔硬止损占起始资金的百分比；0=不挂。考核阶段除注明外不挂
+MIN_LOT = 0.01  # minimum 模式的目标手数；品种最小手更大时 EA 改开最小手
+EA_HEARTBEAT_MAX_AGE_SECONDS = 60  # EA 每 5 秒写一次 ea_account，超过这个时间视为 EA 没在运行
+EA_FILE = "SQLiteSignalEA_aqua.mq5"
+EXPECTED_EA_BUILD = "2026-11-13 免配置"
 
-# 风控比例（AquaFunded 2-Step Standard 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏 5%；最大回撤 8% static）
+# 风控比例（Aqua 2-Step Standard：Phase1 8% / Phase2 5% / Funded 无目标；日亏 5%；Funded 单笔硬止损 0.9%（Wave Stop 1%））
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
-TP_BUFFER_PCT = 0.01       # 止盈余量比例（按起始资金的 1% 上调止盈目标；账户达标会被平台自动关停，止盈只是兜底，宁可超出也不能因检测/成交间价格回撤而差一点没到）
+CHALLENGE_PASS_EQUITY = 0.0        # 官方考核通过线；0=Funded 或未启用。EA 开仓挂券商止盈，空仓且余额过线停止开仓
 
-# 止盈设置（金额）——启动时按上述比例自动计算，请勿手动修改；日内止损由 MT5 EA 执行
-MAX_PROFIT_AMOUNT = -1  # 止盈目标金额（自动计算；负数表示未初始化/禁用）
-
-# 交易时间设置（Aqua 专用：启动时手动选择；一次买多个账户时请错开开仓时间）
+# 交易时间设置（Aqua 专用：启动时手动选择，与轮次无关；多账户错开开仓时间避免 copy 嫌疑）
 TRADING_SESSION_HOURS = 6  # 交易窗口长度（小时），结束时间 = 开始时间 + 此值
 TRADING_TIME_PRESETS = {
     "1": (9, 39, "09:39 (Challenge 常用)"),
@@ -73,13 +75,11 @@ LOG_VERBOSE = False  # 设置为True开启详细日志（主循环/等待/时间
 # 程序内部变量 - 请勿手动修改
 # ============================================================================
 
-# 多账户实例隔离（启动时输入编号；与 MT5 EA 的 InstanceId 必须一致）
-INSTANCE_ID = None  # 1/2/3/4…
-AQUA_MAGIC_BASE = 20260808  # EA Magic = 此值 + INSTANCE_ID（与 mq5 默认一致）
-
-# 日志 / 信号库路径（prompt_instance_id → apply_instance_paths 后赋值）
+# 日志文件路径
 LOG_FILE = "trading_aqua.log"
-DB_PATH = None
+INSTANCE_ID = None
+MAGIC_BASE = 20260808
+DB_PREFIX = "trading_signals_aqua_"
 
 # 收益统计变量
 TOTAL_PNL = 0.0  # 总收益（累计）
@@ -148,18 +148,21 @@ def parse_trading_time_input(raw):
     return h, m
 
 
-def prompt_trading_time():
-    """Aqua 专用：启动时手动选择交易开始时间，便于多账户错开"""
+def prompt_trading_time(default_time=None):
+    """Aqua 专用：启动时选择交易开始时间，多账户错开避免 copy。default_time 为该账户上次的 HH:MM，回车沿用"""
     global TRADING_START_TIME, TRADING_END_TIME
 
-    print("\n--- 交易时间设置 (Aqua: 多账户请手动错开开仓时间) ---")
+    print("\n--- 交易时间设置 (Aqua: 多账户请手动错开开仓时间，避免 copy 嫌疑) ---")
     for key, (h, m, label) in TRADING_TIME_PRESETS.items():
         print(f"  {key} = {label}")
     print("  或直接输入时间 HH:MM / HHMM（如 9:45）")
 
     while True:
         try:
-            choice = input("请选择开仓时间: ").strip()
+            hint = f"（回车={default_time}）" if default_time else ""
+            choice = input(f"请选择开仓时间{hint}: ").strip()
+            if choice == "" and default_time:
+                choice = default_time
             if choice in TRADING_TIME_PRESETS:
                 h, m, _ = TRADING_TIME_PRESETS[choice]
                 start_time = (h, m)
@@ -178,75 +181,253 @@ def prompt_trading_time():
           f"{TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
 
 
-def prompt_capital_settings():
-    """启动时交互输入考试轮次、账户起始资金与当前金额；手动输入杠杆并计算账户止盈金额"""
-    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, MAX_PROFIT_AMOUNT
-    global PROFIT_TARGET_PCT, LEVERAGE, ACCOUNT_PHASE
-    
+def fmt_amount(value):
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def read_ea_account():
+    """读 EA 心跳 ea_account；没有或读失败返回 None。age 为距今秒数（EA 写的是 TimeGMT，同机比较）"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("""
+        SELECT login, server, name, currency, balance, equity, initial_deposit, ea_build,
+               config_ready, config_note, updated_at
+        FROM ea_account WHERE id = 1
+        """).fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    keys = ("login", "server", "name", "currency", "balance", "equity", "initial_deposit", "ea_build",
+            "config_ready", "config_note", "updated_at")
+    info = dict(zip(keys, row))
+    try:
+        beat = datetime.strptime(info["updated_at"], "%Y.%m.%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    info["beat_utc"] = beat
+    info["age"] = (datetime.now(pytz.utc).replace(tzinfo=None) - beat).total_seconds()
+    return info
+
+
+def wait_for_ea_account():
+    """等 MT5 EA 写心跳。余额、登录号、初始入金都从这里拿，不用手输"""
+    print(f"\n--- 等待 MT5 EA 心跳（{os.path.abspath(DB_PATH)}）---")
+    printed_at = 0.0
     while True:
+        info = read_ea_account()
+        if info and info["age"] <= EA_HEARTBEAT_MAX_AGE_SECONDS:
+            return info
+        if time_module.time() - printed_at >= 30:
+            printed_at = time_module.time()
+            if info:
+                print(f"EA 心跳已 {info['age']:.0f} 秒未更新（最后一次: 账户 {info['login']}，EA {info['ea_build']}），继续等待...")
+            else:
+                print(f"尚未收到 EA 心跳。请在 MT5 把 {EA_FILE} 挂到 QQQ 图表（参数不用改），按 Ctrl+C 退出")
+                print(f"  若 EA 已挂上仍无心跳：确认已编译为 {EXPECTED_EA_BUILD}，且与本脚本在同一台机器")
+        time_module.sleep(2)
+
+
+def remind_replace_ea(info=None):
+    """心跳里的 EA 版本不是本脚本对应的那一版时，提醒重新编译并替换图表上的 EA"""
+    if info is None:
+        info = read_ea_account()
+    build = (info or {}).get("ea_build") or ""
+    print("\n" + "!" * 60)
+    if build == EXPECTED_EA_BUILD:
+        print(f"EA 已是最新版本：{EXPECTED_EA_BUILD}")
+    else:
+        print("请用 MetaEditor 编译并替换图表上的 EA（inputs 不用改，重载即可）：")
+        print(f"  文件：{EA_FILE}")
+        print(f"  需要版本：{EXPECTED_EA_BUILD}")
+        print(f"  当前心跳：{build or '还没有'}")
+        print("  重载后日志应出现「已读取 simulate 配置」")
+    print("!" * 60)
+
+
+def load_profile(login):
+    """该登录号上次启动时的选择，作为本次默认值"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS sim_profile (
+            login INTEGER PRIMARY KEY, phase TEXT, start_balance REAL, leverage REAL,
+            start_time TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+        """)
+        row = conn.execute("SELECT phase, start_balance, leverage, start_time FROM sim_profile WHERE login = ?",
+                           (int(login),)).fetchone()
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"读取账户历史设置失败（按新账户处理）: {e}")
+        return {}
+    if not row:
+        return {}
+    return {"phase": row[0], "start_balance": row[1], "leverage": row[2], "start_time": row[3]}
+
+
+def save_profile(login, phase, start_balance, leverage, start_time):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+        INSERT OR REPLACE INTO sim_profile (login, phase, start_balance, leverage, start_time, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (int(login), phase, float(start_balance), float(leverage), start_time))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"保存账户设置失败（不影响本次运行）: {e}")
+
+
+def ask(prompt, default, parse):
+    """带默认值的输入；回车用默认值，解析失败重问"""
+    while True:
+        hint = f"（回车={default}）" if default not in (None, "") else ""
         try:
-            phase = input("请输入当前轮次（1=第一轮 / 2=第二轮 / funded=已通过考试）: ").strip().lower()
-            if phase not in PHASE_PROFIT_TARGET_PCT:
-                print("错误: 轮次必须是 1、2 或 funded，请重新输入")
-                continue
-            start_str = input("请输入账户起始资金（如 100000）: ").strip()
-            current_str = input("请输入账户当前金额（如 98827）: ").strip()
-            start_balance = float(start_str)
-            current_balance = float(current_str)
-            if start_balance <= 0 or current_balance <= 0:
-                print("错误: 金额必须大于 0，请重新输入")
-                continue
-            break
-        except ValueError:
-            print("错误: 输入格式不正确，请输入数字")
+            raw = input(f"{prompt}{hint}: ").strip()
         except EOFError:
             print("错误: 无法读取输入（非交互环境），程序退出")
             sys.exit(1)
-    
+        if raw == "" and default not in (None, ""):
+            raw = str(default)
+        try:
+            return parse(raw)
+        except ValueError as e:
+            print(f"错误: {e}，请重新输入")
+
+
+def parse_phase(raw):
+    value = raw.strip().lower()
+    if value == "min":
+        value = "minimum"
+    if value not in PHASE_PROFIT_TARGET_PCT:
+        raise ValueError("轮次必须是 1、2 或 funded")
+    return value
+
+
+def saved_leverage(profile):
+    """上次手动输入的杠杆。minimum 模式不覆盖它，切回考核/Funded 时还能回车沿用。"""
+    try:
+        value = float(profile.get("leverage") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def parse_positive(raw):
+    try:
+        value = float(raw.replace(",", ""))
+    except ValueError:
+        raise ValueError("请输入数字")
+    if value <= 0:
+        raise ValueError("必须大于 0")
+    return value
+
+
+def prompt_capital_settings():
+    """余额和登录号读 EA 心跳；只确认轮次、起始资金、杠杆、开仓时间（同一账户回车沿用上次）"""
+    global ACCOUNT_START_BALANCE, INITIAL_CAPITAL, CHALLENGE_PASS_EQUITY
+    global PROFIT_TARGET_PCT, LEVERAGE, ACCOUNT_LOGIN, CURRENT_PHASE
+
+    info = wait_for_ea_account()
+    login = int(info["login"])
+    current_balance = float(info["balance"])
+    deposit = float(info["initial_deposit"] or 0)
+    print(f"MT5 账户: {login} @ {info['server']}（{info['name']}）")
+    print(f"当前余额: ${current_balance:,.2f}  净值: ${float(info['equity']):,.2f} {info['currency']}  | EA {info['ea_build']}")
+    if deposit > 0:
+        print(f"MT5 历史第一笔入金: ${deposit:,.2f}")
+
+    profile = load_profile(login)
+    if profile:
+        print("已找到该账户上次的设置，直接回车沿用")
+    else:
+        print("新账户：首次需要确认轮次，之后启动回车即可")
+
+    phase = ask("当前轮次（1=第一轮 / 2=第二轮 / funded=已通过考试）", profile.get("phase"), parse_phase)
+    start_default = profile.get("start_balance") or (deposit if deposit > 0 else None)
+    start_balance = ask("账户起始资金", fmt_amount(start_default) if start_default else None, parse_positive)
+    if phase == "minimum":
+        LEVERAGE = 0.0
+        profile_leverage = saved_leverage(profile) or 0
+    else:
+        profile_leverage = ask("杠杆倍数（如 4 / 2 / 1.5）", fmt_amount(saved_leverage(profile)) if saved_leverage(profile) else None, parse_positive)
+        LEVERAGE = profile_leverage
+    prompt_trading_time(profile.get("start_time") or "09:39")
+    save_profile(login, phase, start_balance, profile_leverage,
+                 f"{TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d}")
+
+    ACCOUNT_LOGIN = login
+    CURRENT_PHASE = phase
     ACCOUNT_START_BALANCE = start_balance
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
-    ACCOUNT_PHASE = phase
 
-    while True:
-        try:
-            lev_str = input("请输入杠杆倍数（如 4 / 2 / 1.5）: ").strip()
-            lev = float(lev_str)
-            if lev > 0:
-                LEVERAGE = lev
-                break
-            print("错误: 杠杆必须大于 0，请重新输入")
-        except ValueError:
-            print("错误: 请输入有效数字（如 4）")
-        except EOFError:
-            print("错误: 无法读取输入（非交互环境），程序退出")
-            sys.exit(1)
-
-    prompt_trading_time()
-
-    phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)"}[phase]
+    phase_label = {"1": "第一轮", "2": "第二轮", "funded": "Funded(已通过)", "minimum": "最小手"}[phase]
     print(f"当前轮次: {phase_label}")
-    print(f"杠杆倍数: {LEVERAGE}x (手动指定，启动后自动同步到 EA)")
-    print(f"单笔硬止损: {sim_hard_sl_pct()}%（{'Funded Wave Stop 1%' if phase == 'funded' else 'Challenge 不启用'}，启动后自动同步到 EA）")
+    if phase == "minimum":
+        print(f"杠杆: 不使用。EA 固定开 {MIN_LOT} 手；品种最小手数更大时开最小手")
+        print("止损: 不挂（不挂单笔硬止损，也不挂日亏保护止损）")
+    else:
+        print(f"杠杆倍数: {LEVERAGE}x（写入 sim_config，EA 自动读取）")
+        print(f"单笔硬止损: {sim_hard_sl_pct()}%（写入 sim_config；0 表示不挂）")
     print(f"账户起始资金: ${start_balance:.2f}")
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
     
     if PROFIT_TARGET_PCT > 0:
-        # 账户止盈金额 = 起始资金 × 目标比例 − 已有盈利 + 余量（起始资金 × TP_BUFFER_PCT，覆盖点差/滑点等损耗）
-        tp_buffer = start_balance * TP_BUFFER_PCT
-        MAX_PROFIT_AMOUNT = start_balance * PROFIT_TARGET_PCT - (current_balance - start_balance) + tp_buffer
-        print(f"账户止盈金额: ${MAX_PROFIT_AMOUNT:.2f} (= 起始资金 × {PROFIT_TARGET_PCT*100:.1f}% − 已有盈亏 + 余量 ${tp_buffer:.2f})")
-        if MAX_PROFIT_AMOUNT <= 0:
-            print("警告: 当前金额已达到/超过账户止盈目标，无需继续交易，程序退出")
+        CHALLENGE_PASS_EQUITY = start_balance * (1.0 + PROFIT_TARGET_PCT)
+        print(f"考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）。"
+              f"EA 开仓即挂券商止盈：成交后余额 = 通过线 + 平仓费 + 5 个价位滑点")
+        if current_balance >= CHALLENGE_PASS_EQUITY:
+            print("警告: 当前金额已达到官方考核通过线，无需继续交易，程序退出")
             sys.exit(0)
+    elif phase == "minimum":
+        CHALLENGE_PASS_EQUITY = 0.0
+        print("考核通过线: 已关闭。余额已经过线也继续按信号交易，用来补最少交易日")
     else:
-        MAX_PROFIT_AMOUNT = -1
+        CHALLENGE_PASS_EQUITY = 0.0
         print("账户止盈: 已禁用（Funded 账户无利润目标，日内止损由 EA 执行）")
     
-    print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
+    if phase == "minimum":
+        print("日内亏损: EA 仍按净值触线平仓（不挂服务器止损单），本脚本只镜像当日停止标志")
+    else:
+        print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
+    remind_replace_ea(info)
 
 # SQLite数据库路径 - 使用MT5通用目录
+
+def apply_instance_paths(instance_id):
+    global INSTANCE_ID, LOG_FILE, DB_PATH
+    INSTANCE_ID = int(instance_id)
+    LOG_FILE = "trading_aqua_" + str(INSTANCE_ID) + ".log"
+    DB_PATH = os.path.join(get_common_files_dir(), DB_PREFIX + str(INSTANCE_ID) + ".db")
+
+
+def prompt_instance_id():
+    """与 EA 的 InstanceId 一致。信号库和日志按编号分开"""
+    env_name = "AQUA_INSTANCE_ID"
+    env_id = os.environ.get(env_name, "").strip()
+    while True:
+        try:
+            raw = env_id if env_id else input("Aqua 编号 (1/2/3/4，与 EA InstanceId 一致): ").strip()
+            env_id = ""
+            n = int(raw)
+            if n < 1:
+                print("请输入 >= 1 的整数")
+                continue
+            apply_instance_paths(n)
+            print(f"✓ #{INSTANCE_ID}  →  {os.path.basename(DB_PATH)}  /  {LOG_FILE}")
+            print(f"  EA InstanceId 设为 {INSTANCE_ID}，Magic = {MAGIC_BASE + INSTANCE_ID}")
+            return INSTANCE_ID
+        except ValueError:
+            print("请输入数字，例如 1")
+        except EOFError:
+            print(f"非交互环境请设置 {env_name}=1")
+            sys.exit(1)
+
+
 def get_common_files_dir():
     if platform.system() == "Windows":
         appdata_path = os.environ.get('APPDATA', os.path.expanduser('~\\AppData\\Roaming'))
@@ -256,35 +437,7 @@ def get_common_files_dir():
     return "."
 
 
-def apply_instance_paths(instance_id):
-    """按实例编号隔离日志与信号库；行情缓存仍共用。"""
-    global INSTANCE_ID, LOG_FILE, DB_PATH
-    INSTANCE_ID = int(instance_id)
-    LOG_FILE = f"trading_aqua_{INSTANCE_ID}.log"
-    DB_PATH = os.path.join(get_common_files_dir(), f"trading_signals_aqua_{INSTANCE_ID}.db")
-    return INSTANCE_ID
-
-
-def prompt_instance_id():
-    """只需输入 1/2/3/4，自动隔离 DB/日志；与 EA InstanceId 对齐。"""
-    env_id = os.environ.get("AQUA_INSTANCE_ID", "").strip()
-    while True:
-        try:
-            raw = env_id if env_id else input("Aqua 编号 (1/2/3/4): ").strip()
-            env_id = ""
-            n = int(raw)
-            if n < 1:
-                print("请输入 >= 1 的整数")
-                continue
-            apply_instance_paths(n)
-            print(f"✓ #{INSTANCE_ID}  →  {os.path.basename(DB_PATH)}  /  {LOG_FILE}")
-            print(f"  MT5 EA 只需把 InstanceId 设为 {INSTANCE_ID}")
-            return INSTANCE_ID
-        except ValueError:
-            print("请输入数字，例如 1")
-        except EOFError:
-            print("非交互环境请设置 AQUA_INSTANCE_ID=1")
-            sys.exit(1)
+DB_PATH = None  # prompt_instance_id 之后赋值
 
 
 def get_market_data_db_path():
@@ -377,29 +530,68 @@ def init_sqlite_database():
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
 
 def sim_hard_sl_pct():
-    return FUNDED_HARD_SL_PCT if ACCOUNT_PHASE == "funded" else 0.0
+    return FUNDED_HARD_SL_PCT if CURRENT_PHASE == "funded" else 0.0
+
+
+def sim_daily_loss_pct():
+    return 5.0
 
 
 def write_sim_config():
-    """把启动时输入的起始资金、杠杆、单笔硬止损写入 sim_config，EA 每 30 秒读取并覆盖对应 inputs，无需在 MT5 手动同步。"""
+    """EA 需要的全部参数都写进 sim_config（EA 每 3~5 秒重读），EA inputs 不用改。返回写入时间（UTC，供确认 EA 已读取）"""
     if not ACCOUNT_START_BALANCE or ACCOUNT_START_BALANCE <= 0:
-        return
+        return None
     values = {
         'account_start_balance': float(ACCOUNT_START_BALANCE),
         'leverage': float(LEVERAGE),
+        'min_lot_mode': 1.0 if CURRENT_PHASE == "minimum" else 0.0,
         'hard_sl_risk_percent': float(sim_hard_sl_pct()),
+        'daily_loss_percent': float(sim_daily_loss_pct()),
+        'account_login': float(ACCOUNT_LOGIN),
+        'challenge_pass_equity': float(CHALLENGE_PASS_EQUITY),
+        # 每次启动换新会话号，让 EA 清掉上一轮的 pass_halted（minimum 用来在过线后继续交易）
+        'challenge_pass_session': float(int(time_module.time())),
     }
+    written_at = datetime.now(pytz.utc).replace(tzinfo=None)
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("CREATE TABLE IF NOT EXISTS sim_config (key TEXT PRIMARY KEY, value REAL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         conn.executemany("INSERT OR REPLACE INTO sim_config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                          list(values.items()))
+        conn.execute("CREATE TABLE IF NOT EXISTS ea_pass_status (id INTEGER PRIMARY KEY, halted INTEGER, equity REAL, target REAL, updated_at TEXT)")
+        conn.execute("DELETE FROM ea_pass_status WHERE id = 1")
         conn.commit()
         conn.close()
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户起始资金 ${ACCOUNT_START_BALANCE:,.2f}"
-              f" | 杠杆 {LEVERAGE}x | 单笔硬止损 {sim_hard_sl_pct()}%")
+        if CURRENT_PHASE == "minimum":
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户 {ACCOUNT_LOGIN} | 起始资金 ${ACCOUNT_START_BALANCE:,.2f}"
+                  f" | 最小手模式 {MIN_LOT} 手 | 不挂止损 | 通过线关闭")
+        else:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户 {ACCOUNT_LOGIN} | 起始资金 ${ACCOUNT_START_BALANCE:,.2f}"
+                  f" | 杠杆 {LEVERAGE}x | 单笔硬止损 {sim_hard_sl_pct()}%")
+        if CHALLENGE_PASS_EQUITY > 0:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入考核通过线: ${CHALLENGE_PASS_EQUITY:,.2f}")
+        return written_at
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入 EA 共享配置失败: {str(e)}")
+        return None
+
+
+def wait_for_ea_config(written_at, timeout=30):
+    """等 EA 心跳确认已按新配置就绪；超时只告警不退出（EA 之后读到配置会自动生效）"""
+    if written_at is None:
+        return False
+    deadline = time_module.time() + timeout
+    info = None
+    while time_module.time() < deadline:
+        info = read_ea_account()
+        if info and info["beat_utc"] >= written_at and info["config_ready"]:
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] ✅ EA 已读取配置并就绪（账户 {info['login']}，EA {info['ea_build']}）")
+            return True
+        time_module.sleep(1)
+    note = (info or {}).get("config_note") or "未收到新心跳"
+    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ {timeout} 秒内 EA 未确认配置（{note}）。"
+          f"EA 未就绪期间不会开仓；请检查 EA 是否挂在账户 {ACCOUNT_LOGIN} 的终端上")
+    return False
 
 def write_signal_to_sqlite(action, size_mult=1.0):
     """将交易信号写入SQLite数据库"""
@@ -439,6 +631,25 @@ def check_ea_daily_halt():
         return False
     return bool(row[0])
 
+def check_ea_challenge_pass():
+    """读取 EA 写回的 ea_pass_status。考核账户由 EA 判定通过（券商止盈成交后空仓且余额过线）。
+
+    Funded 通过线为 0 时直接返回 False，不读库，日内止损和权益止盈路径不受影响。
+    """
+    if CHALLENGE_PASS_EQUITY <= 0:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT halted FROM ea_pass_status WHERE id = 1").fetchone()
+        conn.close()
+    except Exception:
+        return False
+    if not row or row[0] is None:
+        return False
+    return bool(row[0])
+
+
+
 
 # EA 外部平仓（硬止损/服务器SL）同步序号；仅在发现更大的 close_seq 时触发镜像平仓
 _LAST_EA_CLOSE_SEQ = 0
@@ -467,7 +678,7 @@ def init_ea_close_seq():
 def check_ea_external_close():
     """读取 EA 写回的 ea_position.close_seq。
 
-    Aqua Funded 账户：Wave Stop＝合计浮亏 1% 记 strike；EA 用单笔硬止损(0.9%)挂在 broker 兜底：触及时 MT5 持仓被打掉，
+    Aqua Funded 账户的硬止损挂在 broker 服务器：触及时 MT5 持仓被直接打掉，
     不会经过 Python 信号。EA 检测到仓位消失后递增 close_seq；此处发现新序号则返回 True，
     调用方应镜像平掉模拟仓（但不禁止当日再开仓，硬止损≠日亏 halt）。
 
@@ -484,6 +695,9 @@ def check_ea_external_close():
     if close_seq > _LAST_EA_CLOSE_SEQ:
         _LAST_EA_CLOSE_SEQ = close_seq
         return True, reason, ea_has_position
+    if close_seq < _LAST_EA_CLOSE_SEQ:
+        # EA 换账户或升级后序号从头计，跟着重置基线，否则之后的外部平仓都会被漏掉
+        _LAST_EA_CLOSE_SEQ = close_seq
     return False, "", ea_has_position
 
 def get_us_eastern_time():
@@ -825,7 +1039,11 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
         action = "CLOSE"
     else:
         action = "BUY" if side == "Buy" else "SELL"
-    size_mult = 1.0 if is_close else quiet_open.current_multiplier(get_us_eastern_time().date())
+    # minimum 模式手数固定，不再乘开盘冷清系数（再乘会低于 0.01，EA 端也会忽略）
+    if is_close or CURRENT_PHASE == "minimum":
+        size_mult = 1.0
+    else:
+        size_mult = quiet_open.current_multiplier(get_us_eastern_time().date())
     signal_id = write_signal_to_sqlite(action, size_mult)
     
     # 返回一个模拟的订单ID
@@ -903,12 +1121,15 @@ def daily_loss_monitor_thread(symbol, position_data):
     global EA_MIRROR_CLOSE, EA_MIRROR_CLOSE_REASON
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已启动 ===")
-    if MAX_PROFIT_AMOUNT > 0:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
+    if CHALLENGE_PASS_EQUITY > 0:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 由 MT5 EA 端执行（本线程仅镜像 EA 停止标志）")
-    print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
+    if CURRENT_PHASE == "minimum":
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 运行模式: 最小手（{MIN_LOT} 手或品种最小手，不挂止损）")
+    else:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
     
     while DAILY_LOSS_MONITOR_ACTIVE:
         try:
@@ -950,18 +1171,17 @@ def daily_loss_monitor_thread(symbol, position_data):
                     current_total_pnl = TOTAL_PNL + unrealized_pnl
                     current_daily_pnl = DAILY_PNL + unrealized_pnl
                 
-                # 检查是否触发止盈（基于累计盈亏，且MAX_PROFIT_AMOUNT > 0时才启用）
-                if MAX_PROFIT_AMOUNT > 0 and current_total_pnl >= MAX_PROFIT_AMOUNT:
-                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 检测到达成止盈目标 !!!!!")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 累计总盈利: ${current_total_pnl:.2f}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 止盈目标: ${MAX_PROFIT_AMOUNT:.2f}")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 超出目标: ${current_total_pnl - MAX_PROFIT_AMOUNT:.2f}")
-                    
+                # 考核通过由 EA 判定；此处只镜像 ea_pass_status。Funded 通过线为 0，不会进入
+                if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已达到考核通过线 !!!!!")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 通过线: ${CHALLENGE_PASS_EQUITY:.2f}")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 同步平掉模拟仓位并停止开仓")
+
                     with pnl_lock:
                         FORCE_CLOSE_POSITION = True
                         PROFIT_TARGET_TRIGGERED = True
-                    
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置止盈平仓标志")
+
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置考核通过平仓标志")
                     break
                 
                 # 日内止损由 MT5 EA 端权威执行（真实权益触线即全平）；此处仅镜像 EA 写回的
@@ -977,7 +1197,7 @@ def daily_loss_monitor_thread(symbol, position_data):
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置强制平仓标志")
                     break
                 
-                # Aqua：硬止损/Wave Stop 强平实盘仓 → 通知主循环镜像平仓（不 halt 当日）
+                # Aqua：硬止损/服务器SL打掉实盘仓 → 通知主循环镜像平仓（不 halt 当日）
                 # 注意：无论是否持仓都要调用，及时消费序号增量，避免遗留序号被算到下一笔新仓头上
                 ea_ext_closed, ea_ext_reason, ea_has_position = check_ea_external_close()
                 if ea_ext_closed:
@@ -993,10 +1213,6 @@ def daily_loss_monitor_thread(symbol, position_data):
                               f"（模拟持仓: {position_quantity}, EA持仓: {ea_has_position}, 原因: {ea_ext_reason}）")
                 
                 status_parts = [f"当日盈亏: ${current_daily_pnl:+.2f}", f"累计盈亏: ${current_total_pnl:+.2f}"]
-                
-                if MAX_PROFIT_AMOUNT > 0:
-                    profit_remain = MAX_PROFIT_AMOUNT - current_total_pnl
-                    status_parts.append(f"距止盈: ${profit_remain:.2f}")
                 
                 status_parts.append(f"持仓: {position_quantity}")
                 
@@ -1122,7 +1338,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             position_data['quantity'] = position_quantity
             position_data['entry_price'] = entry_price
         
-        # Aqua：EA 端硬止损打掉实盘仓后，镜像平掉模拟仓（不禁当日再开）
+        # Aqua：EA 端硬止损/服务器SL打掉实盘仓后，镜像平掉模拟仓（不禁当日再开）
         if position_quantity != 0 and EA_MIRROR_CLOSE:
             reason = EA_MIRROR_CLOSE_REASON or "external_close"
             EA_MIRROR_CLOSE = False
@@ -1261,6 +1477,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 🎯 重置动态追踪止盈状态
                 max_profit_price = None
                 trailing_tp_activated = False
+                with pnl_lock:
+                    position_data['quantity'] = 0
+                    position_data['entry_price'] = None
                 
                 # 在交易日结束时打印当日所有交易记录
                 if DAILY_TRADES:
@@ -1312,7 +1531,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             positions_opened_today = 0
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
-            PROFIT_TARGET_TRIGGERED = False  # 重置止盈标志
+            # 考核通过是账户级停止，跨日不重置；Funded 没有通过线，这个标志仍按日清掉
+            if not (CHALLENGE_PASS_EQUITY > 0 and PROFIT_TARGET_TRIGGERED):
+                PROFIT_TARGET_TRIGGERED = False
             
             # 停止旧的监控线程
             if monitor_thread is not None and monitor_thread.is_alive():
@@ -1360,6 +1581,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
         last_date = current_date
         LAST_STATS_DATE = current_date
+
         
         # 在每天9:30之后启动日内止损监控线程（只启动一次）
         # 判断当前时间是否在9:30之后且监控线程未启动
@@ -1372,7 +1594,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 初始资金: ${INITIAL_CAPITAL:.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当日盈亏: ${DAILY_PNL:+.2f}")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 累计盈亏: ${TOTAL_PNL:+.2f}")
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
+            if CURRENT_PHASE == "minimum":
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 运行模式: 最小手（{MIN_LOT} 手或品种最小手，不挂止损）")
+            else:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 杠杆倍数: {LEVERAGE}x")
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 由 MT5 EA 端执行（真实权益监控）")
             print("=" * 60 + "\n")
             
@@ -1577,6 +1802,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             # 🎯 重置动态追踪止盈状态
             max_profit_price = None
             trailing_tp_activated = False
+            with pnl_lock:
+                position_data['quantity'] = 0
+                position_data['entry_price'] = None
             
             # 在交易日结束时打印当日所有交易记录
             if DAILY_TRADES:
@@ -1669,6 +1897,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 # 🎯 重置动态追踪止盈状态
                 max_profit_price = None
                 trailing_tp_activated = False
+                with pnl_lock:
+                    position_data['quantity'] = 0
+                    position_data['entry_price'] = None
             now = get_us_eastern_time()
             today = now.date()
             today_start = datetime.combine(today, time(trading_start_time[0], trading_start_time[1]), tzinfo=now.tzinfo)
@@ -1864,6 +2095,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     # 🎯 重置动态追踪止盈状态
                     max_profit_price = None
                     trailing_tp_activated = False
+                    with pnl_lock:
+                        position_data['quantity'] = 0
+                        position_data['entry_price'] = None
                     
         else:
             # 检查是否已有持仓，如果有则不再开仓
@@ -1883,6 +2117,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
                 continue
             
+            if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
+                PROFIT_TARGET_TRIGGERED = True
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已达到考核通过线，不再开仓")
+                continue
+
             # 开仓前实时确认 EA 端日内止损状态，避免监控线程轮询间隙内误开仓造成两边不一致
             if check_ea_daily_halt():
                 DAILY_STOP_TRIGGERED = True
@@ -1960,7 +2199,10 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 position_quantity = 1 if signal > 0 else -1
                 entry_price = latest_price
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开仓信号: {side} {symbol} 入场价: {entry_price}")
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 模拟仓位: ${INITIAL_CAPITAL:.2f} × {LEVERAGE}x = ${INITIAL_CAPITAL * LEVERAGE:.2f}")
+                if CURRENT_PHASE == "minimum":
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 最小手模式: EA 开 {MIN_LOT} 手（品种最小手数更大时开最小手），不挂止损")
+                else:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 模拟仓位: ${INITIAL_CAPITAL:.2f} × {LEVERAGE}x = ${INITIAL_CAPITAL * LEVERAGE:.2f}")
                 
                 # 记录开仓交易
                 DAILY_TRADES.append({
@@ -2036,47 +2278,58 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             if LOG_VERBOSE:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 等待 {sleep_seconds:.1f} 秒到下一个精确检查时间 {next_check_time.strftime('%H:%M:%S')}")
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间精度检查: 秒={now.second}, 微秒={now.microsecond}")
-            # 分段 sleep：监控线程发现日亏 halt / 硬止损外部平仓时可提前醒来处理
+            # 分段 sleep：日亏 halt / 硬止损外部平仓 / 考核通过可提前醒来。Funded 无通过线，等待条件与原来一致
             remaining = sleep_seconds
             while remaining > 0:
-                if FORCE_CLOSE_POSITION or EA_MIRROR_CLOSE:
+                challenge_passed = CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass()
+                if challenge_passed:
+                    with pnl_lock:
+                        FORCE_CLOSE_POSITION = True
+                        PROFIT_TARGET_TRIGGERED = True
+                if FORCE_CLOSE_POSITION or EA_MIRROR_CLOSE or challenge_passed:
                     break
                 chunk = min(5.0, remaining)
                 time_module.sleep(chunk)
                 remaining -= chunk
 
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("长桥API交易策略启动 - 模拟模式 (AquaFunded 2-Step Standard)")
-    print("=" * 60)
-
     print("\n--- 实例隔离（多账户必填）---")
     prompt_instance_id()
-
-    # 启用日志记录（须在确定 INSTANCE_ID / LOG_FILE 之后）
     sys.stdout = Logger(LOG_FILE)
-    sys.stderr = sys.stdout  # 错误信息也记录到日志
+    sys.stderr = sys.stdout
     print(f"[实例 {INSTANCE_ID}] 日志已写入 {os.path.abspath(LOG_FILE)}")
+    
+    print("\n" + "=" * 60)
+    print("长桥API交易策略启动 - 模拟模式 (Aqua)")
+    print("=" * 60)
     
     print("\n--- 账户资金设置 ---")
     prompt_capital_settings()
     
-    print("版本: 1.1.0")
+    print("版本: 1.0.0")
     print("时间:", get_us_eastern_time().strftime("%Y-%m-%d %H:%M:%S"), "(美东时间)")
-    print(f"Aqua 实例编号: {INSTANCE_ID}")
-    print(f"信号库: {os.path.abspath(DB_PATH)}")
     print(f"日志文件: {os.path.abspath(LOG_FILE)}")
-    print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}（各实例共用）")
+    print(f"行情缓存数据库: {os.path.abspath(MARKET_DATA_DB_PATH)}")
     
     print("\n--- 用户配置参数 ---")
     print(f"交易品种: {SYMBOL}")
     print(f"账户起始资金: ${ACCOUNT_START_BALANCE:.2f}")
     print(f"账户当前金额(仓位基准): ${INITIAL_CAPITAL:.2f}")
-    print(f"杠杆倍数: {LEVERAGE}x")
-    print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
-    print(f"止盈目标: ${MAX_PROFIT_AMOUNT:.2f} ({'已禁用' if MAX_PROFIT_AMOUNT <= 0 else '已启用'})")
-    print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL）")
-    print("⚠️ 出金/重置账户后：请在 MT5 EA 勾选 ForceResetDailyRisk 加载一次以重算日内锚点，完成后取消勾选再正常运行")
+    if CURRENT_PHASE == "minimum":
+        print(f"运行模式: 最小手（EA 开 {MIN_LOT} 手或品种最小手，不挂止损，不设通过线）")
+    else:
+        print(f"杠杆倍数: {LEVERAGE}x")
+        print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
+    if CHALLENGE_PASS_EQUITY > 0:
+        print(f"考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
+    elif CURRENT_PHASE == "minimum":
+        print("考核平仓线: 无（最小手模式，余额过线后继续交易）")
+    else:
+        print("考核平仓线: 无（Funded 阶段不设利润目标）")
+    if CURRENT_PHASE == "minimum":
+        print("日内亏损: EA 按净值触线平仓，不挂服务器止损单")
+    else:
+        print("日内止损: 由 MT5 EA 端执行（真实权益逐tick监控 + broker服务器端SL；换账户、出入金自动重算锚点）")
     print(f"交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - {TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     print(f"检查间隔: {CHECK_INTERVAL_MINUTES} 分钟")
     print(f"每日最大开仓: {MAX_POSITIONS_PER_DAY} 次")
@@ -2105,13 +2358,14 @@ if __name__ == "__main__":
     print(f"初始 TOTAL_PNL: ${TOTAL_PNL:.2f}")
     print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     print("=" * 60 + "\n")
-    
+    remind_replace_ea()
+
     if not ensure_market_data_service_available():
         sys.exit(1)
 
     # 初始化SQLite数据库
     init_sqlite_database()
-    write_sim_config()
+    wait_for_ea_config(write_sim_config())
         
     run_trading_strategy(
         symbol=SYMBOL,

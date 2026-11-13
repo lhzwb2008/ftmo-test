@@ -42,6 +42,8 @@ CURRENT_PLAN = None  # "10/5"（New）/ "8/5"（Classic），只影响第一轮�
 DEFAULT_PLAN = "8/5"  # 新账户启动时回车即用；测算里 8/5 比 10/5 早约一周拿到 Pro
 HARD_SL_PCT = 0.0  # 单笔硬止损（占起始资金 %）。官方 FAQ：所有项目都不强制止损；若日后被要求按单笔风险挂 SL，改这里即可，EA 自动读取
 EA_HEARTBEAT_MAX_AGE_SECONDS = 60  # EA 每 5 秒写一次 ea_account，超过这个时间视为 EA 没在运行
+EA_FILE = "SQLiteSignalEA_the5ers_summer.mq5"
+EXPECTED_EA_BUILD = "2026-11-12b The5ers Summer Plan"
 
 # The5ers Summer Plan 2-Step 官方规则（考核与 Pro 相同）：日亏 3%（基数 = 当日开始时余额与净值的较大者，触及即永久封号）、
 # 总亏 10% 静态；考核无最少交易日、无一致性。EA 只守日亏线（input 默认 3%，在 95% 处全平），总亏地板不设保护。
@@ -233,6 +235,23 @@ def wait_for_ea_account():
         time_module.sleep(2)
 
 
+def remind_replace_ea(info=None):
+    """心跳里的 EA 版本不是本脚本对应的那一版时，提醒重新编译并替换图表上的 EA"""
+    if info is None:
+        info = read_ea_account()
+    build = (info or {}).get("ea_build") or ""
+    print("\n" + "!" * 60)
+    if build == EXPECTED_EA_BUILD:
+        print(f"EA 已是最新版本：{EXPECTED_EA_BUILD}")
+    else:
+        print("请用 MetaEditor 编译并替换图表上的 EA（inputs 不用改，重载即可）：")
+        print(f"  文件：{EA_FILE}")
+        print(f"  需要版本：{EXPECTED_EA_BUILD}")
+        print(f"  当前心跳：{build or '还没有'}")
+        print("  重载后日志应出现「已读取 simulate 配置」")
+    print("!" * 60)
+
+
 def load_profile(login):
     """该登录号上次启动时的选择，作为本次默认值"""
     try:
@@ -388,6 +407,7 @@ def prompt_capital_settings():
               "申请时最好一天的盈利不能超过未提利润的 50%，不满足就继续交易到满足为止")
     
     print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
+    remind_replace_ea(info)
 
 # SQLite数据库路径 - 使用MT5通用目录
 def get_common_files_dir():
@@ -2289,7 +2309,8 @@ if __name__ == "__main__":
     print(f"初始 TOTAL_PNL: ${TOTAL_PNL:.2f}")
     print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     print("=" * 60 + "\n")
-    
+    remind_replace_ea()
+
     if not ensure_market_data_service_available():
         sys.exit(1)
 

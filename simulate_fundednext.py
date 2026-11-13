@@ -41,6 +41,8 @@ CURRENT_PHASE = None  # "1" / "2" / "funded" / "minimum"
 FUNDED_HARD_SL_PCT = 2.5  # Funded 每笔必须挂 SL，官方上限 3% 留 0.5%；考核阶段不挂
 MIN_LOT = 0.01  # minimum 模式的目标手数；品种最小手更大时 EA 改开最小手
 EA_HEARTBEAT_MAX_AGE_SECONDS = 60  # EA 每 5 秒写一次 ea_account，超过这个时间视为 EA 没在运行
+EA_FILE = "SQLiteSignalEA_fundednext.mq5"
+EXPECTED_EA_BUILD = "2026-11-12a 最小手模式"
 
 # 风控比例（FundedNext Stellar 2-Step 官方规则: Phase1 目标 8% / Phase2 5% / Funded 无目标；最大日亏均 5%）
 PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1, "minimum": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
@@ -224,6 +226,23 @@ def wait_for_ea_account():
         time_module.sleep(2)
 
 
+def remind_replace_ea(info=None):
+    """心跳里的 EA 版本不是本脚本对应的那一版时，提醒重新编译并替换图表上的 EA"""
+    if info is None:
+        info = read_ea_account()
+    build = (info or {}).get("ea_build") or ""
+    print("\n" + "!" * 60)
+    if build == EXPECTED_EA_BUILD:
+        print(f"EA 已是最新版本：{EXPECTED_EA_BUILD}")
+    else:
+        print("请用 MetaEditor 编译并替换图表上的 EA（inputs 不用改，重载即可）：")
+        print(f"  文件：{EA_FILE}")
+        print(f"  需要版本：{EXPECTED_EA_BUILD}")
+        print(f"  当前心跳：{build or '还没有'}")
+        print("  重载后日志应出现「已读取 simulate 配置」")
+    print("!" * 60)
+
+
 def load_profile(login):
     """该登录号上次启动时的选择，作为本次默认值"""
     try:
@@ -372,6 +391,7 @@ def prompt_capital_settings():
         print("日内亏损: EA 仍按净值触线平仓（不挂服务器止损单），本脚本只镜像当日停止标志")
     else:
         print("日内止损: 由 MT5 EA 端执行（真实权益监控），本脚本仅镜像 EA 写回的当日停止标志做记账")
+    remind_replace_ea(info)
 
 # SQLite数据库路径 - 使用MT5通用目录
 def get_common_files_dir():
@@ -2297,7 +2317,8 @@ if __name__ == "__main__":
     print(f"初始 TOTAL_PNL: ${TOTAL_PNL:.2f}")
     print(f"初始 DAILY_PNL: ${DAILY_PNL:.2f}")
     print("=" * 60 + "\n")
-    
+    remind_replace_ea()
+
     if not ensure_market_data_service_available():
         sys.exit(1)
 
