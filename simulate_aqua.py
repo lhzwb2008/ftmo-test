@@ -49,7 +49,7 @@ PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.05, "funded": -1}  # 各轮次止�
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 CHALLENGE_PASS_EQUITY = 0.0        # 官方考核通过线；0=Funded 或未启用。EA 开仓挂券商止盈，空仓且余额过线停止开仓
 
-# 交易时间设置（Aqua 专用：启动时手动选择，与轮次无关；多账户错开开仓时间避免 copy 嫌疑）
+# 交易时间设置（Aqua 专用：启动时手动选择；一次买多个账户时请错开开仓时间）
 TRADING_SESSION_HOURS = 6  # 交易窗口长度（小时），结束时间 = 开始时间 + 此值
 TRADING_TIME_PRESETS = {
     "1": (9, 39, "09:39 (Challenge 常用)"),
@@ -149,10 +149,10 @@ def parse_trading_time_input(raw):
 
 
 def prompt_trading_time(default_time=None):
-    """Aqua 专用：启动时选择交易开始时间，多账户错开避免 copy。default_time 为该账户上次的 HH:MM，回车沿用"""
+    """Aqua 专用：启动时手动选择交易开始时间，便于多账户错开。default_time 为该账户上次的 HH:MM，回车沿用"""
     global TRADING_START_TIME, TRADING_END_TIME
 
-    print("\n--- 交易时间设置 (Aqua: 多账户请手动错开开仓时间，避免 copy 嫌疑) ---")
+    print("\n--- 交易时间设置 (Aqua: 多账户请手动错开开仓时间) ---")
     for key, (h, m, label) in TRADING_TIME_PRESETS.items():
         print(f"  {key} = {label}")
     print("  或直接输入时间 HH:MM / HHMM（如 9:45）")

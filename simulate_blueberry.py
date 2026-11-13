@@ -49,17 +49,9 @@ PHASE_PROFIT_TARGET_PCT = {"1": 0.08, "2": 0.06, "funded": -1}  # 各轮次止�
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
 CHALLENGE_PASS_EQUITY = 0.0        # 官方考核通过线；0=Funded 或未启用。EA 开仓挂券商止盈，空仓且余额过线停止开仓
 
-# 交易时间设置（Blueberry 专用：启动时手动选择，与轮次无关；多账户错开开仓时间避免 copy 嫌疑）
-TRADING_SESSION_HOURS = 6  # 交易窗口长度（小时），结束时间 = 开始时间 + 此值
-TRADING_TIME_PRESETS = {
-    "1": (9, 39, "09:39 (Challenge 常用)"),
-    "2": (9, 41, "09:41 (Funded 常用)"),
-    "3": (9, 40, "09:40"),
-    "4": (9, 42, "09:42"),
-    "5": (9, 43, "09:43"),
-}
-TRADING_START_TIME = (9, 39)  # 启动时交互选择
-TRADING_END_TIME = (15, 39)  # 启动时根据开始时间自动计算
+# 交易时间设置
+TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
+TRADING_END_TIME = (15, 40)   # 交易结束时间：15点40分
 CHECK_INTERVAL_MINUTES = 15   # 检查间隔（分钟）
 MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 
@@ -120,63 +112,6 @@ class Logger:
     
     def close(self):
         self.log.close()
-
-def trading_end_from_start(start_time, session_hours=TRADING_SESSION_HOURS):
-    """根据开始时间计算结束时间（默认 +6 小时交易窗口）"""
-    h, m = start_time
-    total_minutes = h * 60 + m + session_hours * 60
-    return total_minutes // 60, total_minutes % 60
-
-
-def parse_trading_time_input(raw):
-    """解析用户输入的交易时间，支持 HH:MM / HHMM"""
-    raw = raw.strip()
-    if ":" in raw:
-        parts = raw.split(":")
-        if len(parts) != 2:
-            raise ValueError("时间格式应为 HH:MM")
-        h, m = int(parts[0]), int(parts[1])
-    elif len(raw) == 4 and raw.isdigit():
-        h, m = int(raw[:2]), int(raw[2:])
-    else:
-        raise ValueError("无法解析时间，请输入预设编号、HH:MM 或 HHMM")
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError("小时或分钟超出有效范围")
-    return h, m
-
-
-def prompt_trading_time(default_time=None):
-    """Blueberry 专用：启动时选择交易开始时间，多账户错开避免 copy。default_time 为该账户上次的 HH:MM，回车沿用"""
-    global TRADING_START_TIME, TRADING_END_TIME
-
-    print("\n--- 交易时间设置 (Blueberry: 多账户请手动错开开仓时间，避免 copy 嫌疑) ---")
-    for key, (h, m, label) in TRADING_TIME_PRESETS.items():
-        print(f"  {key} = {label}")
-    print("  或直接输入时间 HH:MM / HHMM（如 9:45）")
-
-    while True:
-        try:
-            hint = f"（回车={default_time}）" if default_time else ""
-            choice = input(f"请选择开仓时间{hint}: ").strip()
-            if choice == "" and default_time:
-                choice = default_time
-            if choice in TRADING_TIME_PRESETS:
-                h, m, _ = TRADING_TIME_PRESETS[choice]
-                start_time = (h, m)
-            else:
-                start_time = parse_trading_time_input(choice)
-            break
-        except ValueError as e:
-            print(f"错误: {e}，请重新输入")
-        except EOFError:
-            print("错误: 无法读取输入（非交互环境），程序退出")
-            sys.exit(1)
-
-    TRADING_START_TIME = start_time
-    TRADING_END_TIME = trading_end_from_start(start_time)
-    print(f"已设置交易时间: {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - "
-          f"{TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
-
 
 def fmt_amount(value):
     return f"{value:.2f}".rstrip("0").rstrip(".")
@@ -351,7 +286,8 @@ def prompt_capital_settings():
     else:
         profile_leverage = ask("杠杆倍数（如 4 / 2 / 1.5）", fmt_amount(saved_leverage(profile)) if saved_leverage(profile) else None, parse_positive)
         LEVERAGE = profile_leverage
-    prompt_trading_time(profile.get("start_time") or "09:40")
+    print(f"交易时间(固定): {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - "
+          f"{TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
     save_profile(login, phase, start_balance, profile_leverage,
                  f"{TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d}")
 
