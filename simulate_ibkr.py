@@ -36,8 +36,10 @@ import os
 import sys
 import json
 import re
+import smtplib
 import ssl
 import urllib.request
+from email.message import EmailMessage
 import pytz
 from math import floor
 from dotenv import load_dotenv
@@ -64,6 +66,7 @@ except ImportError:
     sys.exit(1)
 
 load_dotenv(override=True)
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)) or '.', '.env.ibkr-mail'), override=True)
 
 # ============================================================================
 # 用户配置参数 - 请根据需要修改以下参数
@@ -194,6 +197,15 @@ TOTAL_PNL = 0.0  # 总收益（累计）
 DAILY_PNL = 0.0  # 当日收益
 LAST_STATS_DATE = None  # 上次统计日期
 DAILY_TRADES = []  # 当日交易记录
+_LAST_ORDER_RESULT = None  # submit_order 最近一次成功回报，供日报记录成交价
+IBKR_MAIL_TO = "lhzwb2019@gmail.com"
+IBKR_DAILY_TRADES_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)) or '.', 'ibkr_daily_trades.json')
+IBKR_DAILY_MAIL_STATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)) or '.', 'ibkr_daily_mail.json')
+IBKR_MAIL_AFTER = time(15, 41)   # 收盘平仓（15:40）之后发
+IBKR_MAIL_FORCE_AFTER = time(16, 10)  # 到点仍有持仓也发，避免漏掉当天
+IBKR_MAIL_RETRY_SEC = 600
 
 # 止盈止损状态标志
 DAILY_STOP_TRIGGERED = False  # 当日是否触发了日内止损
@@ -2098,11 +2110,14 @@ def submit_order(symbol, side, quantity, order_type="MO", price=None, outside_rt
                 print(f"[{ts}] 刷新官表后张数未下降（重算 {new_qty}，原 {qty_try}；"
                       f"单张 ${old_m or 0:,.2f} → ${new_m or 0:,.2f}），改按比例减张")
 
+    global _LAST_ORDER_RESULT
     if not result or not result.get('ok'):
+        _LAST_ORDER_RESULT = None
         err = (result or {}).get('error', 'unknown')
         print(f"[{ts}] IB 下单失败: {err}")
         return None
 
+    _LAST_ORDER_RESULT = result
     oid = result.get('orderId')
     avg = result.get('avg_fill')
     comm = result.get('commission')
@@ -2341,6 +2356,165 @@ def wait_seconds_until_next_session(now, trading_start_time, calendar_stale=Fals
     ))
     return max((next_check - now).total_seconds(), 60)
 
+def _read_json(path):
+    try:
+        with open(path, encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path, data):
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def remember_trade(trade):
+    """记入当日成交，并写到文件。进程重启后收盘邮件仍能列出今天的单。"""
+    DAILY_TRADES.append(trade)
+    today = get_us_eastern_time().date().isoformat()
+    try:
+        _write_json(IBKR_DAILY_TRADES_PATH, {"date": today, "trades": DAILY_TRADES})
+    except OSError as exc:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入当日成交失败: {exc}")
+
+
+def load_persisted_trades():
+    data = _read_json(IBKR_DAILY_TRADES_PATH)
+    today = get_us_eastern_time().date().isoformat()
+    if data and data.get('date') == today and not DAILY_TRADES:
+        DAILY_TRADES.extend(data.get('trades') or [])
+
+
+def _smtp_settings():
+    host = os.environ.get('IBKR_SMTP_HOST', 'smtp.gmail.com')
+    port = int(os.environ.get('IBKR_SMTP_PORT', '587'))
+    user = os.environ.get('IBKR_SMTP_USER', IBKR_MAIL_TO)
+    password = os.environ.get('IBKR_SMTP_PASSWORD', '')
+    sender = os.environ.get('IBKR_SMTP_FROM', user)
+    return host, port, user, password, sender
+
+
+def _fmt_px(value):
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num != num or num <= 0:
+        return None
+    return num
+
+
+def format_close_email(day, trades, balance, still_open):
+    if balance:
+        subject = f"IBKR 收盘 {day} 净值 ${balance:,.2f}"
+        balance_line = f"账户净值: ${balance:,.2f}"
+    else:
+        subject = f"IBKR 收盘 {day} 净值未读到"
+        balance_line = "账户净值: 未读到"
+    lines = [f"IBKR MNQ 收盘日报 {day}", "", balance_line]
+    if still_open:
+        lines.append(f"注意: 发信时仍有持仓 {still_open} 张")
+    lines.append("")
+    if not trades:
+        lines.append("今日无成交。")
+    else:
+        lines.append(f"今日成交 {len(trades)} 笔:")
+        for i, trade in enumerate(trades, 1):
+            when = str(trade.get('time') or '')
+            clock = when[11:19] if len(when) >= 19 else when
+            qty = _fmt_px(trade.get('qty'))
+            qty_text = f" {qty:g} 张" if qty else ""
+            fill = _fmt_px(trade.get('fill_price'))
+            fill_text = f" 成交 {fill:g}" if fill else ""
+            extra = ""
+            if trade.get('action') == '开仓':
+                signal = _fmt_px(trade.get('entry_price'))
+                if signal:
+                    extra = f" 信号价 {signal:g}"
+            elif trade.get('pnl') is not None:
+                extra = f" 盈亏 ${float(trade['pnl']):+.2f}"
+            lines.append(f"{i}. {clock} {trade.get('action', '')} {trade.get('side', '')}{qty_text}{fill_text}{extra}")
+    lines += ["", "本邮件由 simulate_ibkr.py 在美东收盘后自动发送。"]
+    return subject, "\n".join(lines)
+
+
+def send_close_email(day, trades, balance, still_open):
+    """成功返回空字符串，失败返回原因。"""
+    host, port, user, password, sender = _smtp_settings()
+    if not password:
+        return "未配置 IBKR_SMTP_PASSWORD，收盘邮件未发送"
+    subject, body = format_close_email(day, trades, balance, still_open)
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = IBKR_MAIL_TO
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(host, port, timeout=30) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+            smtp.login(user, password)
+            smtp.send_message(msg)
+    except (OSError, smtplib.SMTPException) as exc:
+        return str(exc)
+    return ""
+
+
+def ensure_close_email(now, position_qty):
+    """每个美东交易日收盘后发一封。发不出去就 10 分钟后再试，不影响交易。"""
+    try:
+        state = _read_json(IBKR_DAILY_MAIL_STATE_PATH) or {}
+        sent = set(state.get('sent') or [])
+        last_attempt = state.get('last_attempt_ts') or 0
+        if time_module.time() - last_attempt < IBKR_MAIL_RETRY_SEC:
+            return
+        stored = _read_json(IBKR_DAILY_TRADES_PATH) or {}
+        day = None
+        trades = []
+        stored_day = stored.get('date')
+        if stored_day and stored_day not in sent:
+            close_at = now.tzinfo.localize(datetime.combine(
+                date_type.fromisoformat(stored_day), IBKR_MAIL_AFTER))
+            if now >= close_at:
+                if (stored_day == now.date().isoformat() and position_qty
+                        and now.time() < IBKR_MAIL_FORCE_AFTER):
+                    return
+                day = stored_day
+                trades = stored.get('trades') or []
+        elif now.time() >= IBKR_MAIL_AFTER and now.date().isoformat() not in sent:
+            if position_qty and now.time() < IBKR_MAIL_FORCE_AFTER:
+                return
+            day = now.date().isoformat()
+            trades = []
+        if day is None:
+            return
+        if now.weekday() >= 5 and not trades and day == now.date().isoformat():
+            return
+        refresh_ib_account_data(wait_sec=0.8)
+        balance = get_account_balance()
+        still_open = position_qty if day == now.date().isoformat() and position_qty else 0
+        err = send_close_email(day, trades, balance, still_open)
+        state['last_attempt_ts'] = time_module.time()
+        ts = now.strftime('%Y-%m-%d %H:%M:%S')
+        if err:
+            if state.get('last_error') != err:
+                print(f"[{ts}] 收盘邮件发送失败，10 分钟后重试: {err}")
+            state['last_error'] = err
+        else:
+            sent.add(day)
+            state['sent'] = sorted(sent)[-20:]
+            state.pop('last_error', None)
+            print(f"[{ts}] 收盘邮件已发送到 {IBKR_MAIL_TO}（{day}，{len(trades)} 笔）")
+        _write_json(IBKR_DAILY_MAIL_STATE_PATH, state)
+    except Exception as exc:
+        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 收盘邮件异常，跳过: {exc!r}")
+
+
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
@@ -2352,6 +2526,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
     print(f"当前美东时间: {now_et.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"交易时间: {trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d}")
     print(f"每日最大开仓次数: {max_positions_per_day}")
+    load_persisted_trades()
     ensure_official_mnq_margin()
     if DEBUG_MODE:
         print(f"调试模式已开启! 使用时间: {now_et.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2414,12 +2589,15 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             DAILY_PNL += pnl
             TOTAL_PNL += pnl
         now_str = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
-        DAILY_TRADES.append({
+        fill = (_LAST_ORDER_RESULT or {}).get('avg_fill')
+        remember_trade({
             "time": now_str,
             "action": action_label,
             "side": side,
+            "qty": abs(qty) if qty else None,
             "entry_price": entry,
             "exit_price": exit_px,
+            "fill_price": fill,
             "pnl": pnl
         })
         print(f"[{now_str}] {action_label}完成: 价格=${exit_px:.2f}, 盈亏=${pnl:+.2f} ({pnl_pct:+.2f}%)")
@@ -2518,7 +2696,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 continue
             time_module.sleep(IB_CLOSE_RETRY_SEC)
             continue
-        
+
+        ensure_close_email(now, position_quantity)
+
         # 更新持仓数据供监控线程使用
         with pnl_lock:
             position_data['quantity'] = position_quantity
@@ -3157,11 +3337,13 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 仓位: {filled_qty} 张 MNQ ≈ ${actual_notional:,.0f} 名义 "
                       f"(按可用保证金满仓)")
 
-                DAILY_TRADES.append({
+                remember_trade({
                     "time": now.strftime('%Y-%m-%d %H:%M:%S'),
                     "action": "开仓",
                     "side": side,
+                    "qty": filled_qty,
                     "entry_price": entry_price,
+                    "fill_price": (_LAST_ORDER_RESULT or {}).get('avg_fill'),
                     "pnl": None
                 })
         
@@ -3262,7 +3444,12 @@ if __name__ == "__main__":
     print("\n--- 风控设置 ---")
     apply_optional_risk_settings()
 
-    print("版本: 2.1.8")
+    print("版本: 2.1.9")
+    _mail_host, _mail_port, _mail_user, _mail_password, _mail_from = _smtp_settings()
+    if _mail_password:
+        print(f"收盘邮件: 每个交易日 {IBKR_MAIL_AFTER.strftime('%H:%M')} 后发到 {IBKR_MAIL_TO}（经由 {_mail_user}）")
+    else:
+        print(f"收盘邮件: 未配置 IBKR_SMTP_PASSWORD，暂不发送（收件人 {IBKR_MAIL_TO}）")
     print("执行: 每轮以 IB 仓位为准；下单看仓位不看 Filled；读仓失败不当空仓")
     print("平仓: 信号用完整 15m K；一旦成立立刻市价平到仓位=0，失败持续补平")
     print("等待: 非交易日睡到下一开盘；Gateway 未登录（含 IB Key）会一直重连，不退出")

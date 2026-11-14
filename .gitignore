@@ -2,6 +2,9 @@
 __pycache__
 .env
 .env.e8
+.env.ibkr-mail
+ibkr_daily_trades.json
+ibkr_daily_mail.json
 *.log
 *.backup
 *.csv
