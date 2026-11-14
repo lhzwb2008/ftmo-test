@@ -42,7 +42,7 @@ FUNDED_HARD_SL_PCT = 0.95  # 单笔硬止损占起始资金的百分比；0=不�
 MIN_LOT = 0.01  # minimum 模式的目标手数；品种最小手更大时 EA 改开最小手
 EA_HEARTBEAT_MAX_AGE_SECONDS = 60  # EA 每 5 秒写一次 ea_account，超过这个时间视为 EA 没在运行
 EA_FILE = "SQLiteSignalEA_aqua_paylater.mq5"
-EXPECTED_EA_BUILD = "2026-11-13b 免配置+日盈帽重载后保留"
+EXPECTED_EA_BUILD = "2026-11-14a 免配置+日盈帽由EA按真实权益执行并回写"
 
 # 风控比例（Aqua Pay Later：Challenge 目标 3%、无日亏、硬止损 0.95%；Funded 无目标、日亏 3%、硬止损 0.95%、日盈帽默认 $1100）
 PHASE_PROFIT_TARGET_PCT = {"challenge": 0.03, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
@@ -81,7 +81,8 @@ LAST_STATS_DATE = None  # 上次统计日期
 DAILY_TRADES = []  # 当日交易记录
 
 # 止盈止损状态标志
-DAILY_STOP_TRIGGERED = False  # 当日是否触发了日内止损
+DAILY_STOP_TRIGGERED = False  # 当日是否已停止（EA 日亏线或日盈帽）
+EA_HALT_CODE = 0  # 当日停止原因，取自 ea_daily_status.halted（1=日亏线，2=日盈帽）
 PROFIT_TARGET_TRIGGERED = False  # 是否触发了止盈
 DAILY_LOSS_MONITOR_ACTIVE = False  # 日内止损监控是否激活
 FORCE_CLOSE_POSITION = False  # 强制平仓标志（监控线程设置）
@@ -558,21 +559,30 @@ def write_signal_to_sqlite(action, size_mult=1.0):
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入信号失败: {str(e)}")
         return None
 
-def check_ea_daily_halt():
-    """读取 EA 写回的 ea_daily_status 表，返回 EA 端是否已触发当日日内止损。
+EA_HALT_DAILY_LOSS = 1    # ea_daily_status.halted：日亏线
+EA_HALT_PROFIT_CAP = 2    # ea_daily_status.halted：Funded 日盈帽
 
-    日内止损判定已完全迁移到 MT5 EA 端（真实权益逐tick监控 + broker服务器端SL）。
-    Python 端只镜像该标志：平掉模拟仓位并当日禁止新开仓，保证两边账本长期一致。
+
+def check_ea_daily_halt():
+    """读取 EA 写回的 ea_daily_status.halted：0=未停止，1=日亏线，2=Funded 日盈帽。
+
+    日内止损和日盈帽都由 MT5 EA 按真实权益逐 tick 判定并全平。
+    Python 端只镜像该标志：平掉模拟仓位并当日禁止新开仓，不用 QQQ 模拟盈亏自行触发
+    （模拟盈亏与 nas100 实际成交可差 0.1% 以上，2026-11-13 模拟 $1105 时实盘只有 $877）。
     """
     try:
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute("SELECT halted FROM ea_daily_status WHERE id = 1").fetchone()
         conn.close()
     except Exception:
-        return False  # 表不存在（EA 未启动或未升级）时视为未触发
-    if not row:
-        return False
-    return bool(row[0])
+        return 0  # 表不存在（EA 未启动或未升级）时视为未触发
+    if not row or row[0] is None:
+        return 0
+    return int(row[0])
+
+
+def ea_halt_label(code):
+    return "日盈帽" if code == EA_HALT_PROFIT_CAP else "日内止损"
 
 def check_ea_challenge_pass():
     """读取 EA 写回的 ea_pass_status。考核账户由 EA 判定通过（券商止盈成交后空仓且余额过线）。
@@ -1060,10 +1070,12 @@ def daily_loss_monitor_thread(symbol, position_data):
     注意：盈亏计算包含杠杆
     """
     global DAILY_STOP_TRIGGERED, FORCE_CLOSE_POSITION, DAILY_LOSS_MONITOR_ACTIVE
-    global DAILY_PNL, PROFIT_TARGET_TRIGGERED
+    global DAILY_PNL, PROFIT_TARGET_TRIGGERED, EA_HALT_CODE
     global EA_MIRROR_CLOSE, EA_MIRROR_CLOSE_REASON
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已启动 ===")
+    if MAX_DAILY_PROFIT_AMOUNT > 0:
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日盈帽: ${MAX_DAILY_PROFIT_AMOUNT:.2f}，由 MT5 EA 按真实权益执行（本线程仅镜像 EA 停止标志）")
     if CHALLENGE_PASS_EQUITY > 0:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
     else:
@@ -1115,14 +1127,6 @@ def daily_loss_monitor_thread(symbol, position_data):
                     current_daily_pnl = DAILY_PNL + unrealized_pnl
                 
                 # 考核通过由 EA 判定；此处只镜像 ea_pass_status。Funded 通过线为 0，不会进入
-                if MAX_DAILY_PROFIT_AMOUNT > 0 and current_daily_pnl >= MAX_DAILY_PROFIT_AMOUNT:
-                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] 达到 Funded 日盈上限 !!!!!")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 当日盈利: ${current_daily_pnl:.2f} / 上限 ${MAX_DAILY_PROFIT_AMOUNT:.2f}")
-                    with pnl_lock:
-                        FORCE_CLOSE_POSITION = True
-                        DAILY_STOP_TRIGGERED = True
-                    break
-
                 if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
                     print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已达到考核通过线 !!!!!")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 通过线: ${CHALLENGE_PASS_EQUITY:.2f}")
@@ -1135,15 +1139,17 @@ def daily_loss_monitor_thread(symbol, position_data):
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置考核通过平仓标志")
                     break
                 
-                # 日内止损由 MT5 EA 端权威执行（真实权益触线即全平）；此处仅镜像 EA 写回的
+                # 日内止损和 Funded 日盈帽都由 MT5 EA 端权威执行（真实权益触线即全平）；此处仅镜像 EA 写回的
                 # halted 标志：把模拟仓位按当前价平掉并当日禁止新开仓，保证两边账本一致
-                if check_ea_daily_halt():
-                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已触发日内止损 !!!!!")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 同步平掉模拟仓位并停止今日交易（当日盈亏参考: ${current_daily_pnl:.2f}）")
+                halt_code = check_ea_daily_halt()
+                if halt_code:
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已触发{ea_halt_label(halt_code)} !!!!!")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 同步平掉模拟仓位并停止今日交易（模拟当日盈亏参考: ${current_daily_pnl:.2f}，以 MT5 实际为准）")
                     
                     with pnl_lock:
                         FORCE_CLOSE_POSITION = True
                         DAILY_STOP_TRIGGERED = True
+                        EA_HALT_CODE = halt_code
                     
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置强制平仓标志")
                     break
@@ -1221,7 +1227,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
                         max_positions_per_day=MAX_POSITIONS_PER_DAY, lookback_days=LOOKBACK_DAYS):
     global TOTAL_PNL, DAILY_PNL, LAST_STATS_DATE, DAILY_TRADES, DAILY_STOP_TRIGGERED, PROFIT_TARGET_TRIGGERED
-    global DAILY_LOSS_MONITOR_ACTIVE, FORCE_CLOSE_POSITION
+    global DAILY_LOSS_MONITOR_ACTIVE, FORCE_CLOSE_POSITION, EA_HALT_CODE
     global EA_MIRROR_CLOSE, EA_MIRROR_CLOSE_REASON
     
     now_et = get_us_eastern_time()
@@ -1347,7 +1353,12 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     DAILY_PNL += pnl
                     TOTAL_PNL += pnl
                 # 记录平仓交易（根据是止盈还是止损区分）
-                action_type = "平仓(止盈)" if PROFIT_TARGET_TRIGGERED else "平仓(止损)"
+                if PROFIT_TARGET_TRIGGERED:
+                    action_type = "平仓(止盈)"
+                elif EA_HALT_CODE == EA_HALT_PROFIT_CAP:
+                    action_type = "平仓(日盈帽)"
+                else:
+                    action_type = "平仓(止损)"
                 DAILY_TRADES.append({
                     "time": now.strftime('%Y-%m-%d %H:%M:%S'),
                     "action": action_type,
@@ -1481,6 +1492,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         if last_date is not None and current_date != last_date:
             positions_opened_today = 0
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
+            EA_HALT_CODE = 0
             FORCE_CLOSE_POSITION = False  # 重置强制平仓标志
             # 考核通过是账户级停止，跨日不重置；Funded 没有通过线，这个标志仍按日清掉
             if not (CHALLENGE_PASS_EQUITY > 0 and PROFIT_TARGET_TRIGGERED):
@@ -1530,6 +1542,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 
             DAILY_PNL = 0.0  # 重置当日收益
             DAILY_STOP_TRIGGERED = False  # 重置日内止损标志
+            EA_HALT_CODE = 0
         last_date = current_date
         LAST_STATS_DATE = current_date
 
@@ -2065,7 +2078,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             if DAILY_STOP_TRIGGERED:
                 if LOG_VERBOSE:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发日内止损，跳过开仓检查")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已触发{ea_halt_label(EA_HALT_CODE)}，跳过开仓检查")
                 continue
             
             if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
@@ -2074,9 +2087,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 continue
 
             # 开仓前实时确认 EA 端日内止损状态，避免监控线程轮询间隙内误开仓造成两边不一致
-            if check_ea_daily_halt():
+            halt_code = check_ea_daily_halt()
+            if halt_code:
                 DAILY_STOP_TRIGGERED = True
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已触发日内止损，今日不再开仓")
+                EA_HALT_CODE = halt_code
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已触发{ea_halt_label(halt_code)}，今日不再开仓")
                 continue
             
                 

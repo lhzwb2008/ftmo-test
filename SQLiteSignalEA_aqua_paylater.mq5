@@ -5,7 +5,7 @@
 #property copyright "Copyright 2024"
 #property link      ""
 #property version   "1.04"
-#define   EA_BUILD   "2026-11-13b 免配置+日盈帽重载后保留"  // 每次改 EA 逻辑时同步更新日期和说明
+#define   EA_BUILD   "2026-11-14a 免配置+日盈帽由EA按真实权益执行并回写"  // 每次改 EA 逻辑时同步更新日期和说明
 // 杠杆、起始资金、单笔硬止损、最小手模式、绑定账户全部由 simulate 写入 sim_config；EA inputs 保持默认即可，无需修改
 #property strict
 
@@ -1938,7 +1938,8 @@ void WriteDailyStatus(string reason)
         "ON CONFLICT(id) DO UPDATE SET server_day=excluded.server_day, halted=excluded.halted, "
         "reason=excluded.reason, anchor=excluded.anchor, equity=excluded.equity, "
         "loss_floor=excluded.loss_floor, updated_at=excluded.updated_at",
-        TimeToString(daily_period_start, TIME_DATE), daily_halted ? 1 : 0, reason,
+        // halted: 0=未停止 1=日亏线 2=日盈帽；simulate 据此镜像平仓并当日停止开仓
+        TimeToString(daily_period_start, TIME_DATE), daily_halted ? 1 : (profit_cap_halted ? 2 : 0), reason,
         daily_anchor, AccountInfoDouble(ACCOUNT_EQUITY), DailyTriggerFloor(),
         TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS));
     
