@@ -524,7 +524,7 @@ def init_sqlite_database():
         abs_db = os.path.abspath(DB_PATH)
         print(f"[{ts}] SQLite 已清空旧信号并重建表（未消费记录已删除）")
         print(f"数据库路径: {abs_db}")
-        print(f"[{ts}] 建议：先启动本脚本再启动 MT5 EA；二者须使用上述同一 db 文件（同机同路径）。")
+        print(f"[{ts}] 建议：先启动 MT5 EA 再启动本脚本；二者须使用上述同一 db 文件（同机同路径）。")
         
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] SQLite数据库初始化失败: {str(e)}")
