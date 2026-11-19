@@ -23,6 +23,7 @@ Windows 运行前准备：
 .env 仅需 Longport 凭证；IB 连接参数写死在下方常量。
 仓位：按 IB 净值 100% / 官表日内单张初始保证金估算张数；Error 201 先强制刷官表重算，仍不足再 90%→85%→70% 减张（默认不订 IB 行情、不用 whatIf）。
 断线：运行中自动心跳探活 + 无限重连（Gateway Auto Restart 窗口内会短暂拒连，脚本会等待恢复）。
+     端口能连但同步一直超时时经 IBC 命令端口让 Gateway 重连账户服务器 / 自动重启；交易时段断线超 5 分钟发邮件告警。
 执行层对齐 Longport 实盘：每轮以 IB 仓位为唯一真相；下单看仓位变化不看 Filled；读仓失败不当成空仓。
 平仓：信号仍由完整 15m K 判定；一旦成立立刻市价平到仓位=0，不等当前分钟 K，失败则短间隔持续补平。
 风险：QQQ 信号 vs MNQ 存在基差；每个交易日自动选主力合约（到期前 8 天换到下一季，空仓时才切换）；满仓保证金风险极高。
@@ -37,6 +38,7 @@ import sys
 import json
 import re
 import smtplib
+import socket
 import ssl
 import urllib.request
 from email.message import EmailMessage
@@ -95,6 +97,20 @@ IB_RECONNECT_MAX_ATTEMPTS = 0        # 运行中/启动重连次数；0=无限�
 IB_HEARTBEAT_INTERVAL_SEC = 120      # 心跳探活间隔（秒）；缩短以便更快发现重启断线
 IB_KEEPALIVE_SLEEP_CHUNK_SEC = 60    # 长等待分段 sleep，以便心跳/重连
 _IB_LAST_HEARTBEAT_TS = 0.0
+# Gateway 收到 1100→1102 后可能卡在「API 端口能连、持仓/账户同步一直超时」，曾两次卡到 17:05 IB 每日重置才恢复。
+# 端口能连但重连一直失败时，通过 IBC 命令端口（/opt/ibc/config.ini CommandServerPort，只绑 127.0.0.1）自救：
+# 先 RECONNECTACCOUNT（等同 Ctrl-Alt-R），仍不行再 RESTART（等同每日自动重启，复用会话，不需要手机确认）
+IBC_COMMAND_HOST = '127.0.0.1'
+IBC_COMMAND_PORT = 7462
+IBC_RECONNECT_ACCOUNT_AFTER_FAILS = 3   # 每次重连约 1 分钟，3 次 ≈ 3 分钟
+IBC_RESTART_AFTER_FAILS = 8
+IBC_RESTART_MIN_GAP_SEC = 1800
+# 23:45 是 Gateway 自己的自动重启，这段时间不插手
+IBC_HEAL_QUIET_AFTER = time(23, 30)
+# 美东工作日交易时段内断线超过这个秒数发邮件告警，恢复后再发一封
+IB_OUTAGE_ALERT_AFTER_SEC = 300
+IB_OUTAGE_ALERT_WINDOW = (time(9, 25), time(16, 0))
+_IB_OUTAGE = {"started": None, "alerted": False, "heal_stage": 0, "last_restart": 0.0}
 # 先按净值 100% 估张数（日内约 13x）；201 先刷官表重算，仍不足再按比例减张，不在估算阶段预留 15%
 MARGIN_USAGE_PCT = 1.0
 # 开仓被 201 拒单且刷表后仍过不了，按首次张数的这些比例重试（90% 吃小误差，70% 约等于隔夜保证金）
@@ -770,6 +786,116 @@ def ib_heartbeat(force=False):
         return False
 
 
+def _ib_api_port_open():
+    try:
+        with socket.create_connection((IB_HOST, IB_PORT), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def ibc_send_command(cmd):
+    """发命令到 IBC 命令端口，返回 (成功, 回复或错误)。"""
+    try:
+        with socket.create_connection((IBC_COMMAND_HOST, IBC_COMMAND_PORT), timeout=5) as sock:
+            sock.sendall((cmd + "\n").encode())
+            sock.settimeout(5)
+            reply = b""
+            try:
+                while not reply.endswith(b"\n"):
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        break
+                    reply += chunk
+            except socket.timeout:
+                pass
+            try:
+                sock.sendall(b"EXIT\n")
+            except OSError:
+                pass
+        return True, reply.decode(errors="replace").strip() or "无回复"
+    except OSError as e:
+        return False, str(e)
+
+
+def _ibc_self_heal(attempt):
+    """端口能连但同步一直超时时，按阶段让 Gateway 重连账户服务器 / 自动重启。"""
+    now = get_us_eastern_time()
+    if now.weekday() >= 5 or now.time() >= IBC_HEAL_QUIET_AFTER:
+        return
+    state = _IB_OUTAGE
+    if state["heal_stage"] == 0:
+        if attempt < IBC_RECONNECT_ACCOUNT_AFTER_FAILS:
+            return
+        cmd = "RECONNECTACCOUNT"
+    else:
+        if attempt < IBC_RESTART_AFTER_FAILS:
+            return
+        if time_module.time() - state["last_restart"] < IBC_RESTART_MIN_GAP_SEC:
+            return
+        cmd = "RESTART"
+    if not _ib_api_port_open():
+        return
+    ok, reply = ibc_send_command(cmd)
+    ts = now.strftime('%Y-%m-%d %H:%M:%S')
+    if not ok:
+        if state.get("cmd_error") != reply:
+            print(f"[{ts}] IBC 命令 {cmd} 发送失败: {reply}（检查 /opt/ibc/config.ini CommandServerPort={IBC_COMMAND_PORT}）")
+        state["cmd_error"] = reply
+        return
+    state["cmd_error"] = None
+    print(f"[{ts}] API 端口能连但同步超时已 {attempt} 次，已发 IBC {cmd}，回复: {reply}")
+    if cmd == "RESTART":
+        state["last_restart"] = time_module.time()
+    state["heal_stage"] = max(state["heal_stage"], 1)
+
+
+def _ib_outage_check_alert():
+    state = _IB_OUTAGE
+    if state["alerted"] or state["started"] is None:
+        return
+    now = get_us_eastern_time()
+    start, end = IB_OUTAGE_ALERT_WINDOW
+    if now.weekday() >= 5 or not (start <= now.time() < end):
+        return
+    down_sec = time_module.time() - state["started"]
+    if down_sec < IB_OUTAGE_ALERT_AFTER_SEC:
+        return
+    since = datetime.fromtimestamp(state["started"], now.tzinfo).strftime('%Y-%m-%d %H:%M:%S')
+    port_text = "API 端口能连，但持仓/账户同步一直超时" if _ib_api_port_open() else "API 端口连不上（Gateway 可能未登录，需要手机确认）"
+    subject = f"IBKR 断线告警 已 {down_sec / 60:.0f} 分钟"
+    body = "\n".join([
+        f"IBKR Gateway 自美东 {since} 起断线，已 {down_sec / 60:.0f} 分钟，期间不会开平仓。",
+        f"状态: {port_text}",
+        "脚本仍在每分钟重连；端口能连时会自动让 Gateway 重连账户服务器或自动重启。",
+        "恢复后会再发一封邮件。",
+    ])
+    err = send_mail(subject, body)
+    ts = now.strftime('%Y-%m-%d %H:%M:%S')
+    if err:
+        print(f"[{ts}] 断线告警邮件发送失败: {err}")
+        return
+    state["alerted"] = True
+    print(f"[{ts}] 断线告警邮件已发送到 {IBKR_MAIL_TO}")
+
+
+def _ib_outage_recovered():
+    state = _IB_OUTAGE
+    started, alerted = state["started"], state["alerted"]
+    state.update(started=None, alerted=False, heal_stage=0)
+    if not alerted or started is None:
+        return
+    now = get_us_eastern_time()
+    since = datetime.fromtimestamp(started, now.tzinfo).strftime('%Y-%m-%d %H:%M:%S')
+    minutes = (time_module.time() - started) / 60
+    err = send_mail(
+        f"IBKR 已恢复连接（断线 {minutes:.0f} 分钟）",
+        f"IBKR Gateway 自美东 {since} 断线，已于 {now.strftime('%Y-%m-%d %H:%M:%S')} 恢复，共 {minutes:.0f} 分钟。",
+    )
+    if err:
+        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 恢复邮件发送失败: {err}")
+
+
 def ib_ensure_connected(max_attempts=None, interval_sec=None):
     """
     确保已连接；断线则自动重连。
@@ -788,6 +914,8 @@ def ib_ensure_connected(max_attempts=None, interval_sec=None):
             return True
 
     attempt = 0
+    if _IB_OUTAGE["started"] is None:
+        _IB_OUTAGE["started"] = time_module.time()
     while True:
         attempt += 1
         ts = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
@@ -799,9 +927,16 @@ def ib_ensure_connected(max_attempts=None, interval_sec=None):
             if _ib_try_connect(verbose=verbose):
                 ts_ok = get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')
                 print(f"[{ts_ok}] IB 重连成功")
+                _ib_outage_recovered()
                 return True
         except Exception as e:
             print(f"[{ts}] 重连异常: {e}")
+
+        try:
+            _ibc_self_heal(attempt)
+            _ib_outage_check_alert()
+        except Exception as e:
+            print(f"[{ts}] 断线自救/告警异常: {e}")
 
         if max_attempts > 0 and attempt >= max_attempts:
             print(f"[{ts}] IB 重连失败，已达上限 {max_attempts} 次")
@@ -2443,11 +2578,15 @@ def format_close_email(day, trades, balance, still_open):
 
 
 def send_close_email(day, trades, balance, still_open):
+    subject, body = format_close_email(day, trades, balance, still_open)
+    return send_mail(subject, body)
+
+
+def send_mail(subject, body):
     """成功返回空字符串，失败返回原因。"""
     host, port, user, password, sender = _smtp_settings()
     if not password:
-        return "未配置 IBKR_SMTP_PASSWORD，收盘邮件未发送"
-    subject, body = format_close_email(day, trades, balance, still_open)
+        return "未配置 IBKR_SMTP_PASSWORD，邮件未发送"
     msg = EmailMessage()
     msg['Subject'] = subject
     msg['From'] = sender
@@ -3444,7 +3583,7 @@ if __name__ == "__main__":
     print("\n--- 风控设置 ---")
     apply_optional_risk_settings()
 
-    print("版本: 2.1.9")
+    print("版本: 2.2.0")
     _mail_host, _mail_port, _mail_user, _mail_password, _mail_from = _smtp_settings()
     if _mail_password:
         print(f"收盘邮件: 每个交易日 {IBKR_MAIL_AFTER.strftime('%H:%M')} 后发到 {IBKR_MAIL_TO}（经由 {_mail_user}）")
