@@ -2710,8 +2710,9 @@ if __name__ == "__main__":
         'quiet_open_position_mult': 0.5,
         # SPY 逆势门控（与 Quantra/backtest.py 同步）：第一个开仓判断点（trading_start_time）算 QQQ 相对 β×SPY 的超额
         # （均自前收盘起），超额 > 0 当天只许做多，< 0 只许做空。缺 SPY 数据的日子不限制。
-        # 实盘 simulate*.py 尚未实现该门控；SPY 分钟数据用 Quantra/data_fetch_from_longport_spy.py 拉取后放到本目录（前复权）。
-        'spy_lead_gate': True,
+        # 默认关闭：2020-04~2023-12 样本外每年都比不开更差（2x 总回报 263.9%→131.4%），实盘也不接入。
+        # 需要复查时改 True；SPY 分钟数据用 Quantra/data_fetch_from_longport_spy.py 拉取后放到本目录（前复权）。
+        'spy_lead_gate': False,
         'spy_data_path': 'spy_longport.csv',
         'spy_lead_beta_lookback': 60,
         'use_vwap': False,  # VWAP开关，True为使用VWAP，False为不使用
