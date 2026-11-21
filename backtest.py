@@ -461,6 +461,44 @@ def quiet_open_multipliers(minute_df, config):
     return mult, desc
 
 
+def spy_lead_directions(minute_df, config, first_check_time):
+    """
+    SPY 逆势门控：在当天第一个开仓判断点，用 QQQ 相对 SPY 的超额定当天允许的方向。
+      超额 = (QQQ 现价/QQQ 前收 - 1) - β × (SPY 现价/SPY 前收 - 1)
+      超额 > 0 当天只许做多；< 0 只许做空。
+    β = 过去 spy_lead_beta_lookback 个交易日日收益的回归系数，只用开盘前已知数据。
+    比值用截断回测窗口之前的全样本计算，避免起点丢掉 β 历史。
+    当天缺 SPY 数据或 β 不足时返回 0（不限制方向）。
+    返回 (date -> +1/-1/0, 参数说明)。开关关闭时返回 (None, 说明)。
+    """
+    if not config.get('spy_lead_gate', False):
+        return None, "spy_gate=off"
+    spy_path = config.get('spy_data_path', 'spy_longport.csv')
+    if not os.path.exists(spy_path):
+        print(f"警告: 找不到 SPY 数据 {spy_path}，SPY 逆势门控未生效")
+        return None, "spy_gate=off(no SPY data)"
+    lookback = int(config.get('spy_lead_beta_lookback', 60))
+
+    spy = pd.read_csv(spy_path, parse_dates=['DateTime'])
+    spy['Date'] = spy['DateTime'].dt.date
+    spy['Time'] = spy['DateTime'].dt.strftime('%H:%M')
+    q_close = minute_df.groupby('Date')['Close'].last()
+    s_close = spy.groupby('Date')['Close'].last()
+    common = q_close.index.intersection(s_close.index)
+    q_close, s_close = q_close.loc[common].sort_index(), s_close.loc[common].sort_index()
+    q_prev, s_prev = q_close.shift(1), s_close.shift(1)
+    lq, ls = np.log(q_close).diff(), np.log(s_close).diff()
+    beta = (lq.rolling(lookback, min_periods=lookback).cov(ls)
+            / ls.rolling(lookback, min_periods=lookback).var()).shift(1)
+
+    q_t = minute_df[minute_df['Time'] == first_check_time].groupby('Date')['Close'].last()
+    s_t = spy[spy['Time'] == first_check_time].groupby('Date')['Close'].last()
+    ex = (q_t.reindex(common) / q_prev - 1) - beta * (s_t.reindex(common) / s_prev - 1)
+    direction = {d: (int(np.sign(v)) if pd.notna(v) else 0) for d, v in ex.items()}
+    desc = f"spy_gate=on(@{first_check_time}, β{lookback}d)"
+    return direction, desc
+
+
 def compute_weekly_trend_strength_by_date(minute_df):
     """兼容旧名：仅返回 weekly_trend_strength。"""
     d = compute_daily_trend_features(minute_df)
@@ -851,8 +889,11 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
         elif position == 0 and current_time in allowed_times and current_time != end_time_str and positions_opened_today < max_positions_per_day:
             etp = row.get('entry_trend_pass', True)
             trend_ok = True if pd.isna(etp) else bool(etp)
+            # SPY 逆势门控：当天方向由第一个判断点决定，0 表示不限制
+            spy_dir = row.get('spy_lead_dir', 0)
+            spy_dir = 0 if pd.isna(spy_dir) else int(spy_dir)
             # 检查潜在多头入场
-            long_entry_condition = price > upper and trend_ok
+            long_entry_condition = price > upper and trend_ok and spy_dir >= 0
                 
             if long_entry_condition:
                 # 打印边界计算详情（如果需要）
@@ -883,7 +924,7 @@ def simulate_day(day_df, prev_close, allowed_times, position_size, config, day_s
                 max_adverse_price = low  # 开仓当根 K 即计入不利侧
                     
             # 检查潜在空头入场
-            short_entry_condition = price < lower_bound and trend_ok
+            short_entry_condition = price < lower_bound and trend_ok and spy_dir <= 0
                 
             if short_entry_condition:
                 # 打印边界计算详情（如果需要）
@@ -1397,6 +1438,9 @@ def run_backtest(config):
 
     # 冷清日系数必须在日期过滤前算，20 日均值才能用到窗口开始之前的成交量
     quiet_open_mult, quiet_open_desc = quiet_open_multipliers(price_df, config)
+    # SPY 逆势门控同理：β 需要窗口开始之前的日收益；判断点 = 第一个开仓检查时刻
+    spy_first_check = f"{trading_start_time[0]:02d}:{trading_start_time[1]:02d}"
+    spy_lead_dir, spy_lead_desc = spy_lead_directions(price_df, config, spy_first_check)
 
     # 用全样本日收盘计算日频趋势特征（不修改 CSV）；回测窗口截断后再按 Date 合并
     trend_feat_df = compute_daily_trend_features(price_df)
@@ -1565,6 +1609,11 @@ def run_backtest(config):
 
     # 开仓门控：放在 sigma 与边界之后，才能使用 sigma / minutes_from_open 等列
     price_df['entry_trend_pass'] = compute_entry_trend_pass_series(price_df, config)
+    # SPY 逆势门控：+1 当天只许做多，-1 只许做空，0 不限制
+    if spy_lead_dir is not None:
+        price_df['spy_lead_dir'] = price_df['Date'].map(spy_lead_dir).fillna(0).astype(int)
+        _gate_days = price_df.groupby('Date')['spy_lead_dir'].first()
+        spy_lead_desc += f" 限多{int((_gate_days > 0).sum())}天/限空{int((_gate_days < 0).sum())}天/不限{int((_gate_days == 0).sum())}天"
     
     # 根据检查间隔生成允许的交易时间
     allowed_times = []
@@ -1602,7 +1651,7 @@ def run_backtest(config):
     ttp_info = f"TTP={ttp_act*100:.2f}%/{ttp_cb*100:.0f}%" if enable_ttp else "TTP=off"
     print(
         f"参数: interval={check_interval_minutes}m, {k_info}, leverage={leverage}x, "
-        f"{ttp_info}, filter={entry_filter}, slip={slip}, {quiet_open_desc}"
+        f"{ttp_info}, filter={entry_filter}, slip={slip}, {quiet_open_desc}, {spy_lead_desc}"
     )
     
     # 初始化回测变量
@@ -2659,6 +2708,12 @@ if __name__ == "__main__":
         'quiet_open_rel_threshold': 0.65,
         'quiet_open_lookback_days': 20,
         'quiet_open_position_mult': 0.5,
+        # SPY 逆势门控（与 Quantra/backtest.py 同步）：第一个开仓判断点（trading_start_time）算 QQQ 相对 β×SPY 的超额
+        # （均自前收盘起），超额 > 0 当天只许做多，< 0 只许做空。缺 SPY 数据的日子不限制。
+        # 实盘 simulate*.py 尚未实现该门控；SPY 分钟数据用 Quantra/data_fetch_from_longport_spy.py 拉取后放到本目录（前复权）。
+        'spy_lead_gate': True,
+        'spy_data_path': 'spy_longport.csv',
+        'spy_lead_beta_lookback': 60,
         'use_vwap': False,  # VWAP开关，True为使用VWAP，False为不使用
         'enable_intraday_stop_loss': True,  # 是否启用日内止损（与 simulate 的 MAX_DAILY_LOSS_AMOUNT>0 对应）
         'intraday_stop_loss_pct': 0.04,  # 仅在未指定 max_daily_loss_amount 时用于换算美元限额
