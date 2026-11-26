@@ -45,9 +45,10 @@ EA_FILE = "SQLiteSignalEA_aqua_paylater.mq5"
 EXPECTED_EA_BUILD = "2026-11-14a 免配置+日盈帽由EA按真实权益执行并回写"
 
 # 风控比例（Aqua Pay Later：Challenge 目标 3%、无日亏、硬止损 0.95%；Funded 无目标、日亏 3%、硬止损 0.95%、日盈帽默认 $1100）
-PHASE_PROFIT_TARGET_PCT = {"challenge": 0.03, "funded": -1}  # 各轮次止盈目标比例（负数=禁用止盈）
+# balance=指定余额止盈：风控与 Funded 相同，另指定一条余额线。到达后走现有考核止盈（券商止盈 + 永久停开仓），不用改 EA
+PHASE_PROFIT_TARGET_PCT = {"challenge": 0.03, "funded": -1, "balance": -1}  # 各轮次止盈目标比例（负数=不按比例算）
 PROFIT_TARGET_PCT = -1     # 当前轮次止盈比例（启动时根据输入轮次自动设置）
-CHALLENGE_PASS_EQUITY = 0.0        # 官方考核通过线；0=Funded 或未启用。EA 开仓挂券商止盈，空仓且余额过线停止开仓
+CHALLENGE_PASS_EQUITY = 0.0        # 考核通过线，或 balance 模式的止盈余额；0=关闭。EA 开仓挂券商止盈，空仓且余额过线停止开仓
 
 # 交易时间设置
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
@@ -192,8 +193,10 @@ def load_profile(login):
             login INTEGER PRIMARY KEY, phase TEXT, start_balance REAL, leverage REAL,
             start_time TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
         """)
-        row = conn.execute("SELECT phase, start_balance, leverage, start_time FROM sim_profile WHERE login = ?",
-                           (int(login),)).fetchone()
+        _ensure_profile_balance_tp(conn)
+        row = conn.execute(
+            "SELECT phase, start_balance, leverage, start_time, balance_tp FROM sim_profile WHERE login = ?",
+            (int(login),)).fetchone()
         conn.commit()
         conn.close()
     except Exception as e:
@@ -201,16 +204,29 @@ def load_profile(login):
         return {}
     if not row:
         return {}
-    return {"phase": row[0], "start_balance": row[1], "leverage": row[2], "start_time": row[3]}
+    return {"phase": row[0], "start_balance": row[1], "leverage": row[2], "start_time": row[3], "balance_tp": row[4]}
 
 
-def save_profile(login, phase, start_balance, leverage, start_time):
+def _ensure_profile_balance_tp(conn):
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(sim_profile)")}
+    if "balance_tp" not in cols:
+        conn.execute("ALTER TABLE sim_profile ADD COLUMN balance_tp REAL")
+
+
+def save_profile(login, phase, start_balance, leverage, start_time, balance_tp=None):
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("""
-        INSERT OR REPLACE INTO sim_profile (login, phase, start_balance, leverage, start_time, updated_at)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, (int(login), phase, float(start_balance), float(leverage), start_time))
+        CREATE TABLE IF NOT EXISTS sim_profile (
+            login INTEGER PRIMARY KEY, phase TEXT, start_balance REAL, leverage REAL,
+            start_time TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+        """)
+        _ensure_profile_balance_tp(conn)
+        conn.execute("""
+        INSERT OR REPLACE INTO sim_profile (login, phase, start_balance, leverage, start_time, balance_tp, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (int(login), phase, float(start_balance), float(leverage), start_time,
+              None if balance_tp is None else float(balance_tp)))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -238,9 +254,16 @@ def parse_phase(raw):
     value = raw.strip().lower()
     if value == "min":
         value = "minimum"
+    if value in ("tp", "payout", "余额"):
+        value = "balance"
     if value not in PHASE_PROFIT_TARGET_PCT:
-        raise ValueError("必须是 challenge 或 funded")
+        raise ValueError("必须是 challenge、funded 或 balance")
     return value
+
+
+def pass_line_name():
+    """challenge 是考核通过线；balance 是指定余额止盈。两条都写 challenge_pass_equity，EA 行为相同。"""
+    return "余额止盈线" if CURRENT_PHASE == "balance" else "考核通过线"
 
 
 def saved_leverage(profile):
@@ -282,7 +305,7 @@ def prompt_capital_settings():
     else:
         print("新账户：首次需要确认轮次，之后启动回车即可")
 
-    phase = ask("当前阶段（challenge=考核 / funded=已激活）", profile.get("phase"), parse_phase)
+    phase = ask("当前阶段（challenge=考核 / funded=已激活 / balance=指定余额止盈）", profile.get("phase"), parse_phase)
     start_default = profile.get("start_balance") or (deposit if deposit > 0 else None)
     start_balance = ask("账户起始资金", fmt_amount(start_default) if start_default else None, parse_positive)
     if phase == "minimum":
@@ -291,14 +314,25 @@ def prompt_capital_settings():
     else:
         profile_leverage = ask("杠杆倍数（建议 2）", fmt_amount(saved_leverage(profile)) if saved_leverage(profile) else "2", parse_positive)
         LEVERAGE = profile_leverage
-    if phase == "funded":
+    if phase in ("funded", "balance"):
         MAX_DAILY_PROFIT_AMOUNT = ask("Funded 日盈上限（200K 默认 1100，达到后当日停止开仓）", "1100", parse_positive)
     else:
         MAX_DAILY_PROFIT_AMOUNT = -1
+    balance_tp = None
+    if phase == "balance":
+        def parse_balance_tp(raw):
+            value = parse_positive(raw)
+            if value <= current_balance:
+                raise ValueError(f"必须高于当前余额 ${current_balance:,.2f}")
+            return value
+        saved_tp = profile.get("balance_tp")
+        tp_default = fmt_amount(saved_tp) if saved_tp and float(saved_tp) > current_balance else None
+        balance_tp = ask("止盈余额（到达后平仓，之后不再开仓）", tp_default, parse_balance_tp)
     print(f"交易时间(固定): {TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d} - "
           f"{TRADING_END_TIME[0]:02d}:{TRADING_END_TIME[1]:02d}")
+    remembered_tp = balance_tp if phase == "balance" else profile.get("balance_tp")
     save_profile(login, phase, start_balance, profile_leverage,
-                 f"{TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d}")
+                 f"{TRADING_START_TIME[0]:02d}:{TRADING_START_TIME[1]:02d}", remembered_tp)
 
     ACCOUNT_LOGIN = login
     CURRENT_PHASE = phase
@@ -306,7 +340,12 @@ def prompt_capital_settings():
     INITIAL_CAPITAL = current_balance
     PROFIT_TARGET_PCT = PHASE_PROFIT_TARGET_PCT[phase]
 
-    phase_label = {"challenge": "Challenge（考核）", "funded": "Funded（已激活）", "minimum": "最小手"}[phase]
+    phase_label = {
+        "challenge": "Challenge（考核）",
+        "funded": "Funded（已激活）",
+        "balance": "指定余额止盈",
+        "minimum": "最小手",
+    }[phase]
     print(f"当前轮次: {phase_label}")
     if phase == "minimum":
         print(f"杠杆: 不使用。EA 固定开 {MIN_LOT} 手；品种最小手数更大时开最小手")
@@ -318,7 +357,15 @@ def prompt_capital_settings():
     print(f"账户当前金额: ${current_balance:.2f}")
     print(f"已有盈亏: ${current_balance - start_balance:+.2f}")
     
-    if PROFIT_TARGET_PCT > 0:
+    if phase == "balance":
+        CHALLENGE_PASS_EQUITY = balance_tp
+        gap = balance_tp - current_balance
+        print(f"余额止盈线: ${CHALLENGE_PASS_EQUITY:,.2f}（还差 ${gap:,.2f}）。"
+              f"EA 开仓即挂券商止盈，成交后余额不低于这条线，然后永久停止开仓")
+        if MAX_DAILY_PROFIT_AMOUNT > 0 and gap > MAX_DAILY_PROFIT_AMOUNT + 0.01:
+            print(f"注意: 还差 ${gap:,.2f}，大于日盈帽 ${MAX_DAILY_PROFIT_AMOUNT:,.2f}。"
+                  f"日盈帽会先结束当天，余额线要等后面的交易日")
+    elif PROFIT_TARGET_PCT > 0:
         CHALLENGE_PASS_EQUITY = start_balance * (1.0 + PROFIT_TARGET_PCT)
         print(f"考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（起始资金 × {PROFIT_TARGET_PCT*100:.1f}%）。"
               f"EA 开仓即挂券商止盈：成交后余额 = 通过线 + 平仓费 + 5 个价位滑点")
@@ -513,7 +560,7 @@ def write_sim_config():
             print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入 EA 共享配置: 账户 {ACCOUNT_LOGIN} | 起始资金 ${ACCOUNT_START_BALANCE:,.2f}"
                   f" | 杠杆 {LEVERAGE}x | 单笔硬止损 {sim_hard_sl_pct()}%")
         if CHALLENGE_PASS_EQUITY > 0:
-            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入考核通过线: ${CHALLENGE_PASS_EQUITY:,.2f}")
+            print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 已写入{pass_line_name()}: ${CHALLENGE_PASS_EQUITY:,.2f}")
         return written_at
     except Exception as e:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 写入 EA 共享配置失败: {str(e)}")
@@ -1077,7 +1124,7 @@ def daily_loss_monitor_thread(symbol, position_data):
     if MAX_DAILY_PROFIT_AMOUNT > 0:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日盈帽: ${MAX_DAILY_PROFIT_AMOUNT:.2f}，由 MT5 EA 按真实权益执行（本线程仅镜像 EA 停止标志）")
     if CHALLENGE_PASS_EQUITY > 0:
-        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
+        print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] {pass_line_name()}: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
     else:
         print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 止盈: 已禁用")
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] 日内止损: 由 MT5 EA 端执行（本线程仅镜像 EA 停止标志）")
@@ -1128,15 +1175,15 @@ def daily_loss_monitor_thread(symbol, position_data):
                 
                 # 考核通过由 EA 判定；此处只镜像 ea_pass_status。Funded 通过线为 0，不会进入
                 if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
-                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已达到考核通过线 !!!!!")
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 通过线: ${CHALLENGE_PASS_EQUITY:.2f}")
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] !!!!! [监控线程] EA 端已达到{pass_line_name()} !!!!!")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] {pass_line_name()}: ${CHALLENGE_PASS_EQUITY:.2f}")
                     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 同步平掉模拟仓位并停止开仓")
 
                     with pnl_lock:
                         FORCE_CLOSE_POSITION = True
                         PROFIT_TARGET_TRIGGERED = True
 
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置考核通过平仓标志")
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [监控线程] 已设置{pass_line_name()}平仓标志")
                     break
                 
                 # 日内止损和 Funded 日盈帽都由 MT5 EA 端权威执行（真实权益触线即全平）；此处仅镜像 EA 写回的
@@ -2083,7 +2130,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
             if CHALLENGE_PASS_EQUITY > 0 and check_ea_challenge_pass():
                 PROFIT_TARGET_TRIGGERED = True
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已达到考核通过线，不再开仓")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] EA 端已达到{pass_line_name()}，不再开仓")
                 continue
 
             # 开仓前实时确认 EA 端日内止损状态，避免监控线程轮询间隙内误开仓造成两边不一致
@@ -2287,7 +2334,7 @@ if __name__ == "__main__":
         print(f"杠杆倍数: {LEVERAGE}x")
         print(f"模拟仓位: ${INITIAL_CAPITAL * LEVERAGE:.2f} (初始资金 × 杠杆)")
     if CHALLENGE_PASS_EQUITY > 0:
-        print(f"考核通过线: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈）")
+        print(f"{pass_line_name()}: ${CHALLENGE_PASS_EQUITY:.2f}（EA 开仓即挂券商止盈，过线后不再开仓）")
     elif CURRENT_PHASE == "minimum":
         print("考核平仓线: 无（最小手模式，余额过线后继续交易）")
     else:
