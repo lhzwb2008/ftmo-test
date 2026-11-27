@@ -852,7 +852,7 @@ def is_trading_day(symbol=None):
         conn = sqlite3.connect(MARKET_DATA_DB_PATH)
         rows = conn.execute("""
         SELECT key, value FROM service_state
-        WHERE key IN ('calendar_date', 'is_trading_day', 'is_half_trading_day')
+        WHERE key IN ('calendar_date', 'is_trading_day', 'is_half_trading_day', 'prev_trading_day_is_half')
         """).fetchall()
         conn.close()
     except Exception as e:
@@ -863,6 +863,11 @@ def is_trading_day(symbol=None):
         return False, False, True
     is_half = state.get("is_half_trading_day") == "1"
     is_trade = state.get("is_trading_day") == "1" or is_half
+    # 上一交易日为半交易日时，其午后分钟数据缺失会污染噪声区间计算（lookback=1 时下午 sigma 完全缺失），
+    # 跳过当日交易；与 simulate_ibkr.py 及 backtest.py find_half_day_skip_dates 一致
+    if is_trade and not is_half and state.get("prev_trading_day_is_half") == "1":
+        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 上一交易日为半交易日，历史数据不完整，不进行交易")
+        return False, False, False
     return is_trade, is_half, False
 
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
