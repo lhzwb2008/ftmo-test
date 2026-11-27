@@ -53,11 +53,12 @@ CHALLENGE_PASS_EQUITY = 0.0        # 考核通过线，或 balance 模式的止�
 # 交易时间设置
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
 TRADING_END_TIME = (15, 40)   # 交易结束时间：15点40分
-# 半交易日（13:00 收盘）只做上午：最后一个开仓检查 11:55，12:00 触发点清仓。
+# 半交易日（13:00 收盘）只做上午：最后一个开仓检查 11:40（11:55 只管出场），12:00 触发点清仓。
 # 前一交易日是完整交易日，噪声边界和门控不受影响；回测（2023-09~2026-11 共 7 个半交易日，2x）合计 +0.70%。
 # 半交易日次日仍跳过（边界来自半天清淡数据，回测无正面证据）。False=半交易日整天不交易（与其它 simulate 一致）
 TRADE_HALF_DAY_MORNING = True
 HALF_DAY_TRADING_END_TIME = (11, 59)
+HALF_DAY_LAST_ENTRY_TIME = "11:40"  # K 线时间，必须在 15 分钟检查网格上（9:40 起）
 CHECK_INTERVAL_MINUTES = 15   # 检查间隔（分钟）
 MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 MAX_DAILY_PROFIT_AMOUNT = -1  # Funded 日盈帽；Challenge 为 -1
@@ -1271,7 +1272,7 @@ def is_trading_day(symbol=None):
         # 主循环每分钟都会调用，日志每天只打一次
         if _HALF_DAY_LOGGED_DATE != current_date:
             _HALF_DAY_LOGGED_DATE = current_date
-            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，只做上午：最后开仓检查 11:55，12:00 清仓")
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，只做上午：最后开仓检查 {HALF_DAY_LAST_ENTRY_TIME}，12:00 清仓")
         return True, False, True
 
     if state.get('is_trading_day') != '1':
@@ -2173,6 +2174,11 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                     check_time_str = f"{current_hour:02d}:{current_minute-1:02d}"
                 else:
                     check_time_str = f"{current_hour-1:02d}:59"
+
+            # 半交易日最后开仓检查 11:40；11:55 那次只管持仓出场，不再开新仓
+            if is_half_day and check_time_str > HALF_DAY_LAST_ENTRY_TIME:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 半交易日 {HALF_DAY_LAST_ENTRY_TIME} 之后不再开新仓，12:00 清仓")
+                continue
             
             # 获取检查时间点的数据
             latest_date = df["Date"].max()
