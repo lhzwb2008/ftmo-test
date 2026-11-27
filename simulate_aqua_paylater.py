@@ -53,6 +53,11 @@ CHALLENGE_PASS_EQUITY = 0.0        # 考核通过线，或 balance 模式的止�
 # 交易时间设置
 TRADING_START_TIME = (9, 40)  # 交易开始时间：9点40分
 TRADING_END_TIME = (15, 40)   # 交易结束时间：15点40分
+# 半交易日（13:00 收盘）只做上午：最后一个开仓检查 11:55，12:00 触发点清仓。
+# 前一交易日是完整交易日，噪声边界和门控不受影响；回测（2023-09~2026-11 共 7 个半交易日，2x）合计 +0.70%。
+# 半交易日次日仍跳过（边界来自半天清淡数据，回测无正面证据）。False=半交易日整天不交易（与其它 simulate 一致）
+TRADE_HALF_DAY_MORNING = True
+HALF_DAY_TRADING_END_TIME = (11, 59)
 CHECK_INTERVAL_MINUTES = 15   # 检查间隔（分钟）
 MAX_POSITIONS_PER_DAY = 10    # 每日最大开仓次数
 MAX_DAILY_PROFIT_AMOUNT = -1  # Funded 日盈帽；Challenge 为 -1
@@ -1232,10 +1237,14 @@ def daily_loss_monitor_thread(symbol, position_data):
     
     print(f"[{get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')}] === 日内止盈止损监控线程已停止 ===")
 
+_HALF_DAY_LOGGED_DATE = None
+
+
 def is_trading_day(symbol=None):
-    """返回 (是否交易日, 日历是否过期)。日历过期时应短间隔重试。"""
+    """返回 (是否交易日, 日历是否过期, 是否半交易日)。日历过期时应短间隔重试。"""
+    global _HALF_DAY_LOGGED_DATE
     if not ensure_market_data_service_available():
-        return False, True
+        return False, True, False
 
     now_et = get_us_eastern_time()
     current_date = now_et.date()
@@ -1248,27 +1257,33 @@ def is_trading_day(symbol=None):
         conn.close()
     except Exception as e:
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 读取交易日历缓存失败: {str(e)}")
-        return False, True
+        return False, True, False
 
     state = {key: value for key, value in rows}
     if state.get('calendar_date') != current_date.isoformat():
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 交易日历缓存不是今天: {state.get('calendar_date')}")
-        return False, True
+        return False, True, False
 
     if state.get('is_half_trading_day') == '1':
-        print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，不进行交易")
-        return False, False
+        if not TRADE_HALF_DAY_MORNING:
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，不进行交易")
+            return False, False, False
+        # 主循环每分钟都会调用，日志每天只打一次
+        if _HALF_DAY_LOGGED_DATE != current_date:
+            _HALF_DAY_LOGGED_DATE = current_date
+            print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日为半交易日，只做上午：最后开仓检查 11:55，12:00 清仓")
+        return True, False, True
 
     if state.get('is_trading_day') != '1':
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 今日不是交易日，不进行交易")
-        return False, False
+        return False, False, False
 
     # 上一交易日为半交易日时，其午后分钟数据缺失会污染噪声区间计算（lookback=1 时下午 sigma 完全缺失），跳过当日交易
     if state.get('prev_trading_day_is_half') == '1':
         print(f"[{now_et.strftime('%Y-%m-%d %H:%M:%S')}] 上一交易日为半交易日，历史数据不完整，不进行交易")
-        return False, False
+        return False, False, False
 
-    return True, False
+    return True, False, False
 
 def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MINUTES,
                         trading_start_time=TRADING_START_TIME, trading_end_time=TRADING_END_TIME,
@@ -1439,7 +1454,9 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             trailing_tp_activated = False
         
         # 检查是否是交易日（调试模式下保持原有逻辑）
-        is_today_trading_day, calendar_stale = is_trading_day(symbol)
+        is_today_trading_day, calendar_stale, is_half_day = is_trading_day(symbol)
+        # 当天的交易结束时间：半交易日只做上午（见 HALF_DAY_TRADING_END_TIME），到点后的检查走收盘平仓
+        session_end_time = HALF_DAY_TRADING_END_TIME if is_half_day else trading_end_time
         if LOG_VERBOSE:
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 是否交易日: {is_today_trading_day}")
             
@@ -1628,7 +1645,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         # 生成今天所有的检查时间点（这些是K线时间，不是触发时间）
         k_line_check_times = []
         h, m = trading_start_time
-        while h < trading_end_time[0] or (h == trading_end_time[0] and m <= trading_end_time[1]):
+        while h < session_end_time[0] or (h == session_end_time[0] and m <= session_end_time[1]):
             k_line_check_times.append((h, m))
             m += check_interval_minutes
             if m >= 60:
@@ -1636,8 +1653,8 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
                 m = m % 60
         
         # 始终添加结束时间
-        if (trading_end_time[0], trading_end_time[1]) not in k_line_check_times:
-            k_line_check_times.append((trading_end_time[0], trading_end_time[1]))
+        if (session_end_time[0], session_end_time[1]) not in k_line_check_times:
+            k_line_check_times.append((session_end_time[0], session_end_time[1]))
         
         # 生成实际的触发时间点（K线时间的下一分钟）
         trigger_times = []
@@ -1732,13 +1749,13 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             continue
             
         # 检查是否是交易时间结束点，如果是且有持仓，则强制平仓
-        is_trading_end = (current_hour, current_minute) == (trading_end_time[0], trading_end_time[1])
+        is_trading_end = (current_hour, current_minute) == (session_end_time[0], session_end_time[1])
         # 兜底：到达交易结束时间点时，空仓也不再开新仓，避免尾盘开仓被持仓过夜
         if is_trading_end and position_quantity == 0:
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已到交易结束时间 {trading_end_time[0]:02d}:{trading_end_time[1]:02d}，当前空仓，跳过开仓检查")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 已到交易结束时间 {session_end_time[0]:02d}:{session_end_time[1]:02d}，当前空仓，跳过开仓检查")
             continue
         if is_trading_end and position_quantity != 0:
-            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间为交易结束时间 {trading_end_time[0]}:{trading_end_time[1]}，执行平仓")
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前时间为交易结束时间 {session_end_time[0]}:{session_end_time[1]}，执行平仓")
             
             # 获取历史数据
             if LOG_VERBOSE:
@@ -1854,7 +1871,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
         
         # 保持原有交易时间检查逻辑
         start_hour, start_minute = trading_start_time
-        end_hour, end_minute = trading_end_time
+        end_hour, end_minute = session_end_time
         is_trading_hours = (
             (current_hour > start_hour or (current_hour == start_hour and current_minute >= start_minute)) and
             (current_hour < end_hour or (current_hour == end_hour and current_minute <= end_minute))
@@ -1874,7 +1891,7 @@ def run_trading_strategy(symbol=SYMBOL, check_interval_minutes=CHECK_INTERVAL_MI
             
         if not is_trading_hours:
             if LOG_VERBOSE:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前不在交易时间内 ({trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {trading_end_time[0]:02d}:{trading_end_time[1]:02d})")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 当前不在交易时间内 ({trading_start_time[0]:02d}:{trading_start_time[1]:02d} - {session_end_time[0]:02d}:{session_end_time[1]:02d})")
             if position_quantity != 0:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 交易日结束，执行平仓")
                 
